@@ -43,7 +43,7 @@ logging.info("[A_pwmenu] Module init.")
 
 class A_pwmenu(plugins.Plugin):
     __author__ = 'NewFPV'
-    __version__ = '1.1.2'
+    __version__ = '1.1.3'
     __license__ = 'GPL3'
     __description__ = 'Ultimate Password Manager'
 
@@ -961,6 +961,12 @@ class A_pwmenu(plugins.Plugin):
             self._save_data()
             self.ohc_scheduler_wakeup.set()
 
+    def _ohc_retry_after_delay(self, value):
+        try:
+            return int(float(value)) + 10
+        except (TypeError, ValueError):
+            return 3610
+
     def _clear_ohc_backoff(self):
         with self.data_lock:
             should_save = bool(self.data.get('ohc_retry_at') or self.data.get('ohc_retry_reason'))
@@ -1014,7 +1020,7 @@ class A_pwmenu(plugins.Plugin):
                 data = {'message': res.text}
             if res.status_code == 429:
                 retry_after = res.headers.get('Retry-After') or data.get('retry_after', 3600)
-                self._set_ohc_backoff(retry_after, 'OHC rate limit')
+                self._set_ohc_backoff(self._ohc_retry_after_delay(retry_after), 'OHC rate limit')
                 return False, self._ohc_backoff_message()
             if not res.ok or data.get('success') is False:
                 return False, data
@@ -1039,7 +1045,7 @@ class A_pwmenu(plugins.Plugin):
                 data = {'message': res.text}
             if res.status_code == 429:
                 retry_after = res.headers.get('Retry-After') or data.get('retry_after', 3600)
-                self._set_ohc_backoff(retry_after, 'OHC list_tasks rate limit')
+                self._set_ohc_backoff(self._ohc_retry_after_delay(retry_after), 'OHC list_tasks rate limit')
                 logging.warning(f"[A_pwmenu] {self._ohc_backoff_message()}")
                 return False, set()
             if not res.ok or data.get('success') is False:
@@ -3143,6 +3149,14 @@ class A_pwmenu(plugins.Plugin):
             return '';
         }
 
+        function mapPointCount(p) {
+            const members = p.members || [];
+            if(mapFilter === 'cracked' && members.length > 1) {
+                return members.filter(m => m.is_cracked || m.status === 'cracked').length;
+            }
+            return Math.max(1, parseInt(p.count || 1, 10) || 1);
+        }
+
         function yandexPreset(p) {
             return 'islands#circleIcon';
         }
@@ -3226,7 +3240,8 @@ class A_pwmenu(plugins.Plugin):
             yandexObjects.clusters.options.set('preset', mapFilter === 'cracked' ? 'islands#greenClusterIcons' : 'islands#blueClusterIcons');
             const features = [];
             pts.forEach(p => {
-                const repeats = Math.max(1, Math.min(99, parseInt(p.count || 1, 10)));
+                const displayCount = mapPointCount(p);
+                const repeats = Math.max(1, Math.min(99, displayCount));
                 for(let i = 0; i < repeats; i++) {
                     features.push({
                         type: 'Feature',
@@ -3234,7 +3249,7 @@ class A_pwmenu(plugins.Plugin):
                         geometry: { type: 'Point', coordinates: [p.lat, p.lon] },
                         properties: {
                             hintContent: p.essid,
-                            iconContent: String(p.count || 1)
+                            iconContent: String(displayCount)
                         },
                         options: { preset: yandexPreset(p), iconColor: yandexColor(p), openBalloonOnClick: false }
                     });
@@ -3281,7 +3296,7 @@ class A_pwmenu(plugins.Plugin):
                 m.className = 'map-point ' + pointStatusClass(p);
                 m.style.left = pos.x + '%';
                 m.style.top = pos.y + '%';
-                m.innerText = String(p.count || 1);
+                m.innerText = String(mapPointCount(p));
                 m.title = p.essid;
                 m.onclick = () => showMapPoint(p);
                 box.appendChild(m);

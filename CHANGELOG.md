@@ -2,6 +2,11 @@
 
 All notable changes to A_pwmenu are documented here.
 
+## 1.1.3 — 2026-07-13
+
+- Added a 10-second safety margin to the `Retry-After` delay returned by OHC.
+- Fixed same-location marker counts in the Cracked map filter to count only the cracked members shown in the details sheet.
+
 ## 1.1.2 — 2026-07-13
 
 - Moved **Send all missing to OHC** and its persistent queue status to the Other tab.
