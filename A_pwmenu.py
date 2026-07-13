@@ -43,7 +43,7 @@ logging.info("[A_pwmenu] Module init.")
 
 class A_pwmenu(plugins.Plugin):
     __author__ = 'NewFPV'
-    __version__ = '1.1.0'
+    __version__ = '1.1.1'
     __license__ = 'GPL3'
     __description__ = 'Ultimate Password Manager'
 
@@ -55,6 +55,7 @@ class A_pwmenu(plugins.Plugin):
         self.data_file = '/root/handshakes/.a_pwmenu_data.json'
         self.last_sync = 0
         self.data_lock = threading.RLock()
+        self.save_lock = threading.Lock()
         self.time_sync_lock = threading.Lock()
         self.wpa_upload_lock = threading.Lock()
         self.wpa_upload_thread = None
@@ -84,6 +85,9 @@ class A_pwmenu(plugins.Plugin):
         self.ohc_found_notice = ''
         self.ohc_found_notice_checked = 0
         self.ohc_last_result = ''
+        self.ohc_scheduler_running = False
+        self.ohc_scheduler_thread = None
+        self.ohc_scheduler_wakeup = threading.Event()
 
     def on_loaded(self):
         logging.info("[A_pwmenu] Loaded.")
@@ -112,8 +116,17 @@ class A_pwmenu(plugins.Plugin):
         self.options.setdefault('import_max_bytes', 2097152)
         self.options.setdefault('archive_memory_limit', 2097152)
         self.options.setdefault('hcxpcapngtool_timeout', 90)
+        self.options.setdefault('ohc_retry_poll_interval', 60)
+        self.options.setdefault('ohc_reconcile_on_start', False)
         self._start_pwndroid_ws()
         self.ready = True
+        if self._option_bool('ohc_auto_upload', True):
+            reconcile = self._option_bool('ohc_reconcile_on_start', False)
+            if reconcile:
+                with self.data_lock:
+                    self.data['ohc_reconcile_requested'] = True
+            self._queue_ohc_files(force=reconcile)
+        self._start_ohc_scheduler()
 
     def on_ui_setup(self, ui):
         with ui._lock:
@@ -171,6 +184,8 @@ class A_pwmenu(plugins.Plugin):
 
     def on_unload(self, ui):
         self.pwndroid_running = False
+        self.ohc_scheduler_running = False
+        self.ohc_scheduler_wakeup.set()
         try:
             with ui._lock:
                 ui.remove_element(self.gps_indicator_name)
@@ -179,6 +194,7 @@ class A_pwmenu(plugins.Plugin):
 
     def on_internet_available(self, agent):
         if self.ready and self._option_bool('ohc_auto_upload', True):
+            self._queue_ohc_files(force=False)
             self._start_ohc_upload_thread()
 
     def on_handshake(self, agent, filename, access_point, client_station):
@@ -206,7 +222,8 @@ class A_pwmenu(plugins.Plugin):
             except Exception as e:
                 logging.error(f"[A_pwmenu] Could not save PwnDroid GPS: {e}")
         if self._option_bool('ohc_auto_upload', True):
-            self._start_ohc_upload_thread([os.path.basename(filename)])
+            self._queue_ohc_files([os.path.basename(filename)], force=False)
+            self._start_ohc_upload_thread()
 
     def on_webhook(self, path, request):
         if not self.ready:
@@ -254,6 +271,10 @@ class A_pwmenu(plugins.Plugin):
                 if path == 'ohc-upload-cluster':
                     res, is_err = self._handle_ohc_cluster_upload(request)
                     return self._render_page(notification=res, notif_type="error" if is_err else "success", active_tab="map")
+
+                if path == 'ohc-upload-all-missing':
+                    res, is_err = self._handle_ohc_all_missing()
+                    return self._render_page(notification=res, notif_type="error" if is_err else "success", active_tab="handshakes")
 
                 if path == 'add-password':
                     self._add_manual_password(request.form.get('essid'), request.form.get('bssid'), request.form.get('password'))
@@ -464,8 +485,25 @@ class A_pwmenu(plugins.Plugin):
         names = self._filenames_from_csv(req.form.get('filenames') or '')
         if not names:
             return "No files selected", True
-        self._start_ohc_upload_thread(names)
-        return "OHC upload started", False
+        queued = self._queue_ohc_files(names, force=True)
+        self._start_ohc_upload_thread()
+        if time.time() < self._ohc_retry_at():
+            return f"Queued {queued} file(s). {self._ohc_backoff_message()}", False
+        return f"OHC upload started for {queued} file(s)", False
+
+    def _handle_ohc_all_missing(self):
+        if not self._option_bool('ohc_enabled', True):
+            return "OHC disabled", True
+        if not self._ohc_key():
+            return "OHC API key missing", True
+        with self.data_lock:
+            self.data['ohc_reconcile_requested'] = True
+        queued = self._queue_ohc_files(force=True)
+        self._save_data()
+        self._start_ohc_upload_thread()
+        if time.time() < self._ohc_retry_at():
+            return f"Queued {queued} file(s). {self._ohc_backoff_message()}", False
+        return f"Scanning {queued} file(s) and sending hashes missing from OHC", False
 
     def _filenames_from_csv(self, text):
         names = []
@@ -553,14 +591,139 @@ class A_pwmenu(plugins.Plugin):
     def _ohc_mark_path(self, path, status, message='', hashes=0, request_id=''):
         self._ohc_mark_file(os.path.basename(path or ''), status, message, hashes, request_id)
 
+    def _ohc_file_signature(self, path):
+        try:
+            stat = os.stat(path)
+            return f"{stat.st_mtime_ns}:{stat.st_size}"
+        except OSError:
+            return ''
+
+    def _candidate_ohc_paths(self, filenames=None):
+        cracked = self._get_cracked_data()
+        paths = []
+        if filenames:
+            for value in filenames:
+                name = self._safe_handshake_name(os.path.basename(value or ''))
+                if not name:
+                    continue
+                path = None
+                if os.path.isabs(value) and os.path.basename(value) == name:
+                    parent = os.path.realpath(os.path.dirname(value))
+                    allowed = {os.path.realpath(d.rstrip('/')) for d in self.handshake_dirs}
+                    if parent in allowed and os.path.isfile(value):
+                        path = value
+                if not path:
+                    path = self._find_handshake_path(name)
+                if path and self._essid_from_filename(name) not in cracked and path not in paths:
+                    paths.append(path)
+            return paths
+
+        for directory in self.handshake_dirs:
+            if not os.path.exists(directory):
+                continue
+            for path in glob.glob(os.path.join(directory, '*.pcap')):
+                if self._essid_from_filename(os.path.basename(path)) not in cracked and path not in paths:
+                    paths.append(path)
+        return paths
+
+    def _queue_ohc_files(self, filenames=None, force=False):
+        paths = self._candidate_ohc_paths(filenames)
+        now = int(time.time())
+        queued = 0
+        changed = False
+        with self.data_lock:
+            pending = self.data.setdefault('ohc_pending_files', {})
+            signatures = self.data.setdefault('ohc_file_signatures', {})
+            for path in paths:
+                signature = self._ohc_file_signature(path)
+                if not signature:
+                    continue
+                current = pending.get(path, {})
+                if not force and signatures.get(path) == signature and not current:
+                    continue
+                if current.get('signature') != signature or force:
+                    pending[path] = {
+                        'signature': signature,
+                        'queued_at': int(current.get('queued_at', now) or now),
+                        'force': bool(force or current.get('force', False))
+                    }
+                    self._ohc_mark_path(path, 'queued', 'Waiting for OHC upload')
+                    changed = True
+                queued += 1
+        if changed:
+            self._save_data()
+        self.ohc_scheduler_wakeup.set()
+        return queued
+
+    def _pending_ohc_paths(self):
+        with self.data_lock:
+            pending = dict(self.data.setdefault('ohc_pending_files', {}))
+        paths = []
+        changed = False
+        for path, record in pending.items():
+            signature = self._ohc_file_signature(path)
+            if not signature:
+                with self.data_lock:
+                    self.data.setdefault('ohc_pending_files', {}).pop(path, None)
+                changed = True
+                continue
+            if record.get('signature') != signature:
+                with self.data_lock:
+                    current = self.data.setdefault('ohc_pending_files', {}).setdefault(path, {})
+                    current['signature'] = signature
+                    current['queued_at'] = int(time.time())
+                changed = True
+            paths.append(path)
+        if changed:
+            self._save_data()
+        return paths
+
+    def _complete_ohc_path(self, path, signature=None):
+        signature = signature or self._ohc_file_signature(path)
+        with self.data_lock:
+            self.data.setdefault('ohc_pending_files', {}).pop(path, None)
+            if signature:
+                self.data.setdefault('ohc_file_signatures', {})[path] = signature
+
+    def _start_ohc_scheduler(self):
+        if self.ohc_scheduler_thread and self.ohc_scheduler_thread.is_alive():
+            return
+        self.ohc_scheduler_running = True
+        self.ohc_scheduler_thread = threading.Thread(
+            target=self._ohc_scheduler_loop,
+            daemon=True,
+            name='pwmenu-ohc-scheduler'
+        )
+        self.ohc_scheduler_thread.start()
+
+    def _ohc_scheduler_loop(self):
+        while self.ohc_scheduler_running:
+            pending = self._pending_ohc_paths()
+            retry_in = max(0, self._ohc_retry_at() - time.time())
+            if pending and retry_in <= 0:
+                self._start_ohc_upload_thread()
+                timeout = 10
+            elif pending:
+                timeout = min(max(1, retry_in), self._option_int('ohc_retry_poll_interval', 60))
+            else:
+                timeout = self._option_int('ohc_retry_poll_interval', 60)
+            self.ohc_scheduler_wakeup.wait(max(1, timeout))
+            self.ohc_scheduler_wakeup.clear()
+
     def _start_ohc_upload_thread(self, filenames=None):
         if not self._option_bool('ohc_enabled', True):
             return
+        if filenames:
+            self._queue_ohc_files(filenames, force=True)
         if time.time() < self._ohc_retry_at():
+            self.ohc_last_result = self._ohc_backoff_message()
+            self.ohc_scheduler_wakeup.set()
             return
         if self.ohc_upload_thread and self.ohc_upload_thread.is_alive():
             return
-        todo = list(filenames) if filenames else None
+        todo = self._pending_ohc_paths()
+        if not todo:
+            return
         self.ohc_upload_thread = threading.Thread(
             target=self._ohc_upload_worker,
             args=(todo,),
@@ -592,6 +755,7 @@ class A_pwmenu(plugins.Plugin):
                 self.ohc_display_status = ''
                 self.ohc_display_result_until = 0
                 self.ohc_uploading = False
+                self.ohc_scheduler_wakeup.set()
 
     def _ohc_upload_files(self, filenames=None, manual=False):
         if not self._option_bool('ohc_enabled', True):
@@ -608,43 +772,37 @@ class A_pwmenu(plugins.Plugin):
             return "No Internet Connection", True
 
         self.ohc_display_status = 'OHC upload'
-        cracked = self._get_cracked_data()
-        paths = []
-        if filenames:
-            for name in filenames:
-                path = self._find_handshake_path(name)
-                if path and self._essid_from_filename(name) not in cracked:
-                    paths.append(path)
-        else:
-            for d in self.handshake_dirs:
-                if not os.path.exists(d):
-                    continue
-                for path in glob.glob(os.path.join(d, '*.pcap')):
-                    if self._essid_from_filename(os.path.basename(path)) not in cracked:
-                        paths.append(path)
+        paths = self._candidate_ohc_paths(filenames)
 
         with self.data_lock:
             reported = set(self.data.setdefault('ohc_reported', []))
-        paths = [p for p in paths if p not in reported]
         if not paths:
             return "OHC: no uncracked handshakes to upload", False
 
         path_hash_count = {}
+        path_hashes = {}
         with self.data_lock:
             hash_files = dict(self.data.setdefault('ohc_hash_files', {}))
             reported_hashes = set(self.data.setdefault('ohc_reported_hashes', []))
             last_ohc_sync = float(self.data.get('ohc_tasks_synced_at', 0) or 0)
+            reconcile_requested = bool(self.data.get('ohc_reconcile_requested', False))
         sync_interval = int(self.options.get('ohc_sync_interval', 3600) or 3600)
-        if time.time() - last_ohc_sync > sync_interval:
+        if reconcile_requested or time.time() - last_ohc_sync > sync_interval:
             ok, server_hashes = self._ohc_list_task_hashes(key)
             if ok:
-                reported_hashes.update(server_hashes)
+                if reconcile_requested:
+                    reported_hashes = set(server_hashes)
+                else:
+                    reported_hashes.update(server_hashes)
                 with self.data_lock:
                     self.data['ohc_reported_hashes'] = sorted(reported_hashes)
                     self.data['ohc_tasks_synced_at'] = time.time()
+                    self.data['ohc_reconcile_requested'] = False
                 self._save_data()
             elif time.time() < self._ohc_retry_at():
                 return self._ohc_backoff_message(), True
+            elif reconcile_requested:
+                return "OHC task reconciliation failed; queued files were preserved", True
 
         hashes = []
         hash_sources = {}
@@ -659,12 +817,15 @@ class A_pwmenu(plugins.Plugin):
             extracted = self._ohc_extract_hashes(path)
             if not extracted:
                 failed_extract += 1
-                self._ohc_mark_path(path, 'failed', 'No valid 22000 hashes extracted')
+                self._ohc_mark_path(path, 'invalid', 'No valid 22000 hashes extracted')
+                self._complete_ohc_path(path)
                 continue
+            path_hashes[path] = set()
             for h in extracted:
                 h = h.strip()
                 if not h:
                     continue
+                path_hashes[path].add(h)
                 path_hash_count[path] = path_hash_count.get(path, 0) + 1
                 if h in reported_hashes:
                     already_reported += 1
@@ -675,6 +836,10 @@ class A_pwmenu(plugins.Plugin):
                 hash_files[h] = os.path.basename(path)
                 hashes.append(h)
                 hash_sources[h] = path
+
+        for path, extracted in path_hashes.items():
+            if extracted and extracted.issubset(reported_hashes):
+                self._complete_ohc_path(path)
 
         if not hashes:
             with self.data_lock:
@@ -719,9 +884,18 @@ class A_pwmenu(plugins.Plugin):
             skipped += batch_skipped
             rejected += batch_rejected
             rejected_reason = data.get('rejected', {}).get('reason', '')
-            should_cache_batch = batch_accepted or batch_skipped or rejected_reason in ('invalid_format', 'invalid_algorithm')
+            fully_accounted = batch_accepted + batch_skipped >= len(batch)
+            terminal_rejection = rejected_reason in ('invalid_format', 'invalid_algorithm')
+            should_cache_batch = fully_accounted or terminal_rejection
             if not should_cache_batch:
-                continue
+                delay = 3600 if rejected_reason == 'quota_exceeded' else 300
+                self._set_ohc_backoff(delay, f"OHC {rejected_reason or 'partial batch failure'}")
+                failed += max(1, batch_rejected)
+                for h in batch:
+                    path = hash_sources.get(h)
+                    if path:
+                        self._ohc_mark_path(path, 'failed', rejected_reason or 'Partial batch failure', path_hash_count.get(path, 0), request_id)
+                break
             for h in batch:
                 path = hash_sources.get(h)
                 sent_paths.add(path)
@@ -747,6 +921,11 @@ class A_pwmenu(plugins.Plugin):
         else:
             with self.data_lock:
                 self.data['ohc_hash_files'] = hash_files
+
+        resolved_hashes = reported_hashes | sent_hashes
+        for path, extracted in path_hashes.items():
+            if extracted and extracted.issubset(resolved_hashes):
+                self._complete_ohc_path(path)
 
         msg = f"OHC: {accepted} accepted, {skipped} skipped, {rejected} rejected"
         if already_reported:
@@ -780,6 +959,7 @@ class A_pwmenu(plugins.Plugin):
                 self.data['ohc_retry_at'] = retry_at
                 self.data['ohc_retry_reason'] = str(reason or 'retry later')[:200]
             self._save_data()
+            self.ohc_scheduler_wakeup.set()
 
     def _clear_ohc_backoff(self):
         with self.data_lock:
@@ -789,6 +969,7 @@ class A_pwmenu(plugins.Plugin):
                 self.data['ohc_retry_reason'] = ''
         if should_save:
             self._save_data()
+            self.ohc_scheduler_wakeup.set()
 
     def _ohc_extract_hashes(self, pcap_path):
         out = None
@@ -832,7 +1013,7 @@ class A_pwmenu(plugins.Plugin):
             except ValueError:
                 data = {'message': res.text}
             if res.status_code == 429:
-                retry_after = res.headers.get('Retry-After', '3600')
+                retry_after = res.headers.get('Retry-After') or data.get('retry_after', 3600)
                 self._set_ohc_backoff(retry_after, 'OHC rate limit')
                 return False, self._ohc_backoff_message()
             if not res.ok or data.get('success') is False:
@@ -857,7 +1038,7 @@ class A_pwmenu(plugins.Plugin):
             except ValueError:
                 data = {'message': res.text}
             if res.status_code == 429:
-                retry_after = res.headers.get('Retry-After', '3600')
+                retry_after = res.headers.get('Retry-After') or data.get('retry_after', 3600)
                 self._set_ohc_backoff(retry_after, 'OHC list_tasks rate limit')
                 logging.warning(f"[A_pwmenu] {self._ohc_backoff_message()}")
                 return False, set()
@@ -1022,14 +1203,23 @@ class A_pwmenu(plugins.Plugin):
             'phone_gps': {},
             'ohc_files': {},
             'ohc_hash_files': {},
-            'ohc_found_files': {}
+            'ohc_found_files': {},
+            'ohc_pending_files': {},
+            'ohc_file_signatures': {},
+            'ohc_reconcile_requested': False
         }
-        if os.path.exists(self.data_file):
+        candidates = [self.data_file, self.data_file + '.bak']
+        candidates = [p for p in candidates if os.path.exists(p)]
+        candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+        for candidate in candidates:
             try:
-                with open(self.data_file) as f:
+                with open(candidate) as f:
                     self.data.update(json.load(f))
+                if candidate != self.data_file:
+                    logging.warning("[A_pwmenu] Recovered state from backup")
+                break
             except (OSError, ValueError, TypeError, json.JSONDecodeError) as e:
-                logging.warning(f"[A_pwmenu] Could not load state: {e}")
+                logging.warning(f"[A_pwmenu] Could not load state from {candidate}: {e}")
         if not isinstance(self.data.get('locations'), dict):
             self.data['locations'] = {}
         if not isinstance(self.data.get('seen_files'), dict):
@@ -1042,24 +1232,42 @@ class A_pwmenu(plugins.Plugin):
             self.data['ohc_hash_files'] = {}
         if not isinstance(self.data.get('ohc_found_files'), dict):
             self.data['ohc_found_files'] = {}
+        if not isinstance(self.data.get('ohc_pending_files'), dict):
+            self.data['ohc_pending_files'] = {}
+        if not isinstance(self.data.get('ohc_file_signatures'), dict):
+            self.data['ohc_file_signatures'] = {}
 
     def _save_data(self):
-        tmp_path = self.data_file + '.tmp'
         try:
-            with self.data_lock:
-                snapshot = copy.deepcopy(self.data)
-                with open(tmp_path, 'w') as f:
-                    json.dump(snapshot, f, sort_keys=True)
-                    f.flush()
-                    os.fsync(f.fileno())
-                os.replace(tmp_path, self.data_file)
+            with self.save_lock:
+                with self.data_lock:
+                    snapshot = copy.deepcopy(self.data)
+                payload = json.dumps(snapshot, sort_keys=True)
+                directory = os.path.dirname(self.data_file)
+                for target in (self.data_file + '.bak', self.data_file):
+                    tmp_path = target + '.tmp'
+                    with open(tmp_path, 'w') as f:
+                        f.write(payload)
+                        f.flush()
+                        os.fsync(f.fileno())
+                    os.replace(tmp_path, target)
+                    try:
+                        flags = os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0)
+                        dir_fd = os.open(directory, flags)
+                        try:
+                            os.fsync(dir_fd)
+                        finally:
+                            os.close(dir_fd)
+                    except OSError:
+                        pass
         except Exception as e:
             logging.error(f"[A_pwmenu] Could not save state: {e}")
-            try:
-                if os.path.exists(tmp_path):
-                    os.remove(tmp_path)
-            except Exception:
-                pass
+            for target in (self.data_file + '.bak.tmp', self.data_file + '.tmp'):
+                try:
+                    if os.path.exists(target):
+                        os.remove(target)
+                except OSError:
+                    pass
 
     def _option_bool(self, key, default=True):
         v = self.options.get(key, default)
@@ -1348,11 +1556,16 @@ class A_pwmenu(plugins.Plugin):
         return {'label': 'PwnDroid', 'state': self.pwndroid_ws_state, 'age': 0, 'lat': None, 'lon': None, 'accuracy': 0, 'detail': detail}
 
     def _ohc_status(self):
+        with self.data_lock:
+            pending = len(self.data.get('ohc_pending_files', {}) or {})
+        retry_in = max(0, int(self._ohc_retry_at() - time.time()))
         return {
             'enabled': self._option_bool('ohc_enabled', True),
             'uploading': self.ohc_uploading,
             'face': self.ohc_upload_face if self.ohc_uploading else '0__0',
-            'last': self.ohc_last_result
+            'last': self.ohc_last_result,
+            'pending': pending,
+            'retry_in': retry_in
         }
 
     def _read_gpsd_location(self):
@@ -2340,7 +2553,16 @@ class A_pwmenu(plugins.Plugin):
             {% if not cracked %}<div style="padding:30px;text-align:center;color:var(--sub);">No cracked networks yet.</div>{% endif %}
         </div>
 
-        <div id="v-handshakes" class="list hidden">
+        <div id="v-handshakes" class="hidden">
+            <div class="card" style="padding:15px;text-align:left;">
+                <button class="btn" style="margin-top:0;background:#ff9f0a;" onclick="sendAllMissingToOhc()">Send all missing to OHC</button>
+                <div class="sub" style="margin-top:10px;">
+                    Persistent queue: {{ ohc_status.pending }} file(s)
+                    {% if ohc_status.retry_in > 0 %} • retry in {{ ohc_status.retry_in }}s{% endif %}
+                </div>
+                <div class="sub" style="margin-top:4px;">Scans every uncracked PCAP and submits only hashes absent from the OHC task list.</div>
+            </div>
+            <div class="list">
             {% for g in groups %}
             <div class="si" data-t="{{ g.essid }}">
                 <div class="row">
@@ -2373,6 +2595,7 @@ class A_pwmenu(plugins.Plugin):
                 </div>
             </div>
             {% endfor %}
+            </div>
         </div>
 
         <div id="v-map" class="map-shell hidden">
@@ -2634,6 +2857,11 @@ class A_pwmenu(plugins.Plugin):
             post('ohc-upload-cluster', {filenames: filename});
         }
 
+        function sendAllMissingToOhc() {
+            if(!confirm('Scan all uncracked captures and send every hash missing from OHC?')) return;
+            post('ohc-upload-all-missing', {});
+        }
+
         function sendSingleToWpa(filename) {
             if(!filename || !wpaEnabled) return;
             post('wpa-sec-upload-cluster', {filenames: filename});
@@ -2643,7 +2871,8 @@ class A_pwmenu(plugins.Plugin):
             const o = (item && item.ohc) || {};
             if(!o.status) return '<span class="map-chip gray">OHC Not sent</span>';
             if(o.status === 'sent') return '<span class="map-chip green">OHC Sent</span>';
-            if(o.status === 'already_reported') return '<span class="map-chip blue">OHC Queued</span>';
+            if(o.status === 'already_reported') return '<span class="map-chip blue">OHC Already exists</span>';
+            if(o.status === 'queued') return '<span class="map-chip yellow">OHC Queued</span>';
             if(o.status === 'failed') return '<span class="map-chip red">OHC Failed</span>';
             if(o.status === 'invalid') return '<span class="map-chip yellow">OHC Invalid</span>';
             return `<span class="map-chip gray">OHC ${esc(o.status)}</span>`;
