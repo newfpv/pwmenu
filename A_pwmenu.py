@@ -43,7 +43,7 @@ logging.info("[A_pwmenu] Module init.")
 
 class A_pwmenu(plugins.Plugin):
     __author__ = 'NewFPV'
-    __version__ = '1.1.3'
+    __version__ = '1.1.4'
     __license__ = 'GPL3'
     __description__ = 'Ultimate Password Manager'
 
@@ -56,6 +56,7 @@ class A_pwmenu(plugins.Plugin):
         self.last_sync = 0
         self.data_lock = threading.RLock()
         self.save_lock = threading.Lock()
+        self.potfile_lock = threading.RLock()
         self.time_sync_lock = threading.Lock()
         self.wpa_upload_lock = threading.Lock()
         self.wpa_upload_thread = None
@@ -93,6 +94,8 @@ class A_pwmenu(plugins.Plugin):
         logging.info("[A_pwmenu] Loaded.")
         self._ensure_file(self.potfile_ohc)
         self._ensure_file(self.potfile_manual)
+        self._normalize_potfile(self.potfile_ohc)
+        self._normalize_potfile(self.potfile_manual)
         self._load_data()
         self.options.setdefault('time_sync_interval', 1800)
         self.options.setdefault('phone_gps_enabled', True)
@@ -303,8 +306,14 @@ class A_pwmenu(plugins.Plugin):
                         payload = f.stream.read(max_bytes + 1)
                         if len(payload) > max_bytes:
                             return self._render_page(notification="Import file is too large", notif_type="error", active_tab='other')
-                        c = self._process_import(payload.decode('utf-8', errors='ignore'), f.filename)
-                        return self._render_page(notification=f"Imported {c} passwords", notif_type="success", active_tab='other')
+                        report = self._process_import(payload.decode('utf-8', errors='ignore'), f.filename)
+                        message = (
+                            f"Import: {report['added']} added, {report['already']} already present, "
+                            f"{report['duplicates']} duplicate rows, {report['ignored']} ignored"
+                        )
+                        if report['invalid']:
+                            message += f", {report['invalid']} invalid"
+                        return self._render_page(notification=message, notif_type="success", active_tab='other')
                     except Exception as e:
                         return self._render_page(notification=f"Import Error: {e}", notif_type="error", active_tab='other')
 
@@ -371,6 +380,7 @@ class A_pwmenu(plugins.Plugin):
         no_gps_networks = self._build_no_gps_networks(groups)
         gps_status = self._gps_status()
         ohc_status = self._ohc_status()
+        pot_health = self._potfile_health(self.potfile_ohc)
         ach = self._update_achievements(groups, cracked)
 
         t_nets = len(groups)
@@ -394,7 +404,8 @@ class A_pwmenu(plugins.Plugin):
             groups=groups, cracked=cracked, notif=notification, ntype=notif_type,
             tab=active_tab, stats=stats, ach=ach['badges'], token=tok,
             show_wpa=show_wpa, map_points=map_points, gps_status=gps_status,
-            no_gps_networks=no_gps_networks, ohc_status=ohc_status
+            no_gps_networks=no_gps_networks, ohc_status=ohc_status,
+            pot_health=pot_health
         )
 
         r = make_response(html)
@@ -1972,11 +1983,18 @@ class A_pwmenu(plugins.Plugin):
     def _add_manual_password(self, essid, bssid, pwd):
         m = bssid if bssid and len(bssid)==17 else "00:00:00:00:00:00"
         try:
-            with open(self.potfile_manual, 'a') as f:
-                f.write(f"{m}:{m}:{essid}:{pwd}\n")
-            with self.data_lock:
-                self.data['xp'] += 200
-            self._save_data()
+            with self.potfile_lock:
+                self._normalize_potfile(self.potfile_manual)
+                lines, _ = self._read_pot_lines(self.potfile_manual)
+                lines, keys, _ = self._dedupe_pot_lines(lines)
+                line = f"{m}:{m}:{essid}:{pwd}"
+                added = self._pot_line_key(line) not in keys
+                if added:
+                    self._write_pot_lines(self.potfile_manual, lines + [line])
+            if added:
+                with self.data_lock:
+                    self.data['xp'] += 200
+                self._save_data()
         except OSError as e:
             logging.error(f"[A_pwmenu] Could not add manual password: {e}")
 
@@ -1984,28 +2002,18 @@ class A_pwmenu(plugins.Plugin):
         deleted = False
 
         if os.path.exists(self.potfile_manual):
-            lines = []
-            with open(self.potfile_manual, 'r') as f:
-                for l in f:
-                    if f":{essid}:" not in l:
-                        lines.append(l)
-                    else:
-                        deleted = True
-            with open(self.potfile_manual, 'w') as f:
-                f.writelines(lines)
+            original, _ = self._read_pot_lines(self.potfile_manual)
+            lines = [line for line in original if f":{essid}:" not in line]
+            deleted = deleted or len(lines) != len(original)
+            if len(lines) != len(original):
+                self._write_pot_lines(self.potfile_manual, lines)
 
         if os.path.exists(self.potfile_ohc):
-            lines = []
-            with open(self.potfile_ohc, 'r') as f:
-                for l in f:
-                    if f":{essid}:" not in l:
-                        lines.append(l)
-                    elif pwd and f":{pwd}" in l:
-                         deleted = True
-                    else:
-                         deleted = True
-            with open(self.potfile_ohc, 'w') as f:
-                f.writelines(lines)
+            original, _ = self._read_pot_lines(self.potfile_ohc)
+            lines = [line for line in original if f":{essid}:" not in line]
+            deleted = deleted or len(lines) != len(original)
+            if len(lines) != len(original):
+                self._write_pot_lines(self.potfile_ohc, lines)
 
         return deleted
 
@@ -2099,70 +2107,218 @@ class A_pwmenu(plugins.Plugin):
 
     def _process_import(self, content, name):
         self._ensure_file(self.potfile_ohc)
-        c=0
         is_json = name.lower().endswith('.json') or content.strip().startswith('[')
         if is_json:
-            c = self._imp_json(json.loads(content))
+            report = self._imp_json(json.loads(content))
         else:
-            c = self._imp_csv(content)
-        if c > 0:
+            report = self._imp_csv(content)
+        if report['added'] > 0:
             with self.data_lock:
-                self.data['xp'] += c * 100
+                self.data['xp'] += report['added'] * 100
             self._save_data()
-        return c
+        return report
+
+    def _new_import_report(self):
+        return {'added': 0, 'already': 0, 'duplicates': 0, 'ignored': 0, 'invalid': 0}
 
     def _imp_json(self, data):
         if isinstance(data, dict):
             data = data.get('tasks', [])
         if not isinstance(data, list):
             raise ValueError('JSON import must contain a task list')
-        c=0
-        ex=self._read_pot(self.potfile_ohc)
-        with open(self.potfile_ohc, 'a') as f:
-            for t in data:
-                if not isinstance(t, dict):
-                    continue
-                if t.get('status')=='FOUND':
-                    e = self._fmt(t.get('task',''), t.get('password',''))
-                    if e and e not in ex:
-                        f.write(e+'\n')
-                        ex.add(e)
-                        c += 1
-        return c
+        report = self._new_import_report()
+        entries = []
+        for task in data:
+            if not isinstance(task, dict):
+                report['invalid'] += 1
+                continue
+            if task.get('status') != 'FOUND':
+                report['ignored'] += 1
+                continue
+            line = self._fmt_task(task.get('task', ''), task.get('password', ''))
+            if line:
+                entries.append(line)
+            else:
+                report['invalid'] += 1
+        return self._merge_import_lines(entries, report)
 
     def _imp_csv(self, txt):
-        c=0
-        ex=self._read_pot(self.potfile_ohc)
+        report = self._new_import_report()
+        entries = []
         try:
-            r = csv.DictReader(io.StringIO(txt))
-            with open(self.potfile_ohc, 'a') as f:
-                for row in r:
-                    st = row.get('status') or row.get('Status')
-                    pw = row.get('password') or row.get('Password')
-                    tk = row.get('task') or row.get('Task') or row.get('SSID')
-                    if st=='FOUND' and pw and tk:
-                        tk = re.sub(r'<[^>]+>', '', tk).strip()
-                        e = self._fmt(tk, pw)
-                        if e and e not in ex:
-                            f.write(e+'\n')
-                            ex.add(e)
-                            c += 1
+            reader = csv.DictReader(io.StringIO(txt))
+            for row in reader:
+                status = row.get('status') or row.get('Status')
+                password = row.get('password') or row.get('Password')
+                task = row.get('task') or row.get('Task') or row.get('SSID')
+                if status != 'FOUND':
+                    report['ignored'] += 1
+                    continue
+                line = self._fmt_task(task, password)
+                if line:
+                    entries.append(line)
+                else:
+                    report['invalid'] += 1
         except (csv.Error, OSError, TypeError, ValueError) as e:
             logging.error(f"[A_pwmenu] CSV import failed: {e}")
-        return c
+            raise ValueError(f"CSV import failed: {e}")
+        return self._merge_import_lines(entries, report)
+
+    def _fmt_task(self, task, password):
+        if not task or not password:
+            return None
+        clean_task = re.sub(r'<[^>]+>', '', str(task)).strip()
+        return self._fmt(clean_task, str(password))
 
     def _fmt(self, t, p):
-        if len(t)>17:
-            m=t[-17:]
-            if ':' in m: return f"{m}:{m}:{t[:-17]}:{p}"
+        if len(t) > 17:
+            mac = t[-17:]
+            if re.fullmatch(r'(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}', mac):
+                return f"{mac}:{mac}:{t[:-17]}:{p}"
         return None
 
+    def _parse_pot_line(self, line):
+        match = re.fullmatch(
+            r'((?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}):'
+            r'((?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}):(.*):(.*)',
+            line or ''
+        )
+        if not match:
+            return None
+        return {
+            'bssid': match.group(1).lower(),
+            'station': match.group(2).lower(),
+            'essid': match.group(3),
+            'password': match.group(4)
+        }
+
+    def _pot_line_key(self, line):
+        record = self._parse_pot_line(line)
+        if record:
+            return record['bssid'], record['essid'], record['password']
+        return 'raw', line
+
+    def _read_pot_lines(self, path):
+        if not os.path.exists(path):
+            return [], b''
+        with self.potfile_lock:
+            with open(path, 'rb') as handle:
+                raw = handle.read()
+        text = raw.replace(b'\0', b'').decode('utf-8', errors='ignore')
+        lines = [line.strip('\r\n') for line in text.splitlines() if line.strip('\r\n')]
+        return lines, raw
+
+    def _dedupe_pot_lines(self, lines):
+        unique = []
+        keys = set()
+        duplicates = 0
+        for line in lines:
+            clean = line.replace('\0', '')
+            if not clean:
+                continue
+            key = self._pot_line_key(clean)
+            if key in keys:
+                duplicates += 1
+                continue
+            keys.add(key)
+            unique.append(clean)
+        return unique, keys, duplicates
+
+    def _write_pot_lines(self, path, lines):
+        payload = ('\n'.join(lines) + ('\n' if lines else '')).encode('utf-8')
+        directory = os.path.dirname(path)
+        os.makedirs(directory, exist_ok=True)
+        with self.potfile_lock:
+            fd, tmp_path = tempfile.mkstemp(prefix='.pwmenu-pot-', dir=directory)
+            os.close(fd)
+            try:
+                try:
+                    os.chmod(tmp_path, 0o644)
+                except OSError:
+                    pass
+                with open(tmp_path, 'wb') as handle:
+                    handle.write(payload)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(tmp_path, path)
+                try:
+                    flags = os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0)
+                    dir_fd = os.open(directory, flags)
+                    try:
+                        os.fsync(dir_fd)
+                    finally:
+                        os.close(dir_fd)
+                except OSError:
+                    pass
+            finally:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+
+    def _normalize_potfile(self, path):
+        try:
+            with self.potfile_lock:
+                lines, raw = self._read_pot_lines(path)
+                unique, _, duplicates = self._dedupe_pot_lines(lines)
+                expected = ('\n'.join(unique) + ('\n' if unique else '')).encode('utf-8')
+                if raw != expected:
+                    self._write_pot_lines(path, unique)
+                    logging.info(
+                        f"[A_pwmenu] Normalized potfile {os.path.basename(path)}: "
+                        f"{raw.count(bytes([0]))} NUL byte(s), {duplicates} duplicate(s) removed"
+                    )
+            return self._potfile_health(path)
+        except OSError as e:
+            logging.warning(f"[A_pwmenu] Could not normalize potfile {path}: {e}")
+            return self._potfile_health(path)
+
+    def _potfile_health(self, path):
+        try:
+            lines, raw = self._read_pot_lines(path)
+            unique, _, duplicates = self._dedupe_pot_lines(lines)
+            invalid = sum(1 for line in unique if not self._parse_pot_line(line))
+            nul_bytes = raw.count(bytes([0]))
+            return {
+                'ok': nul_bytes == 0 and duplicates == 0 and invalid == 0,
+                'credentials': len(unique) - invalid,
+                'lines': len(lines),
+                'duplicates': duplicates,
+                'invalid': invalid,
+                'nul_bytes': nul_bytes,
+                'bytes': len(raw)
+            }
+        except OSError as e:
+            return {
+                'ok': False, 'credentials': 0, 'lines': 0, 'duplicates': 0,
+                'invalid': 0, 'nul_bytes': 0, 'bytes': 0, 'error': str(e)
+            }
+
+    def _merge_import_lines(self, entries, report):
+        with self.potfile_lock:
+            self._normalize_potfile(self.potfile_ohc)
+            existing_lines, _ = self._read_pot_lines(self.potfile_ohc)
+            existing_lines, existing_keys, _ = self._dedupe_pot_lines(existing_lines)
+            input_keys = set()
+            additions = []
+            for line in entries:
+                key = self._pot_line_key(line)
+                if key in input_keys:
+                    report['duplicates'] += 1
+                    continue
+                input_keys.add(key)
+                if key in existing_keys:
+                    report['already'] += 1
+                    continue
+                existing_keys.add(key)
+                additions.append(line)
+            if additions:
+                self._write_pot_lines(self.potfile_ohc, existing_lines + additions)
+        report['added'] = len(additions)
+        return report
+
     def _read_pot(self, p):
-        s=set()
-        if os.path.exists(p):
-            with open(p) as f:
-                for l in f: s.add(l.strip())
-        return s
+        lines, _ = self._read_pot_lines(p)
+        clean, _, _ = self._dedupe_pot_lines(lines)
+        return set(clean)
 
     def _serve_zip(self):
         m = self._new_archive_buffer()
@@ -2342,11 +2498,15 @@ class A_pwmenu(plugins.Plugin):
         for p, s in pots:
             if os.path.exists(p):
                 try:
-                    with open(p, 'r', errors='ignore') as f:
-                        for l in f:
-                            pt = l.strip().split(':')
-                            if len(pt)>=3:
-                                d[pt[-2]] = {'password': pt[-1], 'source': s}
+                    lines, _ = self._read_pot_lines(p)
+                    for line in lines:
+                        record = self._parse_pot_line(line)
+                        if record:
+                            d[record['essid']] = {'password': record['password'], 'source': s}
+                            continue
+                        parts = line.split(':')
+                        if len(parts) >= 3:
+                            d[parts[-2]] = {'password': parts[-1], 'source': s}
                 except OSError as e:
                     logging.warning(f"[A_pwmenu] Could not read potfile {p}: {e}")
         for ddir in self.handshake_dirs:
@@ -2664,6 +2824,19 @@ class A_pwmenu(plugins.Plugin):
                     {% if ohc_status.retry_in > 0 %} • retry in {{ ohc_status.retry_in }}s{% endif %}
                 </div>
                 <div class="sub" style="margin-top:4px;">Scans every uncracked PCAP and submits only hashes absent from the OHC task list.</div>
+            </div>
+
+            <div class="card" style="padding:15px;text-align:left;">
+                <h3 style="margin-top:0;text-align:center;">OHC Password Storage</h3>
+                <div style="font-weight:800;color:{{ 'var(--green)' if pot_health.ok else 'var(--danger)' }};">
+                    {{ 'Healthy' if pot_health.ok else 'Needs attention' }}
+                </div>
+                <div class="sub" style="margin-top:8px;">
+                    {{ pot_health.credentials }} credential(s) - {{ pot_health.bytes }} byte(s)
+                </div>
+                <div class="sub" style="margin-top:4px;">
+                    {{ pot_health.duplicates }} duplicate(s) - {{ pot_health.invalid }} invalid line(s) - {{ pot_health.nul_bytes }} NUL byte(s)
+                </div>
             </div>
 
             <div class="card">
