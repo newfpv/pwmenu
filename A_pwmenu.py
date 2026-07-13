@@ -43,7 +43,7 @@ logging.info("[A_pwmenu] Module init.")
 
 class A_pwmenu(plugins.Plugin):
     __author__ = 'NewFPV'
-    __version__ = '1.1.1'
+    __version__ = '1.1.2'
     __license__ = 'GPL3'
     __description__ = 'Ultimate Password Manager'
 
@@ -2553,16 +2553,7 @@ class A_pwmenu(plugins.Plugin):
             {% if not cracked %}<div style="padding:30px;text-align:center;color:var(--sub);">No cracked networks yet.</div>{% endif %}
         </div>
 
-        <div id="v-handshakes" class="hidden">
-            <div class="card" style="padding:15px;text-align:left;">
-                <button class="btn" style="margin-top:0;background:#ff9f0a;" onclick="sendAllMissingToOhc()">Send all missing to OHC</button>
-                <div class="sub" style="margin-top:10px;">
-                    Persistent queue: {{ ohc_status.pending }} file(s)
-                    {% if ohc_status.retry_in > 0 %} • retry in {{ ohc_status.retry_in }}s{% endif %}
-                </div>
-                <div class="sub" style="margin-top:4px;">Scans every uncracked PCAP and submits only hashes absent from the OHC task list.</div>
-            </div>
-            <div class="list">
+        <div id="v-handshakes" class="list hidden">
             {% for g in groups %}
             <div class="si" data-t="{{ g.essid }}">
                 <div class="row">
@@ -2595,7 +2586,6 @@ class A_pwmenu(plugins.Plugin):
                 </div>
             </div>
             {% endfor %}
-            </div>
         </div>
 
         <div id="v-map" class="map-shell hidden">
@@ -2660,6 +2650,16 @@ class A_pwmenu(plugins.Plugin):
         </div>
 
         <div id="v-other" class="hidden">
+            <div class="card" style="padding:15px;text-align:left;">
+                <h3 style="margin-top:0;text-align:center;">OnlineHashCrack</h3>
+                <button class="btn" style="margin-top:0;background:#ff9f0a;" onclick="sendAllMissingToOhc()">Send all missing to OHC</button>
+                <div class="sub" style="margin-top:10px;">
+                    Persistent queue: {{ ohc_status.pending }} file(s)
+                    {% if ohc_status.retry_in > 0 %} • retry in {{ ohc_status.retry_in }}s{% endif %}
+                </div>
+                <div class="sub" style="margin-top:4px;">Scans every uncracked PCAP and submits only hashes absent from the OHC task list.</div>
+            </div>
+
             <div class="card">
                 <h3 style="margin-top:0">Achievements</h3>
                 <div class="ach-list">

@@ -2,6 +2,12 @@
 
 All notable changes to A_pwmenu are documented here.
 
+## 1.1.2 — 2026-07-13
+
+- Moved **Send all missing to OHC** and its persistent queue status to the Other tab.
+- Fixed Handshakes rows being rendered but hidden by the tab controller after the v1.1.1 layout change.
+- Confirmed that existing PCAP files and OHC queue state remain untouched by the UI correction.
+
 ## 1.1.1 — 2026-07-13
 
 - Added a **Send all missing to OHC** reconciliation action.

@@ -13,7 +13,7 @@
     <text x="640" y="82" font-size="34" font-weight="700">WWW</text>
     <text x="755" y="82" font-size="34">C</text>
     <text x="835" y="82" font-size="34" font-weight="700">UP</text>
-    <text x="55" y="132" font-size="22">A_pwmenu 1.1.1 · compact connection status</text>
+    <text x="55" y="132" font-size="22">A_pwmenu 1.1.2 · compact connection status</text>
   </g>
   <g font-family="-apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="21" fill="#333333">
     <circle cx="72" cy="205" r="8" fill="#30a46c"/>
