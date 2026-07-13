@@ -2,6 +2,14 @@
 
 All notable changes to A_pwmenu are documented here.
 
+## 1.1.5 — 2026-07-14
+
+- Updated the OnlineHashCrack `add_tasks` payload to match the private API v2 schema by removing the unsupported `receive_email` field.
+- Made `list_tasks` reconciliation advisory for transient failures while continuing to respect the API's per-key hourly rate limit.
+- Persisted reported hashes and hash-to-file metadata after every successful batch, reducing duplicate work after sudden power loss.
+- Removed locally cracked captures from the persistent OHC queue and stopped the resulting busy retry loop.
+- Documented OHC's server-side `already_sent` deduplication behavior and the revised queue states.
+
 ## 1.1.4 — 2026-07-13
 
 - Added automatic UTF-8 potfile normalization with NUL removal and credential-level deduplication.

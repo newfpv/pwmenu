@@ -9,7 +9,6 @@ main.plugins.A_pwmenu.ohc_enabled = false
 main.plugins.A_pwmenu.ohc_api_key = ""
 main.plugins.A_pwmenu.ohc_auto_upload = true
 main.plugins.A_pwmenu.ohc_sync_interval = 3600
-main.plugins.A_pwmenu.ohc_receive_email = "yes"
 main.plugins.A_pwmenu.ohc_retry_poll_interval = 60
 main.plugins.A_pwmenu.ohc_reconcile_on_start = false
 
