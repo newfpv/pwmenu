@@ -2,7 +2,7 @@
 
 An advanced Pwnagotchi handshake and password manager with a mobile-friendly web interface, GPS-aware capture indexing, map visualization, WPA-sec integration, OnlineHashCrack API v2 support, exports, imports, and a compact on-device GPS status indicator.
 
-[![Version](https://img.shields.io/badge/version-1.1.0-0a84ff)](./CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-1.1.1-0a84ff)](./CHANGELOG.md)
 [![License](https://img.shields.io/badge/license-GPL--3.0-30d158)](./LICENSE)
 
 <p align="center">
@@ -91,6 +91,9 @@ The web interface can:
 - Persistent OHC rate-limit backoff.
 - `Retry-After` handling for HTTP 429 responses.
 - A failed batch stops the current upload cycle instead of hammering the API.
+- Persistent file queue with automatic retry after backoff.
+- Signature-aware rescanning when an existing PCAP receives new handshake data.
+- One-click reconciliation that sends every local hash missing from the OHC task list.
 
 ### GPS and map support
 
@@ -110,6 +113,7 @@ The web interface can:
 ### Reliability and hardening
 
 - Atomic JSON state writes with `fsync()` and `os.replace()`.
+- Backup state snapshots and parent-directory `fsync()` for sudden power-loss recovery.
 - Locks around shared state, GPS data, and upload workers.
 - `SpooledTemporaryFile` archives to avoid storing large ZIP files entirely in RAM.
 - Unique temporary conversion outputs.
@@ -157,7 +161,7 @@ GPSD polling is cached. An unavailable local GPSD daemon therefore does not bloc
 
 ## Compatibility and requirements
 
-A_pwmenu 1.1.0 has been developed and tested with:
+A_pwmenu 1.1.1 has been developed and tested with:
 
 - Pwnagotchi 2.x, including Jayofelony-based images.
 - Python 3.11 from the Pwnagotchi virtual environment.
@@ -199,10 +203,10 @@ sudo /home/pi/.pwn/bin/pip install websockets
 
 ```bash
 sudo wget -O /usr/local/share/pwnagotchi/custom-plugins/A_pwmenu.py \
-  https://raw.githubusercontent.com/newfpv/pwmenu/v1.1.0/A_pwmenu.py
+  https://raw.githubusercontent.com/newfpv/pwmenu/v1.1.1/A_pwmenu.py
 ```
 
-Continue with the syntax check and configuration steps below. Pinning the release tag keeps the installed code reproducible; replace `v1.1.0` only when intentionally upgrading.
+Continue with the syntax check and configuration steps below. Pinning the release tag keeps the installed code reproducible; replace `v1.1.1` only when intentionally upgrading.
 
 ### 1. Back up an existing version
 
@@ -330,6 +334,8 @@ The standard WPA-sec plugin may remain enabled for its normal automatic submissi
 | `ohc_auto_upload` | bool | `true` | Starts the OHC worker when internet becomes available and when a new handshake is captured. |
 | `ohc_sync_interval` | int | `3600` | Minimum interval between OHC `list_tasks` synchronization attempts, in seconds. |
 | `ohc_receive_email` | string | `yes` | Requests OHC email notification when supported by the account and API. |
+| `ohc_retry_poll_interval` | int | `60` | Maximum scheduler sleep while a persistent OHC queue is waiting, in seconds. |
+| `ohc_reconcile_on_start` | bool | `false` | Forces a complete local-versus-server hash reconciliation after every plugin start. |
 | `pwndroid_ws_enabled` | bool | `true` | Enables the PwnDroid WebSocket GPS client. |
 | `pwndroid_mac` | string | empty | Bluetooth MAC address of the phone, used to discover its current PAN gateway address. |
 | `pwndroid_gateway` | string | empty | Explicit phone IP. Leave empty for dynamic gateway discovery. |
@@ -427,6 +433,9 @@ The Handshakes tab groups capture files and shows:
 - GPS availability.
 - Crack status.
 - OHC status.
+- Persistent OHC queue size and retry countdown.
+
+The **Send all missing to OHC** button requests a fresh account task list, scans every uncracked local PCAP, and queues only hashes that are absent from OHC.
 
 Per-file actions:
 
@@ -494,7 +503,10 @@ For an OHC submission, A_pwmenu:
 6. Splits new hashes into batches of up to 50.
 7. Sends them with `algo_mode = 22000`.
 8. Records the relationship between each hash and its source PCAP.
-9. Persists API status and rate-limit state.
+9. Persists API status, PCAP signatures, the upload queue, and rate-limit state.
+10. Automatically resumes queued work after `Retry-After` expires.
+
+A PCAP that grows after an earlier submission is extracted again. Previously submitted hashes remain deduplicated, while newly appended handshake material is queued normally.
 
 Possible local OHC states:
 
@@ -505,10 +517,11 @@ Possible local OHC states:
 | `invalid` | OHC rejected the format or algorithm. |
 | `failed` | Extraction, network communication, or the API call failed. |
 | `found` | A synchronized task reports that a result is available. |
+| `queued` | The file is durably queued until connectivity and rate limits allow processing. |
 
 ### HTTP 429 and backoff
 
-`429 rate_limit_exceeded` does not mean the plugin is broken. A_pwmenu saves the next allowed attempt in its state file and suppresses new automatic workers until that time.
+`429 rate_limit_exceeded` does not mean the plugin is broken. A_pwmenu saves the next allowed attempt and every pending file in its state, suppresses API calls until that time, and automatically resumes the queue afterward.
 
 Inspect OHC log entries:
 
@@ -624,7 +637,8 @@ The display element follows the visual style of the standard Bluetooth and inter
 | Path | Purpose |
 |---|---|
 | `/usr/local/share/pwnagotchi/custom-plugins/A_pwmenu.py` | Plugin source. |
-| `/root/handshakes/.a_pwmenu_data.json` | XP, achievements, GPS index, OHC metadata, and file index. |
+| `/root/handshakes/.a_pwmenu_data.json` | XP, achievements, GPS index, OHC metadata, signatures, and persistent queue. |
+| `/root/handshakes/.a_pwmenu_data.json.bak` | Crash-recovery snapshot written atomically before the primary state file. |
 | `/root/handshakes/.a_pwmenu_data.json.tmp` | Atomic-write temporary file. It should not remain after a successful write. |
 | `/root/handshakes/onlinehashcrack.cracked.potfile` | Imported OHC results. |
 | `/root/handshakes/manual.potfile` | Manually managed passwords. |
@@ -836,6 +850,8 @@ A valid PCAP container does not necessarily contain a complete EAPOL exchange or
 
 ### Recover from a damaged state file
 
+A_pwmenu first tries the newest state copy and automatically falls back to `.a_pwmenu_data.json.bak` if the primary file is invalid. Manual reset is only required when both copies are damaged:
+
 ```bash
 sudo systemctl stop pwnagotchi
 
@@ -846,7 +862,7 @@ sudo mv \
 sudo systemctl start pwnagotchi
 ```
 
-A_pwmenu creates a new state file. Existing PCAP and potfile data remain intact, but XP, achievements, cached locations, and internal OHC markers are reset.
+A_pwmenu creates a new state file and rebuilds the OHC queue from local captures. Existing PCAP and potfile data remain intact, but XP, achievements, and cached locations are reset.
 
 ### Time synchronization fails
 
@@ -888,6 +904,7 @@ Base path:
 | `/wpa-sec-upload` | Submit one PCAP to WPA-sec. |
 | `/wpa-sec-upload-cluster` | Start a background WPA-sec upload for a file list. |
 | `/ohc-upload-cluster` | Start the OHC worker for a file list. |
+| `/ohc-upload-all-missing` | Reconcile all local hashes with OHC and persist the missing-file queue. |
 | `/phone-gps` | Receive browser coordinates. |
 | `/add-password` | Add a local password. |
 | `/update-password` | Update a local password. |
@@ -958,4 +975,4 @@ A_pwmenu is distributed under the [GNU General Public License v3.0](./LICENSE). 
 
 ---
 
-Documented plugin version: **A_pwmenu 1.1.0**.
+Documented plugin version: **A_pwmenu 1.1.1**.

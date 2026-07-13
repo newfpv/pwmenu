@@ -2,6 +2,17 @@
 
 All notable changes to A_pwmenu are documented here.
 
+## 1.1.1 — 2026-07-13
+
+- Added a **Send all missing to OHC** reconciliation action.
+- Added a persistent OHC queue that survives service restarts and sudden power loss.
+- Changed OHC tracking from path-only markers to file signatures and individual mode 22000 hashes.
+- Changed modified PCAP files to be re-extracted while already submitted hashes remain deduplicated.
+- Added an OHC retry scheduler that automatically resumes after `Retry-After` expires.
+- Added crash-safe primary and backup state files with file and directory `fsync()`.
+- Added automatic recovery from the newest valid state copy.
+- Fixed new handshakes being forgotten when captured during an active OHC backoff window.
+
 ## 1.1.0 — 2026-07-13
 
 - Added independent WPA-sec and OnlineHashCrack upload paths.
