@@ -2,7 +2,7 @@
 
 An advanced Pwnagotchi handshake and password manager with a mobile-friendly web interface, GPS-aware capture indexing, map visualization, WPA-sec integration, OnlineHashCrack API v2 support, exports, imports, and a compact on-device GPS status indicator.
 
-[![Version](https://img.shields.io/badge/version-1.1.1-0a84ff)](./CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-1.1.2-0a84ff)](./CHANGELOG.md)
 [![License](https://img.shields.io/badge/license-GPL--3.0-30d158)](./LICENSE)
 
 <p align="center">
@@ -161,7 +161,7 @@ GPSD polling is cached. An unavailable local GPSD daemon therefore does not bloc
 
 ## Compatibility and requirements
 
-A_pwmenu 1.1.1 has been developed and tested with:
+A_pwmenu 1.1.2 has been developed and tested with:
 
 - Pwnagotchi 2.x, including Jayofelony-based images.
 - Python 3.11 from the Pwnagotchi virtual environment.
@@ -203,10 +203,10 @@ sudo /home/pi/.pwn/bin/pip install websockets
 
 ```bash
 sudo wget -O /usr/local/share/pwnagotchi/custom-plugins/A_pwmenu.py \
-  https://raw.githubusercontent.com/newfpv/pwmenu/v1.1.1/A_pwmenu.py
+  https://raw.githubusercontent.com/newfpv/pwmenu/v1.1.2/A_pwmenu.py
 ```
 
-Continue with the syntax check and configuration steps below. Pinning the release tag keeps the installed code reproducible; replace `v1.1.1` only when intentionally upgrading.
+Continue with the syntax check and configuration steps below. Pinning the release tag keeps the installed code reproducible; replace `v1.1.2` only when intentionally upgrading.
 
 ### 1. Back up an existing version
 
@@ -433,9 +433,6 @@ The Handshakes tab groups capture files and shows:
 - GPS availability.
 - Crack status.
 - OHC status.
-- Persistent OHC queue size and retry countdown.
-
-The **Send all missing to OHC** button requests a fresh account task list, scans every uncracked local PCAP, and queues only hashes that are absent from OHC.
 
 Per-file actions:
 
@@ -462,6 +459,7 @@ Yandex Maps requires internet access. If the external map API does not load, A_p
 
 The Other tab contains:
 
+- The **Send all missing to OHC** reconciliation action, persistent queue size, and retry countdown.
 - Achievements, level, and XP.
 - Capture and crack statistics.
 - Combined password export.
@@ -975,4 +973,4 @@ A_pwmenu is distributed under the [GNU General Public License v3.0](./LICENSE). 
 
 ---
 
-Documented plugin version: **A_pwmenu 1.1.1**.
+Documented plugin version: **A_pwmenu 1.1.2**.
