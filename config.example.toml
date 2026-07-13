@@ -1,0 +1,38 @@
+# Enable the plugin.
+main.plugins.A_pwmenu.enabled = true
+
+# WPA-sec. Leave empty to hide WPA-sec upload controls.
+main.plugins.A_pwmenu.wpa_sec_key = ""
+
+# OnlineHashCrack API v2.
+main.plugins.A_pwmenu.ohc_enabled = false
+main.plugins.A_pwmenu.ohc_api_key = ""
+main.plugins.A_pwmenu.ohc_auto_upload = false
+main.plugins.A_pwmenu.ohc_sync_interval = 3600
+main.plugins.A_pwmenu.ohc_receive_email = "yes"
+
+# PwnDroid GPS over the phone's Bluetooth PAN connection.
+main.plugins.A_pwmenu.pwndroid_ws_enabled = true
+main.plugins.A_pwmenu.pwndroid_mac = "AA:BB:CC:DD:EE:FF"
+main.plugins.A_pwmenu.pwndroid_gateway = ""
+main.plugins.A_pwmenu.pwndroid_extra_gateways = []
+main.plugins.A_pwmenu.pwndroid_port = 8080
+
+# Browser fixes and capture-sidecar assignment.
+main.plugins.A_pwmenu.phone_gps_enabled = true
+main.plugins.A_pwmenu.phone_gps_max_age = 600
+main.plugins.A_pwmenu.gps_assign_window = 180
+main.plugins.A_pwmenu.gps_stale_seconds = 180
+
+# Optional GPSD fallback.
+main.plugins.A_pwmenu.gpsd_enabled = false
+main.plugins.A_pwmenu.gpsd_host = "127.0.0.1"
+main.plugins.A_pwmenu.gpsd_port = 2947
+main.plugins.A_pwmenu.gpsd_poll_interval = 10
+
+# Operational limits.
+main.plugins.A_pwmenu.timezone = 0
+main.plugins.A_pwmenu.time_sync_interval = 1800
+main.plugins.A_pwmenu.hcxpcapngtool_timeout = 90
+main.plugins.A_pwmenu.import_max_bytes = 2097152
+main.plugins.A_pwmenu.archive_memory_limit = 2097152

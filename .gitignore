@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*.pcap
+*.pcapng
+*.22000
+*.hc22000
+*.potfile
+*.gps.json
+*.geo.json
+.a_pwmenu_data.json
+.a_pwmenu_ohc.json
+.env
+config.toml
+captures/
+handshakes/
