@@ -2,6 +2,14 @@
 
 All notable changes to A_pwmenu are documented here.
 
+## 1.1.4 — 2026-07-13
+
+- Added automatic UTF-8 potfile normalization with NUL removal and credential-level deduplication.
+- Made potfile updates atomic and durable with file and directory synchronization.
+- Added detailed CSV/JSON import results for added, existing, duplicate, ignored, and invalid rows.
+- Added an OHC Password Storage health panel to the Other tab.
+- Hardened potfile parsing for Unicode ESSIDs and concurrent imports.
+
 ## 1.1.3 — 2026-07-13
 
 - Added a 10-second safety margin to the `Retry-After` delay returned by OHC.
