@@ -43,7 +43,7 @@ logging.info("[A_pwmenu] Module init.")
 
 class A_pwmenu(plugins.Plugin):
     __author__ = 'NewFPV'
-    __version__ = '1.1.4'
+    __version__ = '1.1.5'
     __license__ = 'GPL3'
     __description__ = 'Ultimate Password Manager'
 
@@ -115,7 +115,6 @@ class A_pwmenu(plugins.Plugin):
         self.options.setdefault('ohc_api_key', '')
         self.options.setdefault('ohc_auto_upload', True)
         self.options.setdefault('ohc_sync_interval', 3600)
-        self.options.setdefault('ohc_receive_email', 'yes')
         self.options.setdefault('import_max_bytes', 2097152)
         self.options.setdefault('archive_memory_limit', 2097152)
         self.options.setdefault('hcxpcapngtool_timeout', 90)
@@ -669,9 +668,16 @@ class A_pwmenu(plugins.Plugin):
     def _pending_ohc_paths(self):
         with self.data_lock:
             pending = dict(self.data.setdefault('ohc_pending_files', {}))
+        cracked = self._get_cracked_data()
         paths = []
         changed = False
         for path, record in pending.items():
+            if self._essid_from_filename(os.path.basename(path)) in cracked:
+                with self.data_lock:
+                    self.data.setdefault('ohc_pending_files', {}).pop(path, None)
+                self._ohc_mark_path(path, 'local_cracked', 'Password already known locally')
+                changed = True
+                continue
             signature = self._ohc_file_signature(path)
             if not signature:
                 with self.data_lock:
@@ -810,10 +816,21 @@ class A_pwmenu(plugins.Plugin):
                     self.data['ohc_tasks_synced_at'] = time.time()
                     self.data['ohc_reconcile_requested'] = False
                 self._save_data()
-            elif time.time() < self._ohc_retry_at():
+            elif (
+                time.time() < self._ohc_retry_at()
+                and 'rate limit' in str(self.data.get('ohc_retry_reason', '')).lower()
+            ):
                 return self._ohc_backoff_message(), True
-            elif reconcile_requested:
-                return "OHC task reconciliation failed; queued files were preserved", True
+            else:
+                logging.warning(
+                    "[A_pwmenu] OHC task reconciliation unavailable; "
+                    "continuing upload with persistent local state"
+                )
+                with self.data_lock:
+                    self.data['ohc_tasks_synced_at'] = time.time()
+                    self.data['ohc_reconcile_requested'] = False
+                self._clear_ohc_backoff()
+                self._save_data()
 
         hashes = []
         hash_sources = {}
@@ -919,6 +936,12 @@ class A_pwmenu(plugins.Plugin):
                     else:
                         self._ohc_mark_path(path, 'sent', 'Submitted to OHC', path_hash_count.get(path, 0), request_id)
 
+            reported_hashes.update(batch)
+            with self.data_lock:
+                self.data['ohc_reported_hashes'] = sorted(reported_hashes)
+                self.data['ohc_hash_files'] = hash_files
+            self._save_data()
+
         if sent_hashes:
             for path in sent_paths:
                 if path and path not in reported:
@@ -1020,8 +1043,7 @@ class A_pwmenu(plugins.Plugin):
             'agree_terms': 'yes',
             'action': 'add_tasks',
             'algo_mode': 22000,
-            'hashes': [h.strip() for h in hashes if h.strip()],
-            'receive_email': self.options.get('ohc_receive_email', 'yes')
+            'hashes': [h.strip() for h in hashes if h.strip()]
         }
         try:
             res = requests.post('https://api.onlinehashcrack.com/v2', json=payload, timeout=30)
@@ -2823,7 +2845,7 @@ class A_pwmenu(plugins.Plugin):
                     Persistent queue: {{ ohc_status.pending }} file(s)
                     {% if ohc_status.retry_in > 0 %} • retry in {{ ohc_status.retry_in }}s{% endif %}
                 </div>
-                <div class="sub" style="margin-top:4px;">Scans every uncracked PCAP and submits only hashes absent from the OHC task list.</div>
+                <div class="sub" style="margin-top:4px;">Scans every uncracked PCAP, deduplicates locally, and lets OHC safely skip tasks that already exist.</div>
             </div>
 
             <div class="card" style="padding:15px;text-align:left;">
@@ -3051,6 +3073,7 @@ class A_pwmenu(plugins.Plugin):
             if(!o.status) return '<span class="map-chip gray">OHC Not sent</span>';
             if(o.status === 'sent') return '<span class="map-chip green">OHC Sent</span>';
             if(o.status === 'already_reported') return '<span class="map-chip blue">OHC Already exists</span>';
+            if(o.status === 'local_cracked') return '<span class="map-chip green">Password known locally</span>';
             if(o.status === 'queued') return '<span class="map-chip yellow">OHC Queued</span>';
             if(o.status === 'failed') return '<span class="map-chip red">OHC Failed</span>';
             if(o.status === 'invalid') return '<span class="map-chip yellow">OHC Invalid</span>';

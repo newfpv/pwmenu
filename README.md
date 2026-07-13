@@ -2,7 +2,7 @@
 
 An advanced Pwnagotchi handshake and password manager with a mobile-friendly web interface, GPS-aware capture indexing, map visualization, WPA-sec integration, OnlineHashCrack API v2 support, exports, imports, and a compact on-device GPS status indicator.
 
-[![Version](https://img.shields.io/badge/version-1.1.4-0a84ff)](./CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-1.1.5-0a84ff)](./CHANGELOG.md)
 [![License](https://img.shields.io/badge/license-GPL--3.0-30d158)](./LICENSE)
 
 <p align="center">
@@ -163,7 +163,7 @@ GPSD polling is cached. An unavailable local GPSD daemon therefore does not bloc
 
 ## Compatibility and requirements
 
-A_pwmenu 1.1.4 has been developed and tested with:
+A_pwmenu 1.1.5 has been developed and tested with:
 
 - Pwnagotchi 2.x, including Jayofelony-based images.
 - Python 3.11 from the Pwnagotchi virtual environment.
@@ -205,10 +205,10 @@ sudo /home/pi/.pwn/bin/pip install websockets
 
 ```bash
 sudo wget -O /usr/local/share/pwnagotchi/custom-plugins/A_pwmenu.py \
-  https://raw.githubusercontent.com/newfpv/pwmenu/v1.1.4/A_pwmenu.py
+  https://raw.githubusercontent.com/newfpv/pwmenu/v1.1.5/A_pwmenu.py
 ```
 
-Continue with the syntax check and configuration steps below. Pinning the release tag keeps the installed code reproducible; replace `v1.1.4` only when intentionally upgrading.
+Continue with the syntax check and configuration steps below. Pinning the release tag keeps the installed code reproducible; replace `v1.1.5` only when intentionally upgrading.
 
 ### 1. Back up an existing version
 
@@ -297,7 +297,6 @@ main.plugins.A_pwmenu.wpa_sec_key = "REPLACE_WITH_WPA_SEC_KEY"
 main.plugins.A_pwmenu.ohc_enabled = true
 main.plugins.A_pwmenu.ohc_api_key = "sk_REPLACE_WITH_OHC_API_KEY"
 main.plugins.A_pwmenu.ohc_auto_upload = true
-main.plugins.A_pwmenu.ohc_receive_email = "yes"
 main.plugins.A_pwmenu.ohc_sync_interval = 3600
 
 main.plugins.A_pwmenu.pwndroid_ws_enabled = true
@@ -335,7 +334,6 @@ The standard WPA-sec plugin may remain enabled for its normal automatic submissi
 | `ohc_api_key` | string | empty | OHC private API v2 key. It should use the `sk_` prefix. |
 | `ohc_auto_upload` | bool | `true` | Starts the OHC worker when internet becomes available and when a new handshake is captured. |
 | `ohc_sync_interval` | int | `3600` | Minimum interval between OHC `list_tasks` synchronization attempts, in seconds. |
-| `ohc_receive_email` | string | `yes` | Requests OHC email notification when supported by the account and API. |
 | `ohc_retry_poll_interval` | int | `60` | Maximum scheduler sleep while a persistent OHC queue is waiting, in seconds. |
 | `ohc_reconcile_on_start` | bool | `false` | Forces a complete local-versus-server hash reconciliation after every plugin start. |
 | `pwndroid_ws_enabled` | bool | `true` | Enables the PwnDroid WebSocket GPS client. |
@@ -499,12 +497,13 @@ For an OHC submission, A_pwmenu:
 2. Runs local `hcxpcapngtool` with a unique temporary output file.
 3. Removes empty lines and duplicate mode 22000 hashes.
 4. Synchronizes existing OHC tasks when the configured interval has elapsed.
-5. Excludes already reported hashes.
-6. Splits new hashes into batches of up to 50.
-7. Sends them with `algo_mode = 22000`.
-8. Records the relationship between each hash and its source PCAP.
-9. Persists API status, PCAP signatures, the upload queue, and rate-limit state.
-10. Automatically resumes queued work after `Retry-After` expires.
+5. Continues with persistent local state if `list_tasks` is temporarily unavailable, while still respecting a server-issued per-key rate limit; `add_tasks` safely reports existing hashes as `skipped: already_sent`.
+6. Excludes already reported hashes.
+7. Splits new hashes into batches of up to 50.
+8. Sends them with `algo_mode = 22000`.
+9. Records the relationship between each hash and its source PCAP.
+10. Persists every successful batch, PCAP signatures, the upload queue, and rate-limit state before continuing.
+11. Automatically resumes queued work after `Retry-After` expires.
 
 A PCAP that grows after an earlier submission is extracted again. Previously submitted hashes remain deduplicated, while newly appended handshake material is queued normally.
 
@@ -514,6 +513,7 @@ Possible local OHC states:
 |---|---|
 | `sent` | The task was accepted by OHC. |
 | `already_reported` | The hash already existed or was skipped as a duplicate. |
+| `local_cracked` | The password is already known locally, so the file is removed from the upload queue. |
 | `invalid` | OHC rejected the format or algorithm. |
 | `failed` | Extraction, network communication, or the API call failed. |
 | `found` | A synchronized task reports that a result is available. |
@@ -981,4 +981,4 @@ A_pwmenu is distributed under the [GNU General Public License v3.0](./LICENSE). 
 
 ---
 
-Documented plugin version: **A_pwmenu 1.1.4**.
+Documented plugin version: **A_pwmenu 1.1.5**.
