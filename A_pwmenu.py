@@ -16,6 +16,7 @@ import threading
 import asyncio
 import email.utils
 import html
+import hashlib
 import shutil
 import tempfile
 import pwnagotchi.plugins as plugins
@@ -43,7 +44,7 @@ logging.info("[A_pwmenu] Module init.")
 
 class A_pwmenu(plugins.Plugin):
     __author__ = 'NewFPV'
-    __version__ = '1.1.6'
+    __version__ = '1.2.0'
     __license__ = 'GPL3'
     __description__ = 'Ultimate Password Manager'
 
@@ -75,6 +76,7 @@ class A_pwmenu(plugins.Plugin):
         self.gpsd_last_poll = 0
         self.ohc_uploading = False
         self.ohc_upload_lock = threading.Lock()
+        self.ohc_thread_lock = threading.Lock()
         self.ohc_upload_thread = None
         self.ohc_upload_faces = ('0__1', '1__0', '0__0', '1__1')
         self.ohc_upload_face = '0__0'
@@ -84,12 +86,16 @@ class A_pwmenu(plugins.Plugin):
         self.ohc_progress_current = 0
         self.ohc_progress_total = 0
         self.ohc_progress_name = ''
-        self.ohc_found_notice = ''
-        self.ohc_found_notice_checked = 0
         self.ohc_last_result = ''
         self.ohc_scheduler_running = False
         self.ohc_scheduler_thread = None
         self.ohc_scheduler_wakeup = threading.Event()
+        self.capture_analysis_lock = threading.Lock()
+        self.quality_thread_lock = threading.Lock()
+        self.quality_scan_thread = None
+        self.quality_pending = set()
+        self.quality_scan_all = False
+        self.quality_scan_running = False
 
     def on_loaded(self):
         logging.info("[A_pwmenu] Loaded.")
@@ -121,8 +127,14 @@ class A_pwmenu(plugins.Plugin):
         self.options.setdefault('hcxpcapngtool_timeout', 90)
         self.options.setdefault('ohc_retry_poll_interval', 60)
         self.options.setdefault('ohc_reconcile_on_start', False)
+        self.options.setdefault('quality_auto_scan', True)
+        self.options.setdefault('quality_scan_delay_ms', 250)
+        self.options.setdefault('auto_replace_unusable', True)
         self._start_pwndroid_ws()
         self.ready = True
+        self.quality_scan_running = True
+        if self._option_bool('quality_auto_scan', True):
+            self._start_quality_scan_thread(scan_all=True)
         if self._option_bool('ohc_auto_upload', True):
             reconcile = self._option_bool('ohc_reconcile_on_start', False)
             if reconcile:
@@ -167,16 +179,6 @@ class A_pwmenu(plugins.Plugin):
                 ui.set('status', self.ohc_display_status[:32])
             except Exception as e:
                 logging.debug(f"[A_pwmenu] OHC display result failed: {e}")
-        else:
-            try:
-                if time.time() - self.ohc_found_notice_checked > 30:
-                    self.ohc_found_notice = self._ohc_pending_found_notice()
-                    self.ohc_found_notice_checked = time.time()
-                if self.ohc_found_notice:
-                    ui.set('status', self.ohc_found_notice[:64])
-            except Exception as e:
-                logging.debug(f"[A_pwmenu] OHC found notice failed: {e}")
-
         try:
             interval = int(self.options.get('time_sync_interval', 1800))
         except (TypeError, ValueError):
@@ -188,6 +190,7 @@ class A_pwmenu(plugins.Plugin):
     def on_unload(self, ui):
         self.pwndroid_running = False
         self.ohc_scheduler_running = False
+        self.quality_scan_running = False
         self.ohc_scheduler_wakeup.set()
         try:
             with ui._lock:
@@ -227,6 +230,7 @@ class A_pwmenu(plugins.Plugin):
         if self._option_bool('ohc_auto_upload', True):
             self._queue_ohc_files([os.path.basename(filename)], force=False)
             self._start_ohc_upload_thread()
+        self._start_quality_scan_thread([os.path.basename(filename)])
 
     def on_webhook(self, path, request):
         if not self.ready:
@@ -258,6 +262,14 @@ class A_pwmenu(plugins.Plugin):
                 if path == 'clean-broken':
                     d, t = self._clean_broken_handshakes()
                     return self._render_page(notification=f"Removed {d}/{t} broken files", notif_type="success", active_tab='other')
+
+                if path == 'clean-empty-pcaps':
+                    deleted, total, message = self._clean_empty_pcaps(request.form.get('report_token') or '')
+                    return self._render_page(
+                        notification=message or f"Removed {deleted}/{total} empty PCAP files",
+                        notif_type="success" if deleted == total else "error",
+                        active_tab='other'
+                    )
 
                 if path == 'nuke-all':
                     c = self._nuke_all_handshakes()
@@ -383,6 +395,7 @@ class A_pwmenu(plugins.Plugin):
         gps_status = self._gps_status()
         ohc_status = self._ohc_status()
         pot_health = self._potfile_health(self.potfile_ohc)
+        empty_report = self._empty_pcap_report()
         ach = self._update_achievements(groups, cracked)
 
         t_nets = len(groups)
@@ -407,7 +420,7 @@ class A_pwmenu(plugins.Plugin):
             tab=active_tab, stats=stats, ach=ach['badges'], token=tok,
             show_wpa=show_wpa, map_points=map_points, gps_status=gps_status,
             no_gps_networks=no_gps_networks, ohc_status=ohc_status,
-            pot_health=pot_health
+            pot_health=pot_health, empty_report=empty_report
         )
 
         r = make_response(html)
@@ -586,6 +599,290 @@ class A_pwmenu(plugins.Plugin):
             records = self.data.setdefault('ohc_files', {})
             return dict(records.get(os.path.basename(filename), {}) or {})
 
+    def _quality_file_record(self, filename, path=None):
+        if not filename:
+            return {}
+        name = os.path.basename(filename)
+        with self.data_lock:
+            record = dict(self.data.setdefault('capture_quality', {}).get(name, {}) or {})
+        if path and record.get('signature') != self._ohc_file_signature(path):
+            return {}
+        return record
+
+    def _handshake_identity(self, filename):
+        name = os.path.splitext(os.path.basename(filename or ''))[0]
+        if '_' not in name:
+            return name, ''
+        essid, raw_bssid = name.rsplit('_', 1)
+        bssid = re.sub(r'[^0-9a-f]', '', raw_bssid.lower())
+        if len(bssid) != 12:
+            return name, ''
+        return essid, bssid
+
+    def _quality_metric(self, report, label):
+        match = re.search(rf'^{re.escape(label)}\.*:\s*(\d+)', report, re.MULTILINE | re.IGNORECASE)
+        return int(match.group(1)) if match else 0
+
+    def _classify_capture_quality(self, report, hashes, file_size):
+        eapol = self._quality_metric(report, 'EAPOL messages (total)')
+        m1 = self._quality_metric(report, 'EAPOL M1 messages (total)')
+        m2 = self._quality_metric(report, 'EAPOL M2 messages (total)')
+        m3 = self._quality_metric(report, 'EAPOL M3 messages (total)')
+        m4 = self._quality_metric(report, 'EAPOL M4 messages (total)')
+        best_pairs = self._quality_metric(report, 'EAPOL pairs (best)')
+        packets = self._quality_metric(report, 'packets inside')
+        authorized = sum(
+            int(value) for value in re.findall(
+                r'^EAPOL M(?:32E2|34E4).*?authorized.*?\.*:\s*(\d+)',
+                report,
+                re.MULTILINE | re.IGNORECASE,
+            )
+        )
+        pmkid_written = sum(
+            int(value) for value in re.findall(
+                r'^.*PMKID.*written.*?\.*:\s*(\d+)',
+                report,
+                re.MULTILINE | re.IGNORECASE,
+            )
+        )
+        pmkid_total = sum(
+            int(value) for value in re.findall(
+                r'^.*PMKID.*?\.*:\s*(\d+)',
+                report,
+                re.MULTILINE | re.IGNORECASE,
+            )
+        )
+        hash_count = len(hashes)
+
+        if hash_count and (authorized or pmkid_written):
+            grade, rank = 'Excellent', 3
+            summary = f"{hash_count} usable hash(es), authorized exchange"
+        elif hash_count:
+            grade, rank = 'Usable', 2
+            summary = f"{hash_count} usable WPA/PMKID hash(es)"
+        elif eapol or pmkid_total:
+            grade, rank = 'Partial', 1
+            present = '/'.join(str(value) for value in (m1, m2, m3, m4))
+            summary = f"Incomplete EAPOL exchange (M1/M2/M3/M4: {present})"
+        else:
+            grade, rank = 'Unusable', 0
+            summary = 'Empty PCAP header' if file_size == 24 else 'No WPA/PMKID material found'
+
+        return {
+            'grade': grade,
+            'rank': rank,
+            'summary': summary,
+            'hashes': hash_count,
+            'packets': packets,
+            'eapol': eapol,
+            'm1': m1,
+            'm2': m2,
+            'm3': m3,
+            'm4': m4,
+            'best_pairs': best_pairs,
+            'authorized': authorized,
+            'pmkid_written': pmkid_written,
+        }
+
+    def _store_capture_quality(self, path, quality):
+        name = os.path.basename(path)
+        record = dict(quality)
+        record['signature'] = self._ohc_file_signature(path)
+        record['updated_at'] = int(time.time())
+        with self.data_lock:
+            records = self.data.setdefault('capture_quality', {})
+            previous = dict(records.get(name, {}) or {})
+            records[name] = record
+            if (
+                previous.get('signature')
+                and previous.get('signature') != record['signature']
+                and int(previous.get('rank', -1)) < 2
+                and int(record.get('rank', -1)) >= 2
+            ):
+                history = self.data.setdefault('replacement_history', [])
+                history.append({
+                    'old': name,
+                    'replacement': name,
+                    'upgraded_in_place': True,
+                    'from_quality': previous.get('grade', 'Unknown'),
+                    'to_quality': record.get('grade', 'Unknown'),
+                    'updated_at': int(time.time())
+                })
+                del history[:-100]
+        self._save_data()
+        return record
+
+    def _run_capture_analysis(self, path):
+        output_path = None
+        try:
+            file_size = os.path.getsize(path)
+            if file_size == 24:
+                quality = self._classify_capture_quality('', [], file_size)
+                return [], self._store_capture_quality(path, quality)
+
+            with self.capture_analysis_lock:
+                with tempfile.NamedTemporaryFile(prefix='pwmenu-quality-', suffix='.22000', delete=False) as handle:
+                    output_path = handle.name
+                os.remove(output_path)
+                result = subprocess.run(
+                    ['/usr/bin/hcxpcapngtool', '-o', output_path, path],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    errors='replace',
+                    timeout=self._option_int('hcxpcapngtool_timeout', 90)
+                )
+                hashes = []
+                if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+                    with open(output_path, 'r', errors='ignore') as handle:
+                        hashes = list(dict.fromkeys(line.strip() for line in handle if line.strip()))
+                report = (result.stdout or '') + '\n' + (result.stderr or '')
+                quality = self._classify_capture_quality(report, hashes, file_size)
+                return hashes, self._store_capture_quality(path, quality)
+        except Exception as e:
+            logging.error(f"[A_pwmenu] Capture analysis failed for {path}: {e}")
+            return [], {}
+        finally:
+            if output_path:
+                try:
+                    os.remove(output_path)
+                except FileNotFoundError:
+                    pass
+
+    def _start_quality_scan_thread(self, filenames=None, scan_all=False):
+        if not self.quality_scan_running:
+            return
+        with self.quality_thread_lock:
+            for filename in filenames or []:
+                name = self._safe_handshake_name(os.path.basename(filename or ''))
+                if name:
+                    self.quality_pending.add(name)
+            if scan_all:
+                self.quality_scan_all = True
+            if self.quality_scan_thread and self.quality_scan_thread.is_alive():
+                return
+            self.quality_scan_thread = threading.Thread(
+                target=self._quality_scan_worker,
+                daemon=True,
+                name='pwmenu-quality-scan'
+            )
+            self.quality_scan_thread.start()
+
+    def _quality_scan_worker(self):
+        while self.quality_scan_running:
+            with self.quality_thread_lock:
+                if self.quality_pending:
+                    name = self.quality_pending.pop()
+                elif self.quality_scan_all:
+                    self.quality_scan_all = False
+                    for directory in self.handshake_dirs:
+                        if os.path.isdir(directory):
+                            for path in glob.glob(os.path.join(directory, '*.pcap')):
+                                self.quality_pending.add(os.path.basename(path))
+                    continue
+                else:
+                    self.quality_scan_thread = None
+                    return
+            path = self._find_handshake_path(name)
+            if not path:
+                continue
+            signature = self._ohc_file_signature(path)
+            quality = self._quality_file_record(name, path)
+            if not quality or quality.get('signature') != signature:
+                _, quality = self._run_capture_analysis(path)
+            if quality:
+                essid, bssid = self._handshake_identity(name)
+                self._replace_weaker_captures(essid, bssid)
+            delay = max(0, self._option_int('quality_scan_delay_ms', 250)) / 1000.0
+            if delay:
+                time.sleep(delay)
+
+    def _forget_handshake_state_locked(self, name, path):
+        self.data.setdefault('seen_files', {}).pop(name, None)
+        self.data.setdefault('locations', {}).pop(name, None)
+        self.data.setdefault('ohc_files', {}).pop(name, None)
+        self.data.setdefault('ohc_found_files', {}).pop(name, None)
+        self.data.setdefault('capture_quality', {}).pop(name, None)
+        self.data.setdefault('ohc_pending_files', {}).pop(path, None)
+        self.data.setdefault('ohc_file_signatures', {}).pop(path, None)
+        hash_files = self.data.setdefault('ohc_hash_files', {})
+        for hash_value, filename in list(hash_files.items()):
+            if filename == name:
+                hash_files.pop(hash_value, None)
+
+    def _archive_replaced_capture(self, old_path, replacement_path):
+        if not os.path.isfile(old_path) or old_path == replacement_path:
+            return False
+        name = os.path.basename(old_path)
+        suffix = f".replaced-{int(time.time())}"
+        archived_path = old_path + suffix
+        os.replace(old_path, archived_path)
+        base = os.path.splitext(old_path)[0]
+        for extension in ('.gps.json', '.geo.json', '.hc22000', '.22000'):
+            companion = base + extension
+            if os.path.isfile(companion):
+                os.replace(companion, companion + suffix)
+        try:
+            fd = os.open(os.path.dirname(old_path), os.O_RDONLY)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        except OSError:
+            pass
+        with self.data_lock:
+            self._forget_handshake_state_locked(name, old_path)
+            history = self.data.setdefault('replacement_history', [])
+            history.append({
+                'old': name,
+                'replacement': os.path.basename(replacement_path),
+                'archived': os.path.basename(archived_path),
+                'updated_at': int(time.time())
+            })
+            del history[:-100]
+        self._save_data()
+        logging.info(f"[A_pwmenu] Replaced weak capture {name} with {os.path.basename(replacement_path)}")
+        return True
+
+    def _replace_weaker_captures(self, essid, bssid):
+        if not self._option_bool('auto_replace_unusable', True) or not essid or not bssid:
+            return 0
+        candidates = []
+        for directory in self.handshake_dirs:
+            if not os.path.isdir(directory):
+                continue
+            for path in glob.glob(os.path.join(directory, '*.pcap')):
+                _, candidate_bssid = self._handshake_identity(path)
+                if candidate_bssid != bssid:
+                    continue
+                quality = self._quality_file_record(os.path.basename(path), path)
+                if quality:
+                    candidates.append((path, quality))
+        usable = [item for item in candidates if int(item[1].get('rank', -1)) >= 2]
+        if not usable:
+            return 0
+        best_path, _ = max(
+            usable,
+            key=lambda item: (
+                int(item[1].get('rank', 0)),
+                int(item[1].get('hashes', 0)),
+                os.path.getmtime(item[0])
+            )
+        )
+        replaced = 0
+        for path, quality in candidates:
+            if path == best_path or int(quality.get('rank', -1)) >= 2:
+                continue
+            if os.path.getmtime(best_path) <= os.path.getmtime(path):
+                continue
+            if os.path.getsize(path) == 24:
+                continue
+            try:
+                replaced += int(self._archive_replaced_capture(path, best_path))
+            except OSError as e:
+                logging.warning(f"[A_pwmenu] Could not archive weak capture {path}: {e}")
+        return replaced
+
     def _ohc_mark_file(self, filename, status, message='', hashes=0, request_id=''):
         name = os.path.basename(filename or '')
         if not name:
@@ -739,18 +1036,19 @@ class A_pwmenu(plugins.Plugin):
             self.ohc_last_result = self._ohc_backoff_message()
             self.ohc_scheduler_wakeup.set()
             return
-        if self.ohc_upload_thread and self.ohc_upload_thread.is_alive():
-            return
-        todo = self._pending_ohc_paths()
-        if not todo:
-            return
-        self.ohc_upload_thread = threading.Thread(
-            target=self._ohc_upload_worker,
-            args=(todo,),
-            daemon=True,
-            name='pwmenu-ohc-upload'
-        )
-        self.ohc_upload_thread.start()
+        with self.ohc_thread_lock:
+            if self.ohc_upload_thread and self.ohc_upload_thread.is_alive():
+                return
+            todo = self._pending_ohc_paths()
+            if not todo:
+                return
+            self.ohc_upload_thread = threading.Thread(
+                target=self._ohc_upload_worker,
+                args=(todo,),
+                daemon=True,
+                name='pwmenu-ohc-upload'
+            )
+            self.ohc_upload_thread.start()
 
     def _ohc_upload_worker(self, filenames=None):
         with self.ohc_upload_lock:
@@ -855,7 +1153,7 @@ class A_pwmenu(plugins.Plugin):
             extracted = self._ohc_extract_hashes(path)
             if not extracted:
                 failed_extract += 1
-                self._ohc_mark_path(path, 'invalid', 'No valid 22000 hashes extracted')
+                self._ohc_mark_path(path, 'invalid', 'No usable WPA or PMKID hash found')
                 self._complete_ohc_path(path)
                 continue
             path_hashes[path] = set()
@@ -902,7 +1200,7 @@ class A_pwmenu(plugins.Plugin):
                 return msg, False
             if failed_extract:
                 self._save_data()
-            return f"OHC: no valid hashes extracted ({failed_extract} failed)", True
+            return f"OHC: no usable hashes ({failed_extract} capture(s))", True
 
         accepted = 0
         skipped = 0
@@ -1039,30 +1337,8 @@ class A_pwmenu(plugins.Plugin):
             self.ohc_scheduler_wakeup.set()
 
     def _ohc_extract_hashes(self, pcap_path):
-        out = None
-        try:
-            with tempfile.NamedTemporaryFile(prefix='pwmenu-ohc-', suffix='.22000', delete=False) as tmp:
-                out = tmp.name
-            os.remove(out)
-            subprocess.run(
-                ['/usr/bin/hcxpcapngtool', '-o', out, pcap_path],
-                check=False,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=self._option_int('hcxpcapngtool_timeout', 90)
-            )
-            if os.path.exists(out) and os.path.getsize(out) > 0:
-                with open(out, 'r', errors='ignore') as f:
-                    return list(dict.fromkeys(line.strip() for line in f if line.strip()))
-        except Exception as e:
-            logging.error(f"[A_pwmenu] OHC extract failed for {pcap_path}: {e}")
-        finally:
-            if out:
-                try:
-                    os.remove(out)
-                except FileNotFoundError:
-                    pass
-        return []
+        hashes, _ = self._run_capture_analysis(pcap_path)
+        return hashes
 
     def _ohc_add_tasks(self, hashes, key):
         payload = {
@@ -1138,18 +1414,6 @@ class A_pwmenu(plugins.Plugin):
             self._set_ohc_backoff(300, f'OHC list_tasks failed: {e}')
             logging.warning(f"[A_pwmenu] OHC list_tasks failed: {e}")
             return False, set()
-
-    def _ohc_pending_found_notice(self):
-        with self.data_lock:
-            found = copy.deepcopy(self.data.get('ohc_found_files', {}))
-        if not isinstance(found, dict) or not found:
-            return ''
-        cracked = self._get_cracked_data()
-        for fname in sorted(found, key=lambda n: found.get(n, {}).get('updated_at', 0), reverse=True):
-            essid = self._essid_from_filename(fname)
-            if essid and essid not in cracked:
-                return f"OHC found {essid}"
-        return ''
 
     def _safe_handshake_name(self, value):
         if not isinstance(value, str):
@@ -1272,7 +1536,10 @@ class A_pwmenu(plugins.Plugin):
             'ohc_found_files': {},
             'ohc_pending_files': {},
             'ohc_file_signatures': {},
-            'ohc_reconcile_requested': False
+            'ohc_reconcile_requested': False,
+            'capture_quality': {},
+            'replacement_history': [],
+            'empty_cleanup_history': []
         }
         candidates = [self.data_file, self.data_file + '.bak']
         candidates = [p for p in candidates if os.path.exists(p)]
@@ -1302,6 +1569,12 @@ class A_pwmenu(plugins.Plugin):
             self.data['ohc_pending_files'] = {}
         if not isinstance(self.data.get('ohc_file_signatures'), dict):
             self.data['ohc_file_signatures'] = {}
+        if not isinstance(self.data.get('capture_quality'), dict):
+            self.data['capture_quality'] = {}
+        if not isinstance(self.data.get('replacement_history'), list):
+            self.data['replacement_history'] = []
+        if not isinstance(self.data.get('empty_cleanup_history'), list):
+            self.data['empty_cleanup_history'] = []
 
     def _save_data(self):
         try:
@@ -1812,6 +2085,7 @@ class A_pwmenu(plugins.Plugin):
             'gps_stale': bool(f.get('gps_stale', False)),
             'gps_age_at_capture': int(f.get('gps_age_at_capture', 0) or 0),
             'ohc': self._ohc_file_record(f.get('filename', '')),
+            'quality': dict(f.get('quality') or {}),
             'status': 'cracked' if g.get('is_cracked') else 'handshake'
         }
 
@@ -1939,7 +2213,8 @@ class A_pwmenu(plugins.Plugin):
                     'bssid': self._format_bssid(f.get('bssid', '')),
                     'date': f.get('date', ''),
                     'size': f.get('size', ''),
-                    'ohc': self._ohc_file_record(f.get('filename', ''))
+                    'ohc': self._ohc_file_record(f.get('filename', '')),
+                    'quality': dict(f.get('quality') or {})
                 })
             items.append({
                 'essid': g.get('essid', ''),
@@ -1951,6 +2226,7 @@ class A_pwmenu(plugins.Plugin):
                 'password': g.get('pwd', '') if g.get('is_cracked') else '',
                 'filename': first.get('filename', ''),
                 'ohc': self._ohc_file_record(first.get('filename', '')),
+                'quality': dict(first.get('quality') or {}),
                 'files': files
             })
         return items
@@ -2087,6 +2363,82 @@ class A_pwmenu(plugins.Plugin):
                 if os.path.isfile(companion):
                     os.remove(companion)
         return found
+
+    def _is_empty_pcap(self, path):
+        try:
+            if os.path.getsize(path) != 24:
+                return False
+            with open(path, 'rb') as handle:
+                magic = handle.read(4)
+            return magic in (
+                b'\xd4\xc3\xb2\xa1',
+                b'\xa1\xb2\xc3\xd4',
+                b'\x4d\x3c\xb2\xa1',
+                b'\xa1\xb2\x3c\x4d',
+            )
+        except OSError:
+            return False
+
+    def _empty_pcap_report(self):
+        entries = []
+        for directory in self.handshake_dirs:
+            if not os.path.isdir(directory):
+                continue
+            for path in sorted(glob.glob(os.path.join(directory, '*.pcap'))):
+                if not self._is_empty_pcap(path):
+                    continue
+                entries.append({
+                    'name': os.path.basename(path),
+                    'path': path,
+                    'signature': self._ohc_file_signature(path),
+                })
+        fingerprint = json.dumps(
+            [(entry['path'], entry['signature']) for entry in entries],
+            separators=(',', ':'),
+            ensure_ascii=True,
+        ).encode('utf-8')
+        return {
+            'count': len(entries),
+            'bytes': len(entries) * 24,
+            'names': [entry['name'] for entry in entries[:12]],
+            'more': max(0, len(entries) - 12),
+            'token': hashlib.sha256(fingerprint).hexdigest(),
+            'entries': entries,
+        }
+
+    def _clean_empty_pcaps(self, report_token):
+        report = self._empty_pcap_report()
+        total = report['count']
+        if not total:
+            return 0, total, 'No empty PCAP files to remove'
+        if not report_token:
+            return 0, total, 'Review the current empty PCAP report and confirm again.'
+        if not re.fullmatch(r'[0-9a-f]{64}', report_token) or report_token != report['token']:
+            return 0, total, 'Cleanup report changed. Review the current list and confirm again.'
+
+        deleted = 0
+        for entry in report['entries']:
+            path = entry['path']
+            if self._ohc_file_signature(path) != entry['signature'] or not self._is_empty_pcap(path):
+                continue
+            try:
+                os.remove(path)
+                base = os.path.splitext(path)[0]
+                for extension in ('.gps.json', '.geo.json', '.hc22000', '.22000'):
+                    companion = base + extension
+                    if os.path.isfile(companion):
+                        os.remove(companion)
+                with self.data_lock:
+                    self._forget_handshake_state_locked(entry['name'], path)
+                    history = self.data.setdefault('empty_cleanup_history', [])
+                    history.append({'file': entry['name'], 'deleted_at': int(time.time())})
+                    del history[:-200]
+                self._save_data()
+                deleted += 1
+            except OSError as e:
+                logging.warning(f"[A_pwmenu] Could not remove empty PCAP {path}: {e}")
+        logging.info(f"[A_pwmenu] Empty PCAP cleanup removed {deleted}/{total} file(s)")
+        return deleted, total, f"Removed {deleted}/{total} confirmed empty PCAP files"
 
     def _clean_broken_handshakes(self):
         d_cnt=0
@@ -2591,6 +2943,7 @@ class A_pwmenu(plugins.Plugin):
     def _scan_and_group_files(self, cracked):
         grps = {}
         data_changed = False
+        quality_pending = []
         with self.data_lock:
             seen_files = dict(self.data.setdefault('seen_files', {}))
         live_gps = self._fresh_live_gps()
@@ -2637,8 +2990,11 @@ class A_pwmenu(plugins.Plugin):
                     file_info = {
                         'filename': fn, 'bssid': bs, 'size': f"{round(st.st_size/1024,1)}KB",
                         'date': date_str,
-                        'ts': st.st_mtime
+                        'ts': st.st_mtime,
+                        'quality': self._quality_file_record(fn, f)
                     }
+                    if not file_info['quality']:
+                        quality_pending.append(fn)
                     if loc:
                         file_info.update({
                             'lat': loc.get('lat'),
@@ -2663,6 +3019,8 @@ class A_pwmenu(plugins.Plugin):
             with self.data_lock:
                 self.data['seen_files'] = seen_files
             self._save_data()
+        if quality_pending:
+            self._start_quality_scan_thread(quality_pending)
         res = list(grps.values())
         for g in res:
             g['files'].sort(key=lambda x: x['ts'], reverse=True)
@@ -2740,6 +3098,11 @@ class A_pwmenu(plugins.Plugin):
         .btn-xs.hc { color: #ff9f0a; }
         .hidden { display: none !important; }
         .badge { background: var(--input); color: var(--sub); font-size: 10px; padding: 2px 6px; border-radius: 4px; margin-left: 6px; text-transform: uppercase; font-weight: bold;}
+        .quality-badge { display:inline-flex;align-items:center;margin-top:5px;padding:3px 7px;border-radius:999px;font-size:10px;font-weight:850;letter-spacing:.04em;text-transform:uppercase;background:rgba(255,255,255,.06);color:#aeb2bb; }
+        .quality-badge.excellent { background:rgba(48,209,88,.12);color:#76e39b; }
+        .quality-badge.usable { background:rgba(30,155,255,.12);color:#8abfff; }
+        .quality-badge.partial { background:rgba(255,204,0,.12);color:#ffe08a; }
+        .quality-badge.unusable { background:rgba(255,69,58,.12);color:#ff918b; }
         .arr { font-size: 12px; color: #555; margin-left: 15px; }
         .add-btn { background: var(--input); border: none; color: var(--accent); width: 28px; height: 28px; border-radius: 14px; font-size: 18px; line-height: 28px; cursor: pointer; margin-left: 8px; padding: 0; }
         .notif { padding: 15px; text-align: center; border-radius: 12px; margin-bottom: 15px; animation: fi 0.5s; background: rgba(48, 209, 88, 0.2); color: var(--green); border: 1px solid var(--green); }
@@ -2795,6 +3158,7 @@ class A_pwmenu(plugins.Plugin):
         .map-point.cracked { border-color: #30d158; }
         .map-point.analyzing { border-color: #ffcc00; }
         .map-point.no-result { border-color: #8e8e93; }
+        .map-point.unusable { border-color: #ff453a; box-shadow: 0 8px 18px rgba(255,69,58,0.32); }
         .map-point.me { z-index: 5; width: 24px; height: 24px; border-width: 6px; border-color: #050507; background: #1e9bff; color: #fff; font-size: 10px; box-shadow: 0 0 0 10px rgba(30,155,255,0.18), 0 8px 18px rgba(0,0,0,0.25); }
         .map-point.dim { opacity: 0.25; pointer-events: none; }
         .map-empty { position: absolute; z-index: 3; left: 24px; right: 24px; top: 115px; padding: 18px; border-radius: 18px; text-align: center; color: #c9ccd2; background: rgba(20,22,27,0.86); box-shadow: 0 14px 35px rgba(0,0,0,0.22); }
@@ -2846,6 +3210,12 @@ class A_pwmenu(plugins.Plugin):
         .map-list-item { border: none; width:100%; text-align:left; border-radius: 18px; padding: 14px; color:#fff; background: rgba(255,255,255,0.045); cursor:pointer; box-sizing:border-box; }
         .map-list-item.green { background: rgba(4, 63, 32, 0.85); border: 1px solid rgba(7,140,69,0.8); }
         .map-list-item.blue { background: rgba(7, 31, 69, 0.86); border: 1px solid rgba(10,102,220,0.75); }
+        .map-list-item.red { background: rgba(74, 15, 18, 0.88); border: 1px solid rgba(255,69,58,0.72); }
+        .empty-file-list { margin:12px 0 0;padding:0;list-style:none;display:grid;gap:6px; }
+        .empty-file-list li { padding:8px 10px;border-radius:10px;background:rgba(255,255,255,.035);color:#aeb2bb;font-family:monospace;font-size:11px;overflow-wrap:anywhere; }
+        .pwmenu-powered { display:flex;align-items:center;justify-content:center;gap:10px;margin:24px 0 8px;padding:14px;color:#858e93;font-size:11px;font-weight:850;letter-spacing:.14em;text-decoration:none;text-transform:uppercase; }
+        .pwmenu-powered-dot { width:9px;height:9px;border-radius:50%;background:#20e4f4;box-shadow:0 0 16px #20e4f4; }
+        .pwmenu-powered strong { color:#fff;font-weight:900; }
         .map-list-title { font-size: 18px; font-weight: 850; overflow-wrap:anywhere; }
         .map-list-sub { margin-top: 5px; font-size: 12px; color:#aeb2bb; overflow-wrap:anywhere; }
         @media (max-width: 520px) {
@@ -2923,6 +3293,7 @@ class A_pwmenu(plugins.Plugin):
                         <div>
                             <div style="font-size:13px;">{{ f.bssid }}</div>
                             <div style="color:var(--sub);font-size:11px;">{{ f.date }} • {{ f.size }}</div>
+                            {% if f.quality.grade %}<div class="quality-badge {{ f.quality.grade|lower }}" title="{{ f.quality.summary }}">{{ f.quality.grade }}</div>{% else %}<div class="quality-badge">Pending analysis</div>{% endif %}
                         </div>
                         <div class="btn-grp">
                             {% if show_wpa %}<button class="btn-xs" onclick='upl({{ f.filename|tojson }})'>WPA</button>{% endif %}
@@ -3067,6 +3438,25 @@ class A_pwmenu(plugins.Plugin):
                 </form>
             </div>
 
+            <div class="card" style="padding:15px;text-align:left;">
+                <h3 style="margin-top:0;text-align:center;">Empty PCAP Cleanup</h3>
+                <div style="font-weight:800;color:{{ 'var(--danger)' if empty_report.count else 'var(--green)' }};">
+                    {{ empty_report.count }} confirmed empty 24-byte PCAP file(s)
+                </div>
+                <div class="sub" style="margin-top:6px;">Only valid PCAP headers with no packets are included. The list is checked again immediately before deletion.</div>
+                {% if empty_report.names %}
+                <ul class="empty-file-list">
+                    {% for name in empty_report.names %}<li>{{ name }}</li>{% endfor %}
+                    {% if empty_report.more %}<li>+ {{ empty_report.more }} more file(s)</li>{% endif %}
+                </ul>
+                <form method="POST" action="/plugins/A_pwmenu/clean-empty-pcaps" onsubmit="return confirm('Permanently remove {{ empty_report.count }} confirmed empty PCAP file(s) and their companion metadata?')">
+                    <input type="hidden" name="csrf_token" value="{{ token }}">
+                    <input type="hidden" name="report_token" value="{{ empty_report.token }}">
+                    <button class="btn red">Remove Confirmed Empty PCAPs</button>
+                </form>
+                {% endif %}
+            </div>
+
             <div class="card" style="border:1px solid var(--danger);">
                 <h3 style="margin-top:0; color:var(--danger)">Danger Zone</h3>
                 <form method="POST" action="/plugins/A_pwmenu/clean-broken" onsubmit="return confirm('Clean broken?')">
@@ -3078,6 +3468,10 @@ class A_pwmenu(plugins.Plugin):
                     <button class="btn red" style="background:transparent; border-color:var(--sub); color:var(--sub);">Nuke Everything</button>
                 </form>
             </div>
+
+            <a class="pwmenu-powered" href="https://neewfpv.com/" target="_blank" rel="noopener">
+                <span class="pwmenu-powered-dot"></span><span>Powered by <strong>NewFPV</strong></span>
+            </a>
         </div>
     </div>
 
@@ -3238,8 +3632,16 @@ class A_pwmenu(plugins.Plugin):
             if(o.status === 'local_cracked') return '<span class="map-chip green">Password known locally</span>';
             if(o.status === 'queued') return '<span class="map-chip yellow">OHC Queued</span>';
             if(o.status === 'failed') return '<span class="map-chip red">OHC Failed</span>';
-            if(o.status === 'invalid') return '<span class="map-chip yellow">OHC Invalid</span>';
+            if(o.status === 'invalid') return '<span class="map-chip red">OHC Unusable</span>';
             return `<span class="map-chip gray">OHC ${esc(o.status)}</span>`;
+        }
+
+        function qualityStatusBlock(item) {
+            const q = (item && item.quality) || {};
+            const grade = String(q.grade || 'Pending');
+            const cls = grade === 'Excellent' ? 'green' : grade === 'Usable' ? 'blue' : grade === 'Partial' ? 'yellow' : grade === 'Unusable' ? 'red' : 'gray';
+            const title = q.summary ? ` title="${esc(q.summary)}"` : '';
+            return `<span class="map-chip ${cls}"${title}>Quality ${esc(grade)}</span>`;
         }
 
         function gpsStatusChip(item, missing) {
@@ -3252,7 +3654,12 @@ class A_pwmenu(plugins.Plugin):
         }
 
         function pointChips(item, missingGps) {
-            return `<div class="map-chips">${ohcStatusBlock(item)}${gpsStatusChip(item, missingGps)}</div>`;
+            return `<div class="map-chips">${qualityStatusBlock(item)}${ohcStatusBlock(item)}${gpsStatusChip(item, missingGps)}</div>`;
+        }
+
+        function mapItemClass(item) {
+            if(item && ((item.ohc && item.ohc.status === 'invalid') || (item.quality && item.quality.grade === 'Unusable'))) return 'red';
+            return item && item.is_cracked ? 'green' : 'blue';
         }
 
         function networkActions(filename, isCracked, ohcExpr, wpaExpr) {
@@ -3400,7 +3807,7 @@ class A_pwmenu(plugins.Plugin):
             const d = document.getElementById('mapDetails');
             d.classList.remove('hidden');
             const rows = noGpsNetworks.map((n, idx) => `
-                <button class="map-list-item ${n.is_cracked ? 'green' : 'blue'}" onclick="showNoGpsPoint(${idx})">
+                <button class="map-list-item ${mapItemClass(n)}" onclick="showNoGpsPoint(${idx})">
                     <div class="map-list-title">${esc(n.essid)}</div>
                     <div class="map-list-sub">${esc(n.vendor || 'Unknown vendor')} - ${esc(n.bssid || 'no bssid')} - ${esc(n.date)} - ${n.count} capture${n.count === 1 ? '' : 's'}</div>
                     ${n.password ? `<div style="margin-top:10px;color:#8effb8;font-weight:850">Cracked</div>` : ''}
@@ -3437,9 +3844,10 @@ class A_pwmenu(plugins.Plugin):
                 </div>` : `
                 <div class="map-secret blue"><b>Encrypted</b></div>`;
             const fileRows = (n.files || []).slice(0, 5).map(f => `
-                <div class="map-list-item">
+                <div class="map-list-item ${mapItemClass(f)}">
                     <div class="map-list-title" style="font-size:15px">${esc(f.filename)}</div>
                     <div class="map-list-sub">${esc(f.date)} - ${esc(f.size)}</div>
+                    ${qualityStatusBlock(f)}
                 </div>`).join('');
             d.innerHTML = `
                 <div class="map-title-row">
@@ -3500,7 +3908,14 @@ class A_pwmenu(plugins.Plugin):
             });
         }
 
+        function pointHasUnusable(p) {
+            const members = (p && p.members) || [];
+            if(members.length > 1) return false;
+            return !!(p && ((p.ohc && p.ohc.status === 'invalid') || (p.quality && p.quality.grade === 'Unusable')));
+        }
+
         function pointStatusClass(p) {
+            if(pointHasUnusable(p)) return 'unusable';
             if(p.status === 'analyzing') return 'analyzing';
             if(p.status === 'no_result') return 'no-result';
             if(p.is_cracked || p.status === 'cracked') return 'cracked';
@@ -3520,6 +3935,7 @@ class A_pwmenu(plugins.Plugin):
         }
 
         function yandexColor(p) {
+            if(pointHasUnusable(p)) return '#ff453a';
             if(p.status === 'analyzing') return '#ffcc00';
             if(p.status === 'no_result') return '#8e8e93';
             if(p.is_cracked || p.status === 'cracked') return '#30d158';
@@ -3688,9 +4104,10 @@ class A_pwmenu(plugins.Plugin):
                     <b>Encrypted</b>
                 </div>`;
             const history = (p.history || []).slice(1, 5).map(h => `
-                <div class="map-list-item">
+                <div class="map-list-item ${mapItemClass(h)}">
                     <div class="map-list-title" style="font-size:15px">${esc(h.date)}</div>
                     <div class="map-list-sub">${esc(h.filename)} - ${Math.round(h.accuracy || 0)}m</div>
+                    ${qualityStatusBlock(h)}
                 </div>`).join('');
             d.innerHTML = `
                 <div class="map-title-row">
@@ -3724,9 +4141,10 @@ class A_pwmenu(plugins.Plugin):
             const visibleMembers = (p.members || []).filter(m => mapFilter !== 'cracked' || m.is_cracked || m.status === 'cracked');
             const rows = visibleMembers.map((m, idx) => {
                 const gpsAge = m.gps_stale ? ` - GPS ${Math.max(1, Math.round((Number(m.gps_age_at_capture || 0)) / 60))} min old` : '';
-                return `<button class="map-list-item ${m.is_cracked ? 'green' : 'blue'}" onclick="showMapPointFromGroup(${idx})">
+                return `<button class="map-list-item ${mapItemClass(m)}" onclick="showMapPointFromGroup(${idx})">
                     <div class="map-list-title">${esc(m.essid)}</div>
                     <div class="map-list-sub">${esc(m.vendor || 'Unknown vendor')} - ${esc(m.bssid || 'no bssid')}${gpsAge}</div>
+                    ${qualityStatusBlock(m)}
                     ${m.password ? `<div style="margin-top:10px;color:#8effb8;font-weight:850">Cracked</div>` : ''}
                 </button>`;
             }).join('');

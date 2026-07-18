@@ -2,7 +2,7 @@
 
 An advanced Pwnagotchi handshake and password manager with a mobile-friendly web interface, GPS-aware capture indexing, map visualization, WPA-sec integration, OnlineHashCrack API v2 support, exports, imports, and a compact on-device GPS status indicator.
 
-[![Version](https://img.shields.io/badge/version-1.1.6-0a84ff)](./CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-1.2.0-0a84ff)](./CHANGELOG.md)
 [![License](https://img.shields.io/badge/license-GPL--3.0-30d158)](./LICENSE)
 
 <p align="center">
@@ -56,6 +56,10 @@ An advanced Pwnagotchi handshake and password manager with a mobile-friendly web
 - Downloads selected geographic clusters as ZIP archives.
 - Deletes an individual PCAP and its local `.22000` or `.hc22000` derivatives.
 - Detects captures that do not contain usable PMKID/EAPOL material.
+- Grades every capture as **Excellent**, **Usable**, **Partial**, or **Unusable** from the local `hcxpcapngtool` report.
+- Rechecks a capture when its signature changes and upgrades its quality automatically when new handshake material is appended.
+- Reversibly archives an older weak capture when a newer usable capture for the same BSSID exists.
+- Reports valid empty 24-byte PCAP files before a confirmation-bound cleanup action.
 - Includes an explicit Danger Zone for complete local capture cleanup.
 
 ### Password and result aggregation
@@ -165,7 +169,7 @@ GPSD polling is cached. An unavailable local GPSD daemon therefore does not bloc
 
 ## Compatibility and requirements
 
-A_pwmenu 1.1.6 has been developed and tested with:
+A_pwmenu 1.2.0 has been developed and tested with:
 
 - Pwnagotchi 2.x, including Jayofelony-based images.
 - Python 3.11 from the Pwnagotchi virtual environment.
@@ -207,10 +211,10 @@ sudo /home/pi/.pwn/bin/pip install websockets
 
 ```bash
 sudo wget -O /usr/local/share/pwnagotchi/custom-plugins/A_pwmenu.py \
-  https://raw.githubusercontent.com/newfpv/pwmenu/v1.1.6/A_pwmenu.py
+  https://raw.githubusercontent.com/newfpv/pwmenu/v1.2.0/A_pwmenu.py
 ```
 
-Continue with the syntax check and configuration steps below. Pinning the release tag keeps the installed code reproducible; replace `v1.1.6` only when intentionally upgrading.
+Continue with the syntax check and configuration steps below. Pinning the release tag keeps the installed code reproducible; replace `v1.2.0` only when intentionally upgrading.
 
 ### 1. Back up an existing version
 
@@ -356,6 +360,9 @@ The standard WPA-sec plugin may remain enabled for its normal automatic submissi
 | `import_max_bytes` | int | `2097152` | Maximum accepted JSON or CSV upload size. |
 | `archive_memory_limit` | int | `2097152` | Maximum archive or converted-output size retained in RAM before spooling to disk. |
 | `hcxpcapngtool_timeout` | int | `90` | Maximum duration of a single conversion or validation process, in seconds. |
+| `quality_auto_scan` | bool | `true` | Analyzes new and changed captures in a serialized background worker. Existing uncached captures are scanned after plugin startup. |
+| `quality_scan_delay_ms` | int | `250` | Pause between background quality checks to reduce sustained load on the Raspberry Pi. |
+| `auto_replace_unusable` | bool | `true` | Archives an older Partial/Unusable capture when a newer Usable/Excellent capture for the same BSSID exists. Exact 24-byte files always require manual confirmation. |
 
 ### GPSD example
 
@@ -533,10 +540,25 @@ Possible local OHC states:
 | `sent` | The task was accepted by OHC. |
 | `already_reported` | The hash already existed or was skipped as a duplicate. |
 | `local_cracked` | The password is already known locally, so the file is removed from the upload queue. |
-| `invalid` | OHC rejected the format or algorithm. |
+| `invalid` | Shown as **OHC Unusable** when no usable WPA/PMKID hash can be extracted or OHC rejects the submitted format or algorithm. |
 | `failed` | Extraction, network communication, or the API call failed. |
 | `found` | A synchronized task reports that a result is available. |
 | `queued` | The file is durably queued until connectivity and rate limits allow processing. |
+
+### Capture quality and safe replacement
+
+Quality is determined locally and does not require internet access:
+
+| Grade | Meaning |
+|---|---|
+| **Excellent** | A usable mode 22000 hash was generated from an authorized EAPOL exchange or a written PMKID. |
+| **Usable** | At least one usable WPA/PMKID hash was generated. |
+| **Partial** | EAPOL or PMKID material exists, but `hcxpcapngtool` could not generate a usable hash. |
+| **Unusable** | No WPA/PMKID material exists, including an empty PCAP header. |
+
+The cache is bound to the PCAP modification-time and size signature. A changed capture is analyzed again automatically. If the same file improves from Partial/Unusable to Usable/Excellent, the new result supersedes the old grade. If a separate, newer usable PCAP exists for the same BSSID, an older weak PCAP larger than 24 bytes is renamed with a `.replaced-<timestamp>` suffix. The archive remains recoverable and is excluded from the active capture index.
+
+Empty 24-byte PCAP files are never archived or deleted automatically. The **Empty PCAP Cleanup** card in the Other tab lists the exact candidates and generates a report token. Cleanup proceeds only after browser confirmation and only if the file list and signatures still match that report.
 
 ### HTTP 429 and backoff
 
@@ -938,6 +960,7 @@ Base path:
 | `/delete-file` | Delete a PCAP and local derivatives. |
 | `/import` | Import JSON or CSV results. |
 | `/sync-time` | Start time synchronization. |
+| `/clean-empty-pcaps` | Remove only the 24-byte empty PCAP files bound to the current preview token. |
 | `/clean-broken` | Remove captures without usable mode 22000 material. |
 | `/nuke-all` | Delete all captures and local plugin potfiles. |
 
@@ -1001,4 +1024,4 @@ A_pwmenu is distributed under the [GNU General Public License v3.0](./LICENSE). 
 
 ---
 
-Documented plugin version: **A_pwmenu 1.1.6**.
+Documented plugin version: **A_pwmenu 1.2.0**.
