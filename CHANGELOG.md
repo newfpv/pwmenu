@@ -2,6 +2,26 @@
 
 All notable changes to A_pwmenu are documented here.
 
+## 1.2.0 — 2026-07-18
+
+- Added signature-aware `Excellent`, `Usable`, `Partial`, and `Unusable` capture quality analysis based on the installed `hcxpcapngtool` report and generated mode 22000 hashes.
+- Added automatic in-place quality upgrades when a PCAP gains better handshake material.
+- Added reversible archival of older weak captures when a newer usable capture for the same BSSID exists; empty 24-byte PCAP files are explicitly excluded.
+- Added a preview-and-confirm cleanup flow that removes only valid 24-byte PCAP headers and rejects stale confirmation reports.
+- Kept same-location cluster markers neutral while retaining red status for individual OHC-unusable captures.
+- Added regression coverage for quality grading, replacement rules, and confirmation-bound empty cleanup.
+
+## 1.1.8 — 2026-07-18
+
+- Rendered OHC-unusable captures and clusters as red markers on both the Yandex map and the fallback map.
+- Changed the `OHC Unusable` status chip from yellow to red.
+
+## 1.1.7 — 2026-07-18
+
+- Removed the persistent `OHC found ...` message from the Pwnagotchi status line while preserving OHC result tracking in the web interface.
+- Serialized OHC upload worker creation to prevent the scheduler and handshake callback from starting duplicate workers for the same queued capture.
+- Replaced the ambiguous `OHC Invalid` capture label with `OHC Unusable` and a clearer WPA/PMKID extraction reason.
+
 ## 1.1.6 — 2026-07-18
 
 - Added a crash-safe, password-free snapshot of task identities from the latest valid OHC JSON or CSV import.
