@@ -2,6 +2,14 @@
 
 All notable changes to A_pwmenu are documented here.
 
+## 1.1.6 — 2026-07-18
+
+- Added a crash-safe, password-free snapshot of task identities from the latest valid OHC JSON or CSV import.
+- Added conservative pre-upload deduplication by BSSID and BSSID/ESSID in addition to exact persistent hashes and `list_tasks` results.
+- Made imports report the number of OHC task identities saved for upload deduplication.
+- Preserved the last valid snapshot when an invalid or unrelated file is imported.
+- Added regression tests for WPA mode 22000, PMKID, reconnection-safe snapshots, password exclusion, and unrelated BSSIDs.
+
 ## 1.1.5 — 2026-07-14
 
 - Updated the OnlineHashCrack `add_tasks` payload to match the private API v2 schema by removing the unsupported `receive_email` field.

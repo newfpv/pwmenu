@@ -43,7 +43,7 @@ logging.info("[A_pwmenu] Module init.")
 
 class A_pwmenu(plugins.Plugin):
     __author__ = 'NewFPV'
-    __version__ = '1.1.5'
+    __version__ = '1.1.6'
     __license__ = 'GPL3'
     __description__ = 'Ultimate Password Manager'
 
@@ -53,6 +53,7 @@ class A_pwmenu(plugins.Plugin):
         self.potfile_ohc = '/root/handshakes/onlinehashcrack.cracked.potfile'
         self.potfile_manual = '/root/handshakes/manual.potfile'
         self.data_file = '/root/handshakes/.a_pwmenu_data.json'
+        self.ohc_export_file = '/root/handshakes/.a_pwmenu_ohc_export.json'
         self.last_sync = 0
         self.data_lock = threading.RLock()
         self.save_lock = threading.Lock()
@@ -312,6 +313,8 @@ class A_pwmenu(plugins.Plugin):
                         )
                         if report['invalid']:
                             message += f", {report['invalid']} invalid"
+                        if report.get('ohc_tasks'):
+                            message += f", OHC snapshot {report['ohc_tasks']} task(s)"
                         return self._render_page(notification=message, notif_type="success", active_tab='other')
                     except Exception as e:
                         return self._render_page(notification=f"Import Error: {e}", notif_type="error", active_tab='other')
@@ -803,6 +806,12 @@ class A_pwmenu(plugins.Plugin):
             reported_hashes = set(self.data.setdefault('ohc_reported_hashes', []))
             last_ohc_sync = float(self.data.get('ohc_tasks_synced_at', 0) or 0)
             reconcile_requested = bool(self.data.get('ohc_reconcile_requested', False))
+        export_identities, export_bssids, export_info = self._load_ohc_export_snapshot()
+        if export_info.get('tasks'):
+            logging.info(
+                f"[A_pwmenu] OHC export snapshot loaded: {export_info['tasks']} task(s), "
+                f"source={export_info.get('source', 'unknown')}"
+            )
         sync_interval = int(self.options.get('ohc_sync_interval', 3600) or 3600)
         if reconcile_requested or time.time() - last_ohc_sync > sync_interval:
             ok, server_hashes = self._ohc_list_task_hashes(key)
@@ -836,6 +845,7 @@ class A_pwmenu(plugins.Plugin):
         hash_sources = {}
         failed_extract = 0
         already_reported = 0
+        already_exported = 0
         self.ohc_progress_total = len(paths)
         for idx, path in enumerate(paths):
             self.ohc_progress_current = idx + 1
@@ -855,6 +865,17 @@ class A_pwmenu(plugins.Plugin):
                     continue
                 path_hashes[path].add(h)
                 path_hash_count[path] = path_hash_count.get(path, 0) + 1
+                if self._ohc_hash_in_export(h, export_identities, export_bssids):
+                    already_reported += 1
+                    already_exported += 1
+                    reported_hashes.add(h)
+                    self._ohc_mark_path(
+                        path,
+                        'already_reported',
+                        'Present in the last imported OHC export',
+                        path_hash_count.get(path, 0)
+                    )
+                    continue
                 if h in reported_hashes:
                     already_reported += 1
                     self._ohc_mark_path(path, 'already_reported', 'Already exists in OHC tasks', path_hash_count.get(path, 0))
@@ -872,9 +893,13 @@ class A_pwmenu(plugins.Plugin):
         if not hashes:
             with self.data_lock:
                 self.data['ohc_hash_files'] = hash_files
+                self.data['ohc_reported_hashes'] = sorted(reported_hashes)
             if already_reported:
                 self._save_data()
-                return f"OHC: {already_reported} hashes already reported", False
+                msg = f"OHC: {already_reported} hashes already reported"
+                if already_exported:
+                    msg += f" ({already_exported} from last export)"
+                return msg, False
             if failed_extract:
                 self._save_data()
             return f"OHC: no valid hashes extracted ({failed_extract} failed)", True
@@ -964,6 +989,8 @@ class A_pwmenu(plugins.Plugin):
         msg = f"OHC: {accepted} accepted, {skipped} skipped, {rejected} rejected"
         if already_reported:
             msg += f", {already_reported} already reported"
+        if already_exported:
+            msg += f" ({already_exported} from last export)"
         if failed:
             msg += f", {failed} failed"
         self._save_data()
@@ -2131,9 +2158,13 @@ class A_pwmenu(plugins.Plugin):
         self._ensure_file(self.potfile_ohc)
         is_json = name.lower().endswith('.json') or content.strip().startswith('[')
         if is_json:
-            report = self._imp_json(json.loads(content))
+            parsed = json.loads(content)
+            report = self._imp_json(parsed)
+            export_tasks = self._ohc_export_tasks_from_json(parsed)
         else:
             report = self._imp_csv(content)
+            export_tasks = self._ohc_export_tasks_from_csv(content)
+        report['ohc_tasks'] = self._store_ohc_export_snapshot(export_tasks, name)
         if report['added'] > 0:
             with self.data_lock:
                 self.data['xp'] += report['added'] * 100
@@ -2141,7 +2172,138 @@ class A_pwmenu(plugins.Plugin):
         return report
 
     def _new_import_report(self):
-        return {'added': 0, 'already': 0, 'duplicates': 0, 'ignored': 0, 'invalid': 0}
+        return {
+            'added': 0,
+            'already': 0,
+            'duplicates': 0,
+            'ignored': 0,
+            'invalid': 0,
+            'ohc_tasks': 0
+        }
+
+    def _ohc_export_tasks_from_json(self, data):
+        if isinstance(data, dict):
+            data = data.get('tasks', [])
+        if not isinstance(data, list):
+            return []
+        return [task for task in data if isinstance(task, dict)]
+
+    def _ohc_export_tasks_from_csv(self, content):
+        try:
+            return [dict(row) for row in csv.DictReader(io.StringIO(content))]
+        except (csv.Error, OSError, TypeError, ValueError):
+            return []
+
+    def _ohc_export_task_identity(self, task):
+        clean = html.unescape(re.sub(r'<[^>]+>', '', str(task or ''))).replace('\xa0', ' ').strip()
+        match = re.search(r'((?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2})$', clean)
+        if not match:
+            return None, None
+        bssid = match.group(1).lower()
+        essid = clean[:match.start()].strip()
+        return f"{bssid}|{essid}", bssid
+
+    def _ohc_hash_task_identity(self, hash_line):
+        parts = str(hash_line or '').strip().lstrip('$').split('*')
+        if len(parts) < 6 or parts[0] != 'WPA' or parts[1] not in ('01', '02'):
+            return None, None
+        mac = parts[3].lower()
+        if not re.fullmatch(r'[0-9a-f]{12}', mac):
+            return None, None
+        bssid = ':'.join(mac[i:i + 2] for i in range(0, 12, 2))
+        try:
+            essid = bytes.fromhex(parts[5]).decode('utf-8', errors='replace').strip()
+        except (TypeError, ValueError):
+            essid = ''
+        return f"{bssid}|{essid}", bssid
+
+    def _ohc_hash_in_export(self, hash_line, identities, bssids):
+        identity, bssid = self._ohc_hash_task_identity(hash_line)
+        return bool(
+            (identity and identity in identities)
+            or (bssid and bssid in bssids)
+        )
+
+    def _store_ohc_export_snapshot(self, tasks, source):
+        identities = set()
+        bssids = set()
+        for task in tasks:
+            if not isinstance(task, dict):
+                continue
+            value = task.get('task') or task.get('Task') or task.get('SSID') or ''
+            identity, bssid = self._ohc_export_task_identity(value)
+            if identity:
+                identities.add(identity)
+                bssids.add(bssid)
+        if not identities:
+            return 0
+
+        snapshot = {
+            'version': 1,
+            'source': os.path.basename(str(source or ''))[:200],
+            'imported_at': int(time.time()),
+            'tasks': len(identities),
+            'identities': sorted(identities),
+            'bssids': sorted(bssids)
+        }
+        directory = os.path.dirname(self.ohc_export_file)
+        os.makedirs(directory, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(prefix='.a_pwmenu-ohc-export-', dir=directory)
+        try:
+            try:
+                os.chmod(tmp_path, 0o600)
+            except OSError:
+                pass
+            with os.fdopen(fd, 'w', encoding='utf-8') as handle:
+                fd = None
+                json.dump(snapshot, handle, ensure_ascii=False, sort_keys=True)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp_path, self.ohc_export_file)
+            try:
+                dir_fd = os.open(directory, os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0))
+                try:
+                    os.fsync(dir_fd)
+                finally:
+                    os.close(dir_fd)
+            except OSError:
+                pass
+        finally:
+            if fd is not None:
+                os.close(fd)
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        logging.info(
+            f"[A_pwmenu] Saved OHC export snapshot: {len(identities)} task(s), "
+            f"{len(bssids)} BSSID(s), source={snapshot['source']}"
+        )
+        return len(identities)
+
+    def _load_ohc_export_snapshot(self):
+        try:
+            with open(self.ohc_export_file, 'r', encoding='utf-8') as handle:
+                snapshot = json.load(handle)
+            if not isinstance(snapshot, dict):
+                raise ValueError('snapshot root must be an object')
+            identities = {
+                str(value) for value in snapshot.get('identities', [])
+                if isinstance(value, str) and value
+            }
+            bssids = {
+                str(value).lower() for value in snapshot.get('bssids', [])
+                if isinstance(value, str) and re.fullmatch(r'(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}', value)
+            }
+            info = {
+                'source': str(snapshot.get('source') or ''),
+                'tasks': len(identities),
+                'imported_at': int(snapshot.get('imported_at', 0) or 0)
+            }
+            return identities, bssids, info
+        except FileNotFoundError:
+            return set(), set(), {}
+        except (OSError, ValueError, TypeError, json.JSONDecodeError) as error:
+            logging.warning(f"[A_pwmenu] Could not load OHC export snapshot: {error}")
+            return set(), set(), {}
 
     def _imp_json(self, data):
         if isinstance(data, dict):

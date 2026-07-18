@@ -2,7 +2,7 @@
 
 An advanced Pwnagotchi handshake and password manager with a mobile-friendly web interface, GPS-aware capture indexing, map visualization, WPA-sec integration, OnlineHashCrack API v2 support, exports, imports, and a compact on-device GPS status indicator.
 
-[![Version](https://img.shields.io/badge/version-1.1.5-0a84ff)](./CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-1.1.6-0a84ff)](./CHANGELOG.md)
 [![License](https://img.shields.io/badge/license-GPL--3.0-30d158)](./LICENSE)
 
 <p align="center">
@@ -74,6 +74,7 @@ The web interface can:
 - Update a local password.
 - Delete a local password.
 - Import OHC JSON or CSV exports.
+- Save a password-free task snapshot from the latest valid OHC JSON or CSV import.
 - Report added, existing, duplicate, ignored, and invalid import rows separately.
 - Normalize potfiles automatically and expose their health in the Other tab.
 - Export a combined text list.
@@ -89,6 +90,7 @@ The web interface can:
 - OHC batches of up to 50 hashes.
 - OHC `list_tasks` synchronization.
 - Local tracking of reported hashes and source PCAP files.
+- Conservative deduplication against the latest imported OHC export by BSSID and ESSID.
 - Handling of `accepted`, `skipped`, and `rejected` API buckets.
 - Persistent OHC rate-limit backoff.
 - `Retry-After` handling for HTTP 429 responses.
@@ -163,7 +165,7 @@ GPSD polling is cached. An unavailable local GPSD daemon therefore does not bloc
 
 ## Compatibility and requirements
 
-A_pwmenu 1.1.5 has been developed and tested with:
+A_pwmenu 1.1.6 has been developed and tested with:
 
 - Pwnagotchi 2.x, including Jayofelony-based images.
 - Python 3.11 from the Pwnagotchi virtual environment.
@@ -205,10 +207,10 @@ sudo /home/pi/.pwn/bin/pip install websockets
 
 ```bash
 sudo wget -O /usr/local/share/pwnagotchi/custom-plugins/A_pwmenu.py \
-  https://raw.githubusercontent.com/newfpv/pwmenu/v1.1.5/A_pwmenu.py
+  https://raw.githubusercontent.com/newfpv/pwmenu/v1.1.6/A_pwmenu.py
 ```
 
-Continue with the syntax check and configuration steps below. Pinning the release tag keeps the installed code reproducible; replace `v1.1.5` only when intentionally upgrading.
+Continue with the syntax check and configuration steps below. Pinning the release tag keeps the installed code reproducible; replace `v1.1.6` only when intentionally upgrading.
 
 ### 1. Back up an existing version
 
@@ -496,16 +498,33 @@ For an OHC submission, A_pwmenu:
 1. Finds uncracked PCAP files.
 2. Runs local `hcxpcapngtool` with a unique temporary output file.
 3. Removes empty lines and duplicate mode 22000 hashes.
-4. Synchronizes existing OHC tasks when the configured interval has elapsed.
-5. Continues with persistent local state if `list_tasks` is temporarily unavailable, while still respecting a server-issued per-key rate limit; `add_tasks` safely reports existing hashes as `skipped: already_sent`.
-6. Excludes already reported hashes.
-7. Splits new hashes into batches of up to 50.
-8. Sends them with `algo_mode = 22000`.
-9. Records the relationship between each hash and its source PCAP.
-10. Persists every successful batch, PCAP signatures, the upload queue, and rate-limit state before continuing.
-11. Automatically resumes queued work after `Retry-After` expires.
+4. Loads exact hashes from persistent local memory and BSSID/ESSID identities from the latest imported OHC JSON or CSV export.
+5. Synchronizes existing OHC tasks when the configured interval has elapsed.
+6. Continues with persistent local state and the import snapshot if `list_tasks` is temporarily unavailable, while still respecting a server-issued per-key rate limit.
+7. Excludes hashes already known by exact hash or by the conservative export snapshot match.
+8. Splits new hashes into batches of up to 50.
+9. Sends them with `algo_mode = 22000`.
+10. Records the relationship between each hash and its source PCAP.
+11. Persists every successful batch, PCAP signatures, the upload queue, and rate-limit state before continuing.
+12. Automatically resumes queued work after `Retry-After` expires.
 
 A PCAP that grows after an earlier submission is extracted again. Previously submitted hashes remain deduplicated, while newly appended handshake material is queued normally.
+
+### Export-aware deduplication
+
+Import the most recent OHC task export through **Other → Import**. In addition to importing `FOUND` passwords, A_pwmenu extracts every valid task identity from the JSON or CSV, regardless of task status. The newest valid import replaces the previous export snapshot.
+
+Before `add_tasks`, the plugin now checks three independent sources:
+
+1. Exact mode 22000 hashes saved in `.a_pwmenu_data.json`.
+2. Exact hashes returned by OHC `list_tasks` when the API is available.
+3. BSSID and BSSID/ESSID identities from the latest imported export snapshot.
+
+The BSSID comparison is intentionally conservative. If the last export already contains work for an access point, another capture from that BSSID is not submitted again even if the displayed ESSID differs. This favors avoiding duplicate cracking work over resubmitting renamed access points.
+
+The snapshot contains only normalized task identities, its source filename, and an import timestamp. Passwords and raw CSV/JSON rows are never stored in the snapshot. Invalid or unrelated imports do not replace the last valid snapshot.
+
+After upgrading from an older release, import the newest OHC JSON or CSV once to create the snapshot.
 
 Possible local OHC states:
 
@@ -640,6 +659,7 @@ The display element follows the visual style of the standard Bluetooth and inter
 | `/root/handshakes/.a_pwmenu_data.json` | XP, achievements, GPS index, OHC metadata, signatures, and persistent queue. |
 | `/root/handshakes/.a_pwmenu_data.json.bak` | Crash-recovery snapshot written atomically before the primary state file. |
 | `/root/handshakes/.a_pwmenu_data.json.tmp` | Atomic-write temporary file. It should not remain after a successful write. |
+| `/root/handshakes/.a_pwmenu_ohc_export.json` | Password-free identities from the latest valid OHC JSON or CSV import, written atomically with mode `0600`. |
 | `/root/handshakes/onlinehashcrack.cracked.potfile` | Imported OHC results. |
 | `/root/handshakes/manual.potfile` | Manually managed passwords. |
 | `*.gps.json` or `*.geo.json` | Capture coordinates. |
@@ -655,7 +675,7 @@ At startup and before imports, A_pwmenu normalizes its OHC and manual potfiles a
 
 The **OHC Password Storage** card in the Other tab reports the credential count, file size, duplicate lines, invalid lines, and embedded NUL bytes. A healthy file shows zero duplicates, invalid lines, and NUL bytes.
 
-OHC CSV and JSON imports report every outcome separately. For example, importing an export that is already present can report `0 added, 58 already present, 14 duplicate rows, 94 ignored` instead of the ambiguous `Imported 0 passwords`.
+OHC CSV and JSON imports report every outcome separately. For example, importing an export that is already present can report `0 added, 58 already present, 14 duplicate rows, 94 ignored, OHC snapshot 153 task(s)` instead of the ambiguous `Imported 0 passwords`.
 
 Do not manually edit the state file while Pwnagotchi is running. If manual recovery is required:
 
@@ -981,4 +1001,4 @@ A_pwmenu is distributed under the [GNU General Public License v3.0](./LICENSE). 
 
 ---
 
-Documented plugin version: **A_pwmenu 1.1.5**.
+Documented plugin version: **A_pwmenu 1.1.6**.
