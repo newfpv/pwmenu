@@ -47,7 +47,7 @@ logging.info("[A_pwmenu] Module init.")
 
 class A_pwmenu(plugins.Plugin):
     __author__ = 'NewFPV'
-    __version__ = '1.3.0'
+    __version__ = '1.3.1'
     __license__ = 'GPL3'
     __description__ = 'Ultimate Password Manager'
 
@@ -281,19 +281,23 @@ class A_pwmenu(plugins.Plugin):
                     changed, message = self._add_to_whitelist(name)
                     requested_tab = request.form.get('return_tab') or 'other'
                     active_tab = requested_tab if requested_tab in ('handshakes', 'map', 'other') else 'other'
-                    return self._render_page(
-                        notification=message,
-                        notif_type="success" if changed else "error",
-                        active_tab=active_tab
-                    )
+                    return self._whitelist_action_response(request, changed, message, active_tab)
+
+                if path == 'whitelist-add-excellent':
+                    try:
+                        names = json.loads(request.form.get('networks') or '[]')
+                        if not isinstance(names, list):
+                            raise ValueError('Network list must be an array')
+                        changed, message = self._add_excellent_to_whitelist(names)
+                    except (TypeError, ValueError, json.JSONDecodeError) as error:
+                        changed, message = False, str(error)
+                    return self._whitelist_action_response(request, changed, message, 'map')
 
                 if path == 'whitelist-remove':
                     changed, message = self._remove_from_whitelist(request.form.get('network') or '')
-                    return self._render_page(
-                        notification=message,
-                        notif_type="success" if changed else "error",
-                        active_tab='other'
-                    )
+                    requested_tab = request.form.get('return_tab') or 'other'
+                    active_tab = requested_tab if requested_tab in ('handshakes', 'map', 'other') else 'other'
+                    return self._whitelist_action_response(request, changed, message, active_tab)
 
                 if path == 'wpa-sec-upload':
                     res, is_err = self._handle_wpa_upload(request)
@@ -301,11 +305,11 @@ class A_pwmenu(plugins.Plugin):
 
                 if path == 'wpa-sec-upload-cluster':
                     res, is_err = self._handle_wpa_cluster_upload(request)
-                    return self._render_page(notification=res, notif_type="error" if is_err else "success", active_tab="map")
+                    return self._action_response(request, res, is_err, 'map')
 
                 if path == 'ohc-upload-cluster':
                     res, is_err = self._handle_ohc_cluster_upload(request)
-                    return self._render_page(notification=res, notif_type="error" if is_err else "success", active_tab="map")
+                    return self._action_response(request, res, is_err, 'map')
 
                 if path == 'ohc-upload-all-missing':
                     res, is_err = self._handle_ohc_all_missing()
@@ -466,6 +470,38 @@ class A_pwmenu(plugins.Plugin):
                 r.headers["Content-Encoding"] = "gzip"
                 r.headers["Content-Length"] = str(len(compressed))
         return r
+
+    def _whitelist_action_response(self, req, changed, message, active_tab):
+        if req.headers.get('X-PWMenu-Async') == '1':
+            response = make_response(json.dumps({
+                'ok': bool(changed),
+                'message': str(message or ''),
+                'whitelist': self._get_whitelist(),
+            }))
+            response.headers['Content-Type'] = 'application/json; charset=utf-8'
+            response.headers['Cache-Control'] = 'no-store'
+            return response
+        return self._render_page(
+            notification=message,
+            notif_type="success" if changed else "error",
+            active_tab=active_tab,
+        )
+
+    def _action_response(self, req, message, is_error, active_tab):
+        """Return a compact response to in-page actions with a full-page fallback."""
+        if req.headers.get('X-PWMenu-Async') == '1':
+            response = make_response(json.dumps({
+                'ok': not bool(is_error),
+                'message': str(message or ''),
+            }))
+            response.headers['Content-Type'] = 'application/json; charset=utf-8'
+            response.headers['Cache-Control'] = 'no-store'
+            return response
+        return self._render_page(
+            notification=message,
+            notif_type="error" if is_error else "success",
+            active_tab=active_tab,
+        )
 
     def _handle_wpa_upload(self, req):
         try:
@@ -2540,6 +2576,59 @@ class A_pwmenu(plugins.Plugin):
             logging.error(f"[A_pwmenu] Could not add whitelist entry: {error}")
             return False, str(error)
 
+    def _add_excellent_to_whitelist(self, requested_names, groups=None):
+        try:
+            if not isinstance(requested_names, (list, tuple)):
+                raise ValueError('Network list must be an array')
+            if len(requested_names) > 256:
+                raise ValueError('Too many networks in one whitelist request')
+
+            requested = []
+            for name in requested_names:
+                value = self._validate_whitelist_name(name)
+                if value not in requested:
+                    requested.append(value)
+            if not requested:
+                raise ValueError('No networks selected')
+
+            if groups is None:
+                groups = self._scan_and_group_files(self._get_cracked_data())
+            excellent = {
+                str(group.get('essid') or '').strip()
+                for group in (groups or [])
+                if any(
+                    (capture.get('quality') or {}).get('grade') == 'Excellent'
+                    for capture in group.get('files', [])
+                )
+            }
+            eligible = [name for name in requested if name in excellent]
+            skipped = len(requested) - len(eligible)
+
+            with self.whitelist_lock:
+                current = self._get_whitelist()
+                added = [name for name in eligible if name not in current]
+                already = len(eligible) - len(added)
+                if added:
+                    updated = sorted(dict.fromkeys(current + added), key=str.casefold)
+                    self._write_whitelist_config(updated)
+                    self._set_runtime_whitelist(updated)
+
+            parts = []
+            if added:
+                parts.append(f"Added {len(added)} Excellent-quality network(s) to the whitelist")
+            else:
+                parts.append("No new Excellent-quality networks to whitelist")
+            if already:
+                parts.append(f"{already} already whitelisted")
+            if skipped:
+                parts.append(f"{skipped} skipped because quality is not Excellent")
+            message = '; '.join(parts)
+            logging.info(f"[A_pwmenu] Excellent-only group whitelist: {message}")
+            return bool(added), message
+        except (OSError, ValueError) as error:
+            logging.error(f"[A_pwmenu] Could not whitelist Excellent-quality group: {error}")
+            return False, str(error)
+
     def _remove_from_whitelist(self, name):
         try:
             value = self._validate_whitelist_name(name)
@@ -3350,6 +3439,7 @@ class A_pwmenu(plugins.Plugin):
         .map-password.visible { filter:none; user-select:text; }
         .map-toast { position:absolute; z-index:30; left:50%; bottom:92px; transform:translateX(-50%) translateY(18px); padding:12px 16px; border-radius:999px; background:rgba(247,248,251,0.94); color:#050507; font-weight:850; box-shadow:0 14px 35px rgba(0,0,0,0.25); opacity:0; pointer-events:none; transition:0.2s; }
         .map-toast.show { opacity:1; transform:translateX(-50%) translateY(0); }
+        .map-toast.error { background:#ff453a;color:#fff; }
         .map-status { background: rgba(255,255,255,0.04); border-radius: 16px; padding: 12px 14px; color: #c9ccd2; font-weight: 700; margin-top: 12px; }
         .map-chips { display:flex; flex-wrap:wrap; gap:8px; margin-top:12px; }
         .map-chip { display:inline-flex; align-items:center; gap:7px; min-height:30px; border-radius:999px; padding:6px 10px; background:rgba(255,255,255,0.045); border:1px solid rgba(255,255,255,0.055); color:#cfd3da; font-size:12px; font-weight:800; box-sizing:border-box; letter-spacing:0; }
@@ -4257,6 +4347,7 @@ class A_pwmenu(plugins.Plugin):
         const mapPoints = {{ map_points|tojson }};
         const noGpsNetworks = {{ no_gps_networks|tojson }};
         const gpsStatus = {{ gps_status|tojson }};
+        const whitelistedNetworks = new Set({{ whitelist|tojson }});
         let gpsWatchId = null;
         let selectedMapPoint = null;
         let userLocation = null;
@@ -4266,6 +4357,7 @@ class A_pwmenu(plugins.Plugin):
         let yandexReady = false;
         let yandexLoader = null;
         let activeMapGroup = null;
+        const pendingMapActions = new Set();
         const accentStorageKey = 'a_pwmenu_accent_v1';
 
         const t0 = '{{ tab }}';
@@ -4281,6 +4373,43 @@ class A_pwmenu(plugins.Plugin):
             const t = document.createElement('input'); t.type='hidden'; t.name='csrf_token'; t.value=csrfToken; f.appendChild(t);
             for(const k in d) { const i=document.createElement('input'); i.name=k; i.value=d[k]; f.appendChild(i); }
             document.body.appendChild(f); f.submit();
+        }
+
+        async function postAsync(u, data) {
+            const body = new URLSearchParams();
+            body.append('csrf_token', csrfToken);
+            Object.entries(data || {}).forEach(([key, value]) => body.append(key, value));
+            const response = await fetch('/plugins/A_pwmenu/' + u, {
+                method: 'POST',
+                credentials: 'same-origin',
+                headers: {
+                    'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8',
+                    'X-PWMenu-Async': '1'
+                },
+                body: body.toString()
+            });
+            let payload = null;
+            try { payload = await response.json(); } catch(error) {}
+            if(!response.ok || !payload) throw new Error(payload && payload.message ? payload.message : `Request failed (${response.status})`);
+            return payload;
+        }
+
+        async function runMapAction(route, data, pendingMessage) {
+            const key = route + ':' + String((data || {}).filenames || '');
+            if(pendingMapActions.has(key)) {
+                showToast('This action is already in progress', true);
+                return;
+            }
+            pendingMapActions.add(key);
+            showToast(pendingMessage || 'Working...', false);
+            try {
+                const result = await postAsync(route, data);
+                showToast(result.message || (result.ok ? 'Done' : 'Action failed'), !result.ok);
+            } catch(error) {
+                showToast(error.message || 'Request failed', true);
+            } finally {
+                pendingMapActions.delete(key);
+            }
         }
 
         function accentContrast(hex) {
@@ -4383,12 +4512,57 @@ class A_pwmenu(plugins.Plugin):
         function add(e) { const p=prompt("Password for "+e+":"); if(p) post('add-password', {essid:e, password:p}); }
         function whitelistAdd(network, returnTab) {
             if(confirm('Add "' + network + '" to the whitelist?')) {
-                post('whitelist-add', {network:network, return_tab:returnTab || 'other'});
+                if(returnTab === 'map') updateWhitelistAsync('whitelist-add', {network:network, return_tab:'map'});
+                else post('whitelist-add', {network:network, return_tab:returnTab || 'other'});
             }
         }
-        function whitelistRemove(network) {
+        function whitelistRemove(network, returnTab) {
             if(confirm('Remove "' + network + '" from the whitelist?')) {
-                post('whitelist-remove', {network:network});
+                if(returnTab === 'map') updateWhitelistAsync('whitelist-remove', {network:network, return_tab:'map'});
+                else post('whitelist-remove', {network:network, return_tab:returnTab || 'other'});
+            }
+        }
+
+        function syncWhitelist(values) {
+            whitelistedNetworks.clear();
+            (values || []).forEach(name => whitelistedNetworks.add(String(name)));
+        }
+
+        function refreshOpenMapCard() {
+            if(activeMapGroup && selectedMapPoint === activeMapGroup) showMapGroup(activeMapGroup);
+            else if(selectedMapPoint) showMapPoint(selectedMapPoint, !!activeMapGroup);
+        }
+
+        async function updateWhitelistAsync(route, data) {
+            showToast('Saving whitelist...');
+            try {
+                const result = await postAsync(route, data);
+                syncWhitelist(result.whitelist);
+                refreshOpenMapCard();
+                showToast(result.message || (result.ok ? 'Whitelist updated' : 'No changes'));
+            } catch(error) {
+                showToast(error.message || 'Whitelist update failed', true);
+            }
+        }
+
+        function memberHasExcellentQuality(member) {
+            if(member && member.quality && member.quality.grade === 'Excellent') return true;
+            return (member && member.history || []).some(item => item && item.quality && item.quality.grade === 'Excellent');
+        }
+
+        function excellentGroupNetworks(group) {
+            const names = (group && group.members || [])
+                .filter(memberHasExcellentQuality)
+                .map(member => String(member.essid || '').trim())
+                .filter(Boolean);
+            return [...new Set(names)];
+        }
+
+        async function whitelistExcellentGroup(group) {
+            const names = excellentGroupNetworks(group).filter(name => !whitelistedNetworks.has(name));
+            if(!names.length) return;
+            if(confirm(`Add ${names.length} Excellent-quality network(s) from this group to the whitelist?`)) {
+                await updateWhitelistAsync('whitelist-add-excellent', {networks:JSON.stringify(names)});
             }
         }
         function ed(e,o) { const p=prompt("Edit "+e+":", o); if(p&&p!==o) post('update-password', {essid:e, password:p}); }
@@ -4427,13 +4601,14 @@ class A_pwmenu(plugins.Plugin):
             showToast('Copied');
         }
 
-        function showToast(text) {
+        function showToast(text, isError) {
             const toast = document.getElementById('mapToast');
             if(!toast) return;
             toast.textContent = text || 'Done';
+            toast.classList.toggle('error', !!isError);
             toast.classList.add('show');
             clearTimeout(showToast.t);
-            showToast.t = setTimeout(() => toast.classList.remove('show'), 1300);
+            showToast.t = setTimeout(() => toast.classList.remove('show'), 2600);
         }
 
         function setMapPanelOpen(open) {
@@ -4470,13 +4645,13 @@ class A_pwmenu(plugins.Plugin):
         function sendClusterToOhc(p) {
             const names = clusterFilenames(p);
             if(!names) return;
-            post('ohc-upload-cluster', {filenames: names});
+            runMapAction('ohc-upload-cluster', {filenames: names}, 'Starting OHC upload...');
         }
 
         function sendClusterToWpa(p) {
             const names = clusterFilenames(p);
             if(!names || !wpaEnabled) return;
-            post('wpa-sec-upload-cluster', {filenames: names});
+            runMapAction('wpa-sec-upload-cluster', {filenames: names}, 'Starting WPA-sec upload...');
         }
 
         function noGpsFilenames(n) {
@@ -4486,18 +4661,18 @@ class A_pwmenu(plugins.Plugin):
         function sendNoGpsToOhc(n) {
             const names = noGpsFilenames(n);
             if(!names) return;
-            post('ohc-upload-cluster', {filenames: names});
+            runMapAction('ohc-upload-cluster', {filenames: names}, 'Starting OHC upload...');
         }
 
         function sendNoGpsToWpa(n) {
             const names = noGpsFilenames(n);
             if(!names || !wpaEnabled) return;
-            post('wpa-sec-upload-cluster', {filenames: names});
+            runMapAction('wpa-sec-upload-cluster', {filenames: names}, 'Starting WPA-sec upload...');
         }
 
         function sendSingleToOhc(filename) {
             if(!filename) return;
-            post('ohc-upload-cluster', {filenames: filename});
+            runMapAction('ohc-upload-cluster', {filenames: filename}, 'Starting OHC upload...');
         }
 
         function sendAllMissingToOhc() {
@@ -4507,7 +4682,7 @@ class A_pwmenu(plugins.Plugin):
 
         function sendSingleToWpa(filename) {
             if(!filename || !wpaEnabled) return;
-            post('wpa-sec-upload-cluster', {filenames: filename});
+            runMapAction('wpa-sec-upload-cluster', {filenames: filename}, 'Starting WPA-sec upload...');
         }
 
         function ohcStatusBlock(item) {
@@ -4559,13 +4734,23 @@ class A_pwmenu(plugins.Plugin):
             return icons[name] || '';
         }
 
+        function whitelistAction(networkName) {
+            const allowed = whitelistedNetworks.has(String(networkName || ''));
+            const action = allowed
+                ? `whitelistRemove(${jsq(networkName)}, "map")`
+                : `whitelistAdd(${jsq(networkName)}, "map")`;
+            const title = allowed ? 'Remove from whitelist' : 'Add to whitelist';
+            const label = allowed ? 'Remove' : 'Allow';
+            return `<button class="map-icon-action ${allowed ? 'danger' : ''}" onclick='${action}' title="${title}">${mapActionIcon('whitelist')}<span>${label}</span></button>`;
+        }
+
         function networkActions(networkName, filename, isCracked, ohcExpr, wpaExpr) {
             const download = `<a class="map-icon-action primary" href="/plugins/A_pwmenu/download/${encodeURIComponent(filename)}" title="Download PCAP">${mapActionIcon('download')}<span>PCAP</span></a>`;
             const ohc = isCracked ? '' : `<button class="map-icon-action" onclick='${ohcExpr}' title="Send to OHC">${mapActionIcon('ohc')}<span>OHC</span></button>`;
             const wpa = !isCracked && wpaEnabled ? `<button class="map-icon-action" onclick='${wpaExpr}' title="Send to WPA-sec">${mapActionIcon('wpa')}<span>WPA</span></button>` : '';
             return `<div class="map-icon-actions">
                 ${download}${ohc}${wpa}
-                <button class="map-icon-action" onclick='whitelistAdd(${jsq(networkName)}, "map")' title="Add to whitelist">${mapActionIcon('whitelist')}<span>Allow</span></button>
+                ${whitelistAction(networkName)}
                 <button class="map-icon-action danger" title="Delete capture" onclick='rm(${jsq(filename)})'>${mapActionIcon('trash')}<span>Delete</span></button>
             </div>`;
         }
@@ -5060,6 +5245,11 @@ class A_pwmenu(plugins.Plugin):
                     ${qualityStatusBlock(m)}
                 </button>`;
             }).join('');
+            const excellentNames = excellentGroupNetworks(p);
+            const excellentPending = excellentNames.filter(name => !whitelistedNetworks.has(name));
+            const whitelistGroupAction = excellentPending.length
+                ? `<button class="map-icon-action" onclick="whitelistExcellentGroup(activeMapGroup)" title="Add ${excellentPending.length} Excellent-quality network(s) to the whitelist">${mapActionIcon('whitelist')}<span>Allow ${excellentPending.length}</span></button>`
+                : `<button class="map-icon-action" disabled title="${excellentNames.length ? 'All Excellent-quality networks are already whitelisted' : 'No Excellent-quality networks in this group'}">${mapActionIcon('whitelist')}<span>${excellentNames.length ? 'Allowed' : 'No Excellent'}</span></button>`;
             p.visibleMembers = visibleMembers;
             d.innerHTML = `
                 <div class="map-title-row">
@@ -5073,6 +5263,7 @@ class A_pwmenu(plugins.Plugin):
                     <a class="map-icon-action primary" href="${clusterDownloadUrl(p)}" title="Download all PCAP files">${mapActionIcon('download')}<span>All</span></a>
                     <button class="map-icon-action" onclick="sendClusterToOhc(activeMapGroup)" title="Send cluster to OHC">${mapActionIcon('ohc')}<span>OHC</span></button>
                     ${wpaEnabled ? `<button class="map-icon-action" onclick="sendClusterToWpa(activeMapGroup)" title="Send cluster to WPA-sec">${mapActionIcon('wpa')}<span>WPA</span></button>` : ''}
+                    ${whitelistGroupAction}
                 </div>
                 <div class="map-list map-cluster-list">${rows || '<div class="map-status">No networks here.</div>'}</div>`;
         }
