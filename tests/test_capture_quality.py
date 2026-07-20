@@ -221,6 +221,14 @@ class CaptureQualityTests(unittest.TestCase):
         self.assertIn("Capture Cleanup", page)
         self.assertIn("Made by", page)
         self.assertIn("function loadYandexMaps", page)
+        self.assertIn("function whitelistAction", page)
+        self.assertIn("function whitelistExcellentGroup", page)
+        self.assertIn("const whitelistedNetworks = new Set", page)
+        self.assertIn("async function postAsync", page)
+        self.assertIn("async function updateWhitelistAsync", page)
+        self.assertIn("async function runMapAction", page)
+        self.assertIn("runMapAction('ohc-upload-cluster'", page)
+        self.assertIn("runMapAction('wpa-sec-upload-cluster'", page)
         self.assertNotIn('<script src="https://api-maps.yandex.ru', page)
 
 

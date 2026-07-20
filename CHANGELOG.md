@@ -2,6 +2,13 @@
 
 All notable changes to A_pwmenu are documented here.
 
+## 1.3.1 — 2026-07-20
+
+- Added an Excellent-only whitelist action to map clusters, with server-side quality validation.
+- Changed map network whitelist controls into live Allow/Remove toggles that update without reloading the page.
+- Changed map OHC and WPA-sec submissions to compact asynchronous requests, preserving the open map and details card over slow Bluetooth links.
+- Added duplicate-request protection and in-page success or error notifications for asynchronous map actions.
+
 ## 1.3.0 — 2026-07-20
 
 - Rebuilt the web interface as a responsive field console with a compact mobile layout, desktop workspace, redesigned capture actions, persistent bottom navigation, and improved map details.

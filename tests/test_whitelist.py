@@ -4,6 +4,8 @@ import tempfile
 import types
 import unittest
 
+from flask import Flask, request
+
 
 def install_pwnagotchi_stubs():
     pwnagotchi = types.ModuleType("pwnagotchi")
@@ -72,6 +74,79 @@ class WhitelistTests(unittest.TestCase):
         changed, message = self.plugin._add_to_whitelist("bad\nnetwork")
         self.assertFalse(changed)
         self.assertIn("unsupported", message)
+
+    def test_group_whitelist_adds_only_excellent_quality_networks(self):
+        groups = [
+            {"essid": "Home", "files": [{"quality": {"grade": "Excellent"}}]},
+            {"essid": "Cafe", "files": [{"quality": {"grade": "Excellent"}}]},
+            {
+                "essid": "Office",
+                "files": [
+                    {"quality": {"grade": "Partial"}},
+                    {"quality": {"grade": "Excellent"}},
+                ],
+            },
+            {"essid": "UsableOnly", "files": [{"quality": {"grade": "Usable"}}]},
+        ]
+
+        changed, message = self.plugin._add_excellent_to_whitelist(
+            ["Home", "Cafe", "Office", "UsableOnly", "Unknown"],
+            groups=groups,
+        )
+
+        self.assertTrue(changed)
+        self.assertEqual(self.plugin._get_whitelist(), ["Cafe", "Home", "Office"])
+        self.assertIn("Added 2", message)
+        self.assertIn("1 already whitelisted", message)
+        self.assertIn("2 skipped", message)
+
+    def test_group_whitelist_reports_when_no_excellent_network_is_new(self):
+        changed, message = self.plugin._add_excellent_to_whitelist(
+            ["Home", "UsableOnly"],
+            groups=[
+                {"essid": "Home", "files": [{"quality": {"grade": "Excellent"}}]},
+                {"essid": "UsableOnly", "files": [{"quality": {"grade": "Usable"}}]},
+            ],
+        )
+
+        self.assertFalse(changed)
+        self.assertEqual(self.plugin._get_whitelist(), ["Home"])
+        self.assertIn("No new Excellent-quality networks", message)
+        self.assertIn("1 already whitelisted", message)
+        self.assertIn("1 skipped", message)
+
+    def test_async_whitelist_response_is_compact_json(self):
+        app = Flask(__name__)
+        with app.test_request_context(
+            "/plugins/A_pwmenu/whitelist-add",
+            method="POST",
+            headers={"X-PWMenu-Async": "1"},
+        ):
+            response = self.plugin._whitelist_action_response(
+                request,
+                True,
+                "Added Cafe",
+                "map",
+            )
+
+        self.assertEqual(response.mimetype, "application/json")
+        self.assertEqual(response.get_json()["message"], "Added Cafe")
+        self.assertEqual(response.get_json()["whitelist"], ["Home"])
+        self.assertEqual(response.headers["Cache-Control"], "no-store")
+
+    def test_async_map_action_response_is_compact_json(self):
+        app = Flask(__name__)
+        with app.test_request_context(headers={"X-PWMenu-Async": "1"}):
+            response = self.plugin._action_response(
+                request,
+                "Upload started",
+                False,
+                "map",
+            )
+
+        self.assertEqual(response.mimetype, "application/json")
+        self.assertEqual(response.get_json(), {"ok": True, "message": "Upload started"})
+        self.assertEqual(response.headers["Cache-Control"], "no-store")
 
 
 if __name__ == "__main__":
