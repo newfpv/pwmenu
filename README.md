@@ -2,7 +2,7 @@
 
 A fast, mobile-first capture and password manager for Pwnagotchi. It combines PCAP quality analysis, local passwords, GPS mapping, WPA-sec, OnlineHashCrack, exports, imports, a persistent upload queue, and safe cleanup in one web interface.
 
-[![Version](https://img.shields.io/badge/version-1.3.1-20e4f4)](./CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-1.3.2-20e4f4)](./CHANGELOG.md)
 [![Tests](https://github.com/newfpv/pwmenu/actions/workflows/test.yml/badge.svg)](https://github.com/newfpv/pwmenu/actions/workflows/test.yml)
 [![License](https://img.shields.io/badge/license-GPL--3.0-30d158)](./LICENSE)
 
@@ -16,6 +16,7 @@ A fast, mobile-first capture and password manager for Pwnagotchi. It combines PC
 - WPA-sec and OnlineHashCrack uploads with persistent deduplication and backoff.
 - Manual passwords, OHC imports, QuickDic results, exports, and ZIP downloads.
 - In-app Pwnagotchi whitelist management, including Excellent-only map groups, and confirmation-bound capture cleanup.
+- BSSID-aware uncracked exports that keep only the best capture for each exact access point.
 - Gzip-compressed HTML, lazy map loading, and in-place map actions for faster Bluetooth access.
 
 ## Install
@@ -25,7 +26,7 @@ sudo cp /usr/local/share/pwnagotchi/custom-plugins/A_pwmenu.py \
   /root/A_pwmenu.py.backup 2>/dev/null || true
 
 sudo wget -O /usr/local/share/pwnagotchi/custom-plugins/A_pwmenu.py \
-  https://raw.githubusercontent.com/newfpv/pwmenu/v1.3.1/A_pwmenu.py
+  https://raw.githubusercontent.com/newfpv/pwmenu/v1.3.2/A_pwmenu.py
 
 sudo chown root:root /usr/local/share/pwnagotchi/custom-plugins/A_pwmenu.py
 sudo chmod 644 /usr/local/share/pwnagotchi/custom-plugins/A_pwmenu.py

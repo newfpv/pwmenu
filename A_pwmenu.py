@@ -47,7 +47,7 @@ logging.info("[A_pwmenu] Module init.")
 
 class A_pwmenu(plugins.Plugin):
     __author__ = 'NewFPV'
-    __version__ = '1.3.1'
+    __version__ = '1.3.2'
     __license__ = 'GPL3'
     __description__ = 'Ultimate Password Manager'
 
@@ -3101,21 +3101,99 @@ class A_pwmenu(plugins.Plugin):
         return send_file(m, mimetype='application/zip', as_attachment=True, download_name='handshakes.zip')
 
     def _serve_uncracked_zip(self):
-        cracked = self._get_cracked_data()
         m = self._new_archive_buffer()
-        seen = set()
         with zipfile.ZipFile(m, 'w', zipfile.ZIP_DEFLATED) as z:
-            for d in self.handshake_dirs:
-                if not os.path.exists(d):
-                    continue
-                for f in glob.glob(os.path.join(d, '*.pcap')):
-                    fn = os.path.basename(f)
-                    essid = self._essid_from_filename(fn)
-                    if essid not in cracked and fn not in seen:
-                        z.write(f, fn)
-                        seen.add(fn)
+            for path, name in self._uncracked_export_files():
+                z.write(path, name)
         m.seek(0)
         return send_file(m, mimetype='application/zip', as_attachment=True, download_name='uncracked-handshakes.zip')
+
+    def _known_cracked_ap_identities(self):
+        """Return exact (ESSID, BSSID) identities with a locally known password."""
+        identities = set()
+        potfiles = [
+            '/root/handshakes/wpa-sec.cracked.potfile',
+            '/home/pi/handshakes/wpa-sec.cracked.potfile',
+            self.potfile_ohc,
+            self.potfile_manual,
+        ]
+        for path in potfiles:
+            if not os.path.exists(path):
+                continue
+            try:
+                lines, _ = self._read_pot_lines(path)
+                for line in lines:
+                    record = self._parse_pot_line(line)
+                    if not record or not record.get('password'):
+                        continue
+                    bssid = re.sub(r'[^0-9a-f]', '', record.get('bssid', '').lower())
+                    if len(bssid) == 12:
+                        identities.add((record.get('essid', ''), bssid))
+            except OSError as error:
+                logging.warning(f"[A_pwmenu] Could not read cracked identities from {path}: {error}")
+
+        for directory in self.handshake_dirs:
+            if not os.path.exists(directory):
+                continue
+            for result_path in glob.glob(os.path.join(directory, '*.pcap.cracked')):
+                try:
+                    with open(result_path, 'r', errors='ignore') as handle:
+                        if not handle.read().strip():
+                            continue
+                    capture_name = os.path.basename(result_path)[:-len('.cracked')]
+                    essid, bssid = self._handshake_identity(capture_name)
+                    if bssid:
+                        identities.add((essid, bssid))
+                except OSError as error:
+                    logging.warning(f"[A_pwmenu] Could not read QuickDic identity {result_path}: {error}")
+        return identities
+
+    def _capture_export_score(self, path):
+        name = os.path.basename(path)
+        quality = self._quality_file_record(name, path)
+        def metric(field, default=0):
+            try:
+                return int(quality.get(field, default))
+            except (TypeError, ValueError):
+                return default
+        try:
+            stat = os.stat(path)
+            modified = float(stat.st_mtime)
+            size = int(stat.st_size)
+        except OSError:
+            modified, size = 0.0, 0
+        return (
+            metric('rank', -1),
+            metric('hashes'),
+            metric('authorized'),
+            metric('best_pairs'),
+            modified,
+            size,
+        )
+
+    def _uncracked_export_files(self):
+        """Select one best capture per exact AP, excluding only exact cracked APs."""
+        cracked_identities = self._known_cracked_ap_identities()
+        selected = {}
+        for directory in self.handshake_dirs:
+            if not os.path.exists(directory):
+                continue
+            for path in glob.glob(os.path.join(directory, '*.pcap')):
+                name = os.path.basename(path)
+                essid, bssid = self._handshake_identity(name)
+                if bssid and (essid, bssid) in cracked_identities:
+                    continue
+
+                # A filename without a valid BSSID cannot safely be merged with another AP.
+                identity = (essid, bssid) if bssid else ('file', name)
+                score = self._capture_export_score(path)
+                current = selected.get(identity)
+                if current is None or score > current[0]:
+                    selected[identity] = (score, path, name)
+
+        files = [(item[1], item[2]) for item in selected.values()]
+        files.sort(key=lambda item: item[1].casefold())
+        return files
 
     def _essid_from_filename(self, filename):
         nm = os.path.basename(filename).replace('.pcap', '')
@@ -4296,7 +4374,7 @@ class A_pwmenu(plugins.Plugin):
                 </div>
                 <a href="/plugins/A_pwmenu/export-passwords" class="btn" style="background:var(--accent);">Export List (.txt)</a>
                 <a href="/plugins/A_pwmenu/download-zip" class="btn">Download All (.zip)</a>
-                <a href="/plugins/A_pwmenu/download-uncracked" class="btn" style="background:#071f45;color:#91c2ff;">Download Uncracked (.zip)</a>
+                <a href="/plugins/A_pwmenu/download-uncracked" class="btn" style="background:#071f45;color:#91c2ff;">Download Best Uncracked (.zip)</a>
                 <form method="POST" action="/plugins/A_pwmenu/sync-time" style="margin-top:10px;">
                     <input type="hidden" name="csrf_token" value="{{ token }}">
                     <button class="btn" style="background:var(--sub);">Sync Time (Google)</button>

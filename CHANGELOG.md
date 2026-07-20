@@ -2,6 +2,13 @@
 
 All notable changes to A_pwmenu are documented here.
 
+## 1.3.2 — 2026-07-20
+
+- Fixed uncracked ZIP selection to match known credentials by exact `ESSID + BSSID` instead of treating every access point with the same ESSID as cracked.
+- Deduplicated captures from the same exact access point and exported only the best candidate by quality rank, usable hash count, authorized exchange evidence, recency, and file size.
+- Kept captures with missing or malformed BSSID data separate so the exporter cannot incorrectly suppress an unrelated access point.
+- Renamed the UI action to `Download Best Uncracked` and added regression coverage for shared ESSIDs and duplicate captures.
+
 ## 1.3.1 — 2026-07-20
 
 - Added an Excellent-only whitelist action to map clusters, with server-side quality validation.
