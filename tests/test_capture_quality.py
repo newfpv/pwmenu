@@ -159,6 +159,52 @@ class CaptureQualityTests(unittest.TestCase):
         self.assertEqual(replaced, 0)
         self.assertTrue(os.path.exists(old_path))
 
+    def test_uncracked_export_matches_exact_bssid_not_only_essid(self):
+        known_path = os.path.join(self.tempdir.name, "Shared_aaaaaaaaaaaa.pcap")
+        unknown_path = os.path.join(self.tempdir.name, "Shared_bbbbbbbbbbbb.pcap")
+        with open(known_path, "wb") as handle:
+            handle.write(b"known")
+        with open(unknown_path, "wb") as handle:
+            handle.write(b"unknown")
+
+        self.plugin.potfile_ohc = os.path.join(self.tempdir.name, "ohc.potfile")
+        self.plugin.potfile_manual = os.path.join(self.tempdir.name, "manual.potfile")
+        with open(self.plugin.potfile_ohc, "w", encoding="utf-8") as handle:
+            handle.write("aa:aa:aa:aa:aa:aa:aa:aa:aa:aa:aa:aa:Shared:secret123\n")
+
+        selected = [name for _, name in self.plugin._uncracked_export_files()]
+
+        self.assertNotIn("Shared_aaaaaaaaaaaa.pcap", selected)
+        self.assertIn("Shared_bbbbbbbbbbbb.pcap", selected)
+
+    def test_uncracked_export_keeps_best_duplicate_capture(self):
+        second_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(second_dir.cleanup)
+        self.plugin.handshake_dirs = [self.tempdir.name, second_dir.name]
+        self.plugin.potfile_ohc = os.path.join(self.tempdir.name, "ohc.potfile")
+        self.plugin.potfile_manual = os.path.join(self.tempdir.name, "manual.potfile")
+
+        filename = "Field_cccccccccccc.pcap"
+        weak_path = os.path.join(self.tempdir.name, filename)
+        excellent_path = os.path.join(second_dir.name, filename)
+        with open(weak_path, "wb") as handle:
+            handle.write(b"weak")
+        with open(excellent_path, "wb") as handle:
+            handle.write(b"excellent")
+        self.plugin.data["capture_quality"] = {
+            filename: {
+                "grade": "Excellent",
+                "rank": 3,
+                "hashes": 1,
+                "authorized": 1,
+                "signature": self.plugin._ohc_file_signature(excellent_path),
+            }
+        }
+
+        selected = self.plugin._uncracked_export_files()
+
+        self.assertEqual([(excellent_path, filename)], selected)
+
     def test_web_template_renders_quality_cleanup_and_branding(self):
         app = Flask(__name__)
         with app.test_request_context("/plugins/A_pwmenu/"):
@@ -219,6 +265,7 @@ class CaptureQualityTests(unittest.TestCase):
 
         self.assertIn("function qualityStatusBlock", page)
         self.assertIn("Capture Cleanup", page)
+        self.assertIn("Download Best Uncracked", page)
         self.assertIn("Made by", page)
         self.assertIn("function loadYandexMaps", page)
         self.assertIn("function whitelistAction", page)
