@@ -52,7 +52,7 @@ class CaptureQualityTests(unittest.TestCase):
             "ohc_hash_files": {},
             "capture_quality": {},
             "replacement_history": [],
-            "empty_cleanup_history": [],
+            "capture_cleanup_history": [],
         }
 
     def test_quality_grades_follow_hcx_metrics(self):
@@ -86,14 +86,14 @@ class CaptureQualityTests(unittest.TestCase):
         with open(empty_path, "wb") as handle:
             handle.write(b"\xd4\xc3\xb2\xa1" + (b"\x00" * 20))
 
-        report = self.plugin._empty_pcap_report()
+        report = self.plugin._capture_cleanup_report()
         self.assertEqual(report["count"], 1)
 
-        deleted, total, _ = self.plugin._clean_empty_pcaps("0" * 64)
+        deleted, total, _ = self.plugin._clean_capture_candidates("0" * 64)
         self.assertEqual((deleted, total), (0, 1))
         self.assertTrue(os.path.exists(empty_path))
 
-        deleted, total, _ = self.plugin._clean_empty_pcaps(report["token"])
+        deleted, total, _ = self.plugin._clean_capture_candidates(report["token"])
         self.assertEqual((deleted, total), (1, 1))
         self.assertFalse(os.path.exists(empty_path))
 
@@ -206,18 +206,22 @@ class CaptureQualityTests(unittest.TestCase):
                     "invalid": 0,
                     "nul_bytes": 0,
                 },
-                empty_report={
+                cleanup_report={
                     "count": 0,
-                    "bytes": 0,
-                    "names": [],
+                    "empty_count": 0,
+                    "unusable_count": 0,
+                    "display_files": [],
                     "more": 0,
                     "token": "0" * 64,
                 },
+                whitelist=[],
             )
 
         self.assertIn("function qualityStatusBlock", page)
-        self.assertIn("Empty PCAP Cleanup", page)
-        self.assertIn("Powered by <strong>NewFPV</strong>", page)
+        self.assertIn("Capture Cleanup", page)
+        self.assertIn("Made by", page)
+        self.assertIn("function loadYandexMaps", page)
+        self.assertNotIn('<script src="https://api-maps.yandex.ru', page)
 
 
 if __name__ == "__main__":

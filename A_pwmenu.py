@@ -19,9 +19,12 @@ import html
 import hashlib
 import shutil
 import tempfile
+import ast
+import gzip
 import pwnagotchi.plugins as plugins
 import pwnagotchi.ui.fonts as fonts
-from flask import render_template_string, send_file, make_response
+from flask import render_template_string, send_file, make_response, has_request_context
+from flask import request as flask_request
 from pwnagotchi.ui.components import LabeledValue
 from pwnagotchi.ui.view import BLACK
 
@@ -44,7 +47,7 @@ logging.info("[A_pwmenu] Module init.")
 
 class A_pwmenu(plugins.Plugin):
     __author__ = 'NewFPV'
-    __version__ = '1.2.0'
+    __version__ = '1.3.0'
     __license__ = 'GPL3'
     __description__ = 'Ultimate Password Manager'
 
@@ -96,6 +99,9 @@ class A_pwmenu(plugins.Plugin):
         self.quality_pending = set()
         self.quality_scan_all = False
         self.quality_scan_running = False
+        self._agent = None
+        self.config_path = '/etc/pwnagotchi/config.toml'
+        self.whitelist_lock = threading.RLock()
 
     def on_loaded(self):
         logging.info("[A_pwmenu] Loaded.")
@@ -153,6 +159,9 @@ class A_pwmenu(plugins.Plugin):
                 label_font=fonts.Bold,
                 text_font=fonts.Medium
             ))
+
+    def on_ready(self, agent):
+        self._agent = agent
 
     def on_ui_update(self, ui):
         if not self.ready:
@@ -259,21 +268,32 @@ class A_pwmenu(plugins.Plugin):
                         return self._render_page(notification=f"Deleted {fname}", notif_type="success", active_tab="handshakes")
                     return self._render_page(notification=f"Failed to delete {fname}", notif_type="error", active_tab="handshakes")
 
-                if path == 'clean-broken':
-                    d, t = self._clean_broken_handshakes()
-                    return self._render_page(notification=f"Removed {d}/{t} broken files", notif_type="success", active_tab='other')
-
-                if path == 'clean-empty-pcaps':
-                    deleted, total, message = self._clean_empty_pcaps(request.form.get('report_token') or '')
+                if path == 'clean-captures':
+                    deleted, total, message = self._clean_capture_candidates(request.form.get('report_token') or '')
                     return self._render_page(
-                        notification=message or f"Removed {deleted}/{total} empty PCAP files",
+                        notification=message or f"Removed {deleted}/{total} unusable capture files",
                         notif_type="success" if deleted == total else "error",
                         active_tab='other'
                     )
 
-                if path == 'nuke-all':
-                    c = self._nuke_all_handshakes()
-                    return self._render_page(notification=f"Nuked {c} files and passwords", notif_type="success", active_tab='other')
+                if path == 'whitelist-add':
+                    name = request.form.get('network') or ''
+                    changed, message = self._add_to_whitelist(name)
+                    requested_tab = request.form.get('return_tab') or 'other'
+                    active_tab = requested_tab if requested_tab in ('handshakes', 'map', 'other') else 'other'
+                    return self._render_page(
+                        notification=message,
+                        notif_type="success" if changed else "error",
+                        active_tab=active_tab
+                    )
+
+                if path == 'whitelist-remove':
+                    changed, message = self._remove_from_whitelist(request.form.get('network') or '')
+                    return self._render_page(
+                        notification=message,
+                        notif_type="success" if changed else "error",
+                        active_tab='other'
+                    )
 
                 if path == 'wpa-sec-upload':
                     res, is_err = self._handle_wpa_upload(request)
@@ -395,7 +415,8 @@ class A_pwmenu(plugins.Plugin):
         gps_status = self._gps_status()
         ohc_status = self._ohc_status()
         pot_health = self._potfile_health(self.potfile_ohc)
-        empty_report = self._empty_pcap_report()
+        cleanup_report = self._capture_cleanup_report()
+        whitelist = self._get_whitelist()
         ach = self._update_achievements(groups, cracked)
 
         t_nets = len(groups)
@@ -420,11 +441,30 @@ class A_pwmenu(plugins.Plugin):
             tab=active_tab, stats=stats, ach=ach['badges'], token=tok,
             show_wpa=show_wpa, map_points=map_points, gps_status=gps_status,
             no_gps_networks=no_gps_networks, ohc_status=ohc_status,
-            pot_health=pot_health, empty_report=empty_report
+            pot_health=pot_health, cleanup_report=cleanup_report,
+            whitelist=whitelist
         )
 
-        r = make_response(html)
+        return self._html_response(html)
+
+    def _html_response(self, html):
+        """Return the UI efficiently, especially over low-bandwidth Bluetooth PAN."""
+        body = html.encode('utf-8') if isinstance(html, str) else bytes(html)
+        r = make_response(body)
+        r.headers["Content-Type"] = "text/html; charset=utf-8"
         r.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+        r.headers["Vary"] = "Accept-Encoding"
+
+        accepts_gzip = (
+            has_request_context()
+            and flask_request.accept_encodings['gzip'] > 0
+        )
+        if accepts_gzip and len(body) >= 1024:
+            compressed = gzip.compress(body, compresslevel=6)
+            if len(compressed) < len(body):
+                r.set_data(compressed)
+                r.headers["Content-Encoding"] = "gzip"
+                r.headers["Content-Length"] = str(len(compressed))
         return r
 
     def _handle_wpa_upload(self, req):
@@ -2364,6 +2404,158 @@ class A_pwmenu(plugins.Plugin):
                     os.remove(companion)
         return found
 
+    def _whitelist_block_bounds(self, lines):
+        for index, line in enumerate(lines):
+            if line.lstrip().startswith('#'):
+                continue
+            if not re.match(r'^\s*main\.whitelist\s*=', line):
+                continue
+            value = line.split('=', 1)[1]
+            if re.search(r'\]\s*(?:#.*)?$', value):
+                return index, index
+            for end in range(index + 1, len(lines)):
+                if re.match(r'^\s*\]\s*(?:#.*)?$', lines[end]):
+                    return index, end
+            raise ValueError('main.whitelist has no closing bracket')
+        return None
+
+    def _read_config_whitelist(self):
+        try:
+            with open(self.config_path, 'r', encoding='utf-8') as handle:
+                lines = handle.readlines()
+            bounds = self._whitelist_block_bounds(lines)
+            if bounds is None:
+                return [], False
+            start, end = bounds
+            value = ''.join(lines[start:end + 1]).split('=', 1)[1].strip()
+            parsed = ast.literal_eval(value)
+            if not isinstance(parsed, (list, tuple)):
+                raise ValueError('main.whitelist is not an array')
+            names = [str(item).strip() for item in parsed if str(item).strip()]
+            return list(dict.fromkeys(names)), True
+        except (OSError, SyntaxError, ValueError, TypeError) as error:
+            logging.warning(f"[A_pwmenu] Could not read whitelist from config: {error}")
+            return [], False
+
+    def _runtime_whitelist(self):
+        try:
+            values = self._agent._config.get('main', {}).get('whitelist', []) if self._agent else []
+            return list(dict.fromkeys(str(item).strip() for item in values if str(item).strip()))
+        except (AttributeError, TypeError):
+            return []
+
+    def _get_whitelist(self):
+        names, configured = self._read_config_whitelist()
+        if not configured:
+            names = self._runtime_whitelist()
+        return sorted(names, key=str.casefold)
+
+    def _write_whitelist_config(self, names):
+        with open(self.config_path, 'r', encoding='utf-8') as handle:
+            text = handle.read()
+        newline = '\r\n' if '\r\n' in text else '\n'
+        lines = text.splitlines(keepends=True)
+        block = ['main.whitelist = [' + newline]
+        block.extend(f"  {json.dumps(name, ensure_ascii=False)}," + newline for name in names)
+        block.extend([']' + newline, newline])
+
+        bounds = self._whitelist_block_bounds(lines)
+        if bounds is not None:
+            start, end = bounds
+            lines[start:end + 1] = block
+        else:
+            insert_at = next(
+                (index for index, line in enumerate(lines) if line.startswith('# Whitelist temporarily disabled')),
+                None,
+            )
+            if insert_at is None:
+                insert_at = next(
+                    (index + 1 for index, line in enumerate(lines) if re.match(r'^\s*main\.name\s*=', line)),
+                    0,
+                )
+            lines[insert_at:insert_at] = block
+
+        directory = os.path.dirname(self.config_path)
+        original_stat = os.stat(self.config_path)
+        backup_path = self.config_path + '.pwmenu-whitelist.bak'
+        shutil.copy2(self.config_path, backup_path)
+        fd, temporary_path = tempfile.mkstemp(prefix='.config.toml.pwmenu-', dir=directory)
+        try:
+            with os.fdopen(fd, 'w', encoding='utf-8', newline='') as handle:
+                handle.write(''.join(lines))
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.chmod(temporary_path, original_stat.st_mode)
+            try:
+                if not hasattr(os, 'chown'):
+                    raise PermissionError
+                os.chown(temporary_path, original_stat.st_uid, original_stat.st_gid)
+            except PermissionError:
+                pass
+            os.replace(temporary_path, self.config_path)
+            try:
+                directory_fd = os.open(directory, os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0))
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+            except OSError:
+                pass
+        finally:
+            if os.path.exists(temporary_path):
+                os.remove(temporary_path)
+
+    def _set_runtime_whitelist(self, names):
+        if not self._agent:
+            return
+        try:
+            self._agent._config.setdefault('main', {})['whitelist'] = list(names)
+        except (AttributeError, TypeError) as error:
+            logging.warning(f"[A_pwmenu] Could not update runtime whitelist: {error}")
+
+    def _validate_whitelist_name(self, name):
+        value = str(name or '').strip()
+        if not value:
+            raise ValueError('Enter a network name')
+        if len(value) > 128:
+            raise ValueError('Network name is too long')
+        if any(char in value for char in ('\x00', '\r', '\n')):
+            raise ValueError('Network name contains unsupported characters')
+        return value
+
+    def _add_to_whitelist(self, name):
+        try:
+            value = self._validate_whitelist_name(name)
+            with self.whitelist_lock:
+                names = self._get_whitelist()
+                if value in names:
+                    return False, f"{value} is already in the whitelist"
+                names.append(value)
+                names = sorted(dict.fromkeys(names), key=str.casefold)
+                self._write_whitelist_config(names)
+                self._set_runtime_whitelist(names)
+            logging.info(f"[A_pwmenu] Added network to whitelist: {value}")
+            return True, f"Added {value} to the whitelist"
+        except (OSError, ValueError) as error:
+            logging.error(f"[A_pwmenu] Could not add whitelist entry: {error}")
+            return False, str(error)
+
+    def _remove_from_whitelist(self, name):
+        try:
+            value = self._validate_whitelist_name(name)
+            with self.whitelist_lock:
+                names = self._get_whitelist()
+                if value not in names:
+                    return False, f"{value} is not in the whitelist"
+                names = [item for item in names if item != value]
+                self._write_whitelist_config(names)
+                self._set_runtime_whitelist(names)
+            logging.info(f"[A_pwmenu] Removed network from whitelist: {value}")
+            return True, f"Removed {value} from the whitelist"
+        except (OSError, ValueError) as error:
+            logging.error(f"[A_pwmenu] Could not remove whitelist entry: {error}")
+            return False, str(error)
+
     def _is_empty_pcap(self, path):
         try:
             if os.path.getsize(path) != 24:
@@ -2379,47 +2571,58 @@ class A_pwmenu(plugins.Plugin):
         except OSError:
             return False
 
-    def _empty_pcap_report(self):
+    def _capture_cleanup_report(self):
         entries = []
         for directory in self.handshake_dirs:
             if not os.path.isdir(directory):
                 continue
             for path in sorted(glob.glob(os.path.join(directory, '*.pcap'))):
-                if not self._is_empty_pcap(path):
+                name = os.path.basename(path)
+                empty = self._is_empty_pcap(path)
+                quality = self._quality_file_record(name, path)
+                unusable = quality.get('grade') == 'Unusable'
+                if not empty and not unusable:
                     continue
+                reason = 'Empty PCAP header' if empty else (quality.get('summary') or 'No usable WPA/PMKID material')
                 entries.append({
-                    'name': os.path.basename(path),
+                    'name': name,
                     'path': path,
                     'signature': self._ohc_file_signature(path),
+                    'reason': reason,
+                    'empty': empty,
                 })
         fingerprint = json.dumps(
-            [(entry['path'], entry['signature']) for entry in entries],
+            [(entry['path'], entry['signature'], entry['reason']) for entry in entries],
             separators=(',', ':'),
             ensure_ascii=True,
         ).encode('utf-8')
         return {
             'count': len(entries),
-            'bytes': len(entries) * 24,
-            'names': [entry['name'] for entry in entries[:12]],
+            'empty_count': len([entry for entry in entries if entry['empty']]),
+            'unusable_count': len([entry for entry in entries if not entry['empty']]),
+            'display_files': entries[:12],
             'more': max(0, len(entries) - 12),
             'token': hashlib.sha256(fingerprint).hexdigest(),
             'entries': entries,
         }
 
-    def _clean_empty_pcaps(self, report_token):
-        report = self._empty_pcap_report()
+    def _clean_capture_candidates(self, report_token):
+        report = self._capture_cleanup_report()
         total = report['count']
         if not total:
-            return 0, total, 'No empty PCAP files to remove'
+            return 0, total, 'No empty or unusable capture files to remove'
         if not report_token:
-            return 0, total, 'Review the current empty PCAP report and confirm again.'
+            return 0, total, 'Review the current cleanup report and confirm again.'
         if not re.fullmatch(r'[0-9a-f]{64}', report_token) or report_token != report['token']:
             return 0, total, 'Cleanup report changed. Review the current list and confirm again.'
 
         deleted = 0
         for entry in report['entries']:
             path = entry['path']
-            if self._ohc_file_signature(path) != entry['signature'] or not self._is_empty_pcap(path):
+            if self._ohc_file_signature(path) != entry['signature']:
+                continue
+            quality = self._quality_file_record(entry['name'], path)
+            if not self._is_empty_pcap(path) and quality.get('grade') != 'Unusable':
                 continue
             try:
                 os.remove(path)
@@ -2430,81 +2633,19 @@ class A_pwmenu(plugins.Plugin):
                         os.remove(companion)
                 with self.data_lock:
                     self._forget_handshake_state_locked(entry['name'], path)
-                    history = self.data.setdefault('empty_cleanup_history', [])
-                    history.append({'file': entry['name'], 'deleted_at': int(time.time())})
+                    history = self.data.setdefault('capture_cleanup_history', [])
+                    history.append({
+                        'file': entry['name'],
+                        'reason': entry['reason'],
+                        'deleted_at': int(time.time()),
+                    })
                     del history[:-200]
                 self._save_data()
                 deleted += 1
-            except OSError as e:
-                logging.warning(f"[A_pwmenu] Could not remove empty PCAP {path}: {e}")
-        logging.info(f"[A_pwmenu] Empty PCAP cleanup removed {deleted}/{total} file(s)")
-        return deleted, total, f"Removed {deleted}/{total} confirmed empty PCAP files"
-
-    def _clean_broken_handshakes(self):
-        d_cnt=0
-        t_cnt=0
-        for d in self.handshake_dirs:
-            if not os.path.exists(d): continue
-            for f in glob.glob(os.path.join(d, '*.pcap')):
-                t_cnt += 1
-                tmp = None
-                try:
-                    with tempfile.NamedTemporaryFile(prefix='pwmenu-check-', suffix='.hc22000', delete=False) as handle:
-                        tmp = handle.name
-                    os.remove(tmp)
-                    subprocess.run(
-                        ['/usr/bin/hcxpcapngtool', '-o', tmp, f],
-                        check=False,
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                        timeout=self._option_int('hcxpcapngtool_timeout', 90)
-                    )
-                    valid = os.path.exists(tmp) and os.path.getsize(tmp) > 0
-                    if not valid:
-                        os.remove(f)
-                        base = os.path.splitext(f)[0]
-                        for ext in ['.hc22000', '.22000']:
-                            h = base + ext
-                            if os.path.isfile(h):
-                                os.remove(h)
-                        d_cnt += 1
-                except Exception as e:
-                    logging.error(f"[A_pwmenu] Handshake validation failed for {f}: {e}")
-                finally:
-                    if tmp:
-                        try:
-                            os.remove(tmp)
-                        except FileNotFoundError:
-                            pass
-        return d_cnt, t_cnt
-
-    def _nuke_all_handshakes(self):
-        c = 0
-
-        for d in self.handshake_dirs:
-            if not os.path.exists(d): continue
-            for f in glob.glob(os.path.join(d, '*.pcap')):
-                try:
-                    os.remove(f)
-                    c += 1
-                except OSError as e:
-                    logging.warning(f"[A_pwmenu] Could not remove {f}: {e}")
-            for f in glob.glob(os.path.join(d, '*.hc22000')):
-                try: os.remove(f)
-                except OSError as e:
-                    logging.warning(f"[A_pwmenu] Could not remove {f}: {e}")
-            for f in glob.glob(os.path.join(d, '*.22000')):
-                try: os.remove(f)
-                except OSError as e:
-                    logging.warning(f"[A_pwmenu] Could not remove {f}: {e}")
-
-        try:
-            with open(self.potfile_manual, 'w') as f: f.write("")
-            with open(self.potfile_ohc, 'w') as f: f.write("")
-        except OSError as e:
-            logging.error(f"[A_pwmenu] Could not clear potfiles: {e}")
-
-        return c
+            except OSError as error:
+                logging.warning(f"[A_pwmenu] Could not remove capture {path}: {error}")
+        logging.info(f"[A_pwmenu] Capture cleanup removed {deleted}/{total} file(s)")
+        return deleted, total, f"Removed {deleted}/{total} empty or unusable capture files"
 
     def _process_import(self, content, name):
         self._ensure_file(self.potfile_ohc)
@@ -3074,10 +3215,31 @@ class A_pwmenu(plugins.Plugin):
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <title>A_pwmenu</title>
-    <script src="https://api-maps.yandex.ru/2.1/?apikey=&lang=en_US" type="text/javascript"></script>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='16' fill='%23080b0c'/%3E%3Ccircle cx='14' cy='16' r='5' fill='%2320e4f4'/%3E%3Cpath d='M16 24h10c12 0 20 6 20 17S38 57 26 57H16V24Zm10 9v15c7 0 10-2 10-7s-3-8-10-8Z' fill='%23f4f6f7'/%3E%3C/svg%3E">
+    <script>
+        (() => {
+            try {
+                let saved = JSON.parse(localStorage.getItem('a_pwmenu_accent_v1') || 'null');
+                let color = saved && saved.color;
+                if(!color) {
+                    const cookie = document.cookie.match(/(?:^|;\s*)a_pwmenu_accent=([0-9a-f]{6})/i);
+                    if(cookie) color = '#' + cookie[1];
+                }
+                if(!/^#[0-9a-f]{6}$/i.test(String(color || ''))) return;
+                const value = color.slice(1);
+                const rgb = [0,2,4].map(i => parseInt(value.slice(i,i+2),16) / 255);
+                const linear = rgb.map(c => c <= .03928 ? c / 12.92 : Math.pow((c + .055) / 1.055, 2.4));
+                const luminance = .2126 * linear[0] + .7152 * linear[1] + .0722 * linear[2];
+                document.documentElement.style.setProperty('--accent', color.toLowerCase());
+                document.documentElement.style.setProperty('--accent-contrast', luminance > .42 ? '#001013' : '#ffffff');
+            } catch(error) {}
+        })();
+    </script>
     <style>
         :root { --bg: #000; --card: #151515; --text: #fff; --sub: #888; --accent: #0a84ff; --green: #30d158; --yellow: #ffcc00; --sep: #333; --input: #222; --danger: #ff453a; }
-        body { font-family: -apple-system, sans-serif; background: var(--bg); color: var(--text); margin: 0; padding: 15px; }
+        html, body { min-height: 100%; background: var(--bg); }
+        body { min-height: 100vh; box-sizing: border-box; font-family: -apple-system, sans-serif; background: var(--bg); color: var(--text); margin: 0; padding: 15px; }
+        .pwmenu-page { width: 100%; max-width: 800px; min-height: calc(100vh - 30px); margin: 0 auto; }
         h1 { font-size: 24px; margin: 0 0 15px 0; font-weight: 700; }
         .s-box { width: 100%; background: var(--input); border: none; border-radius: 10px; padding: 12px; color: var(--text); font-size: 16px; outline: none; margin-bottom: 15px; box-sizing: border-box; }
         .tabs { display: flex; background: var(--input); border-radius: 10px; padding: 2px; margin-bottom: 20px; }
@@ -3134,8 +3296,9 @@ class A_pwmenu(plugins.Plugin):
         .btn-edit { color: var(--yellow); transform: scaleX(-1); }
         .btn-del { color: var(--danger); font-weight: bold; }
         .btn-add { color: var(--green); font-size: 20px; font-weight: bold; }
-        .map-shell { background: #1f242b; color: #f7f8fb; border-radius: 22px; overflow: hidden; min-height: 680px; position: relative; box-shadow: 0 20px 45px rgba(0,0,0,0.32); }
-        .map-stage { height: 680px; position: relative; overflow: hidden; background-color: #1f242b; background-image: linear-gradient(28deg, transparent 0 43%, rgba(113,116,104,0.34) 44% 47%, transparent 48% 100%), linear-gradient(115deg, transparent 0 52%, rgba(102,110,122,0.28) 53% 56%, transparent 57% 100%), linear-gradient(72deg, transparent 0 64%, rgba(70,110,84,0.18) 65% 67%, transparent 68% 100%), repeating-linear-gradient(0deg, rgba(190,205,225,0.045) 0 2px, transparent 2px 74px), repeating-linear-gradient(90deg, rgba(190,205,225,0.045) 0 2px, transparent 2px 74px); }
+        .btn-whitelist { color: #20e4f4; min-width: 34px; font-size: 10px; font-weight: 900; letter-spacing: .04em; }
+        .map-shell { height: calc(100vh - 205px); min-height: 680px; background: #1f242b; color: #f7f8fb; border-radius: 22px; overflow: hidden; position: relative; box-shadow: 0 20px 45px rgba(0,0,0,0.32); }
+        .map-stage { height: 100%; min-height: inherit; position: relative; overflow: hidden; background-color: #1f242b; background-image: linear-gradient(28deg, transparent 0 43%, rgba(113,116,104,0.34) 44% 47%, transparent 48% 100%), linear-gradient(115deg, transparent 0 52%, rgba(102,110,122,0.28) 53% 56%, transparent 57% 100%), linear-gradient(72deg, transparent 0 64%, rgba(70,110,84,0.18) 65% 67%, transparent 68% 100%), repeating-linear-gradient(0deg, rgba(190,205,225,0.045) 0 2px, transparent 2px 74px), repeating-linear-gradient(90deg, rgba(190,205,225,0.045) 0 2px, transparent 2px 74px); }
         .map-stage:after { content: ""; position: absolute; inset: 0; background: rgba(10,12,15,0.08); pointer-events: none; }
         .ymap-real { position: absolute; inset: 0; z-index: 1; background: #1f242b; }
         .ymap-real.ready [class*="inner-panes"] { background-color: #1f242b !important; }
@@ -3196,11 +3359,12 @@ class A_pwmenu(plugins.Plugin):
         .map-chip.yellow { color:#ffe08a; background:rgba(255,204,0,0.075); border-color:rgba(255,204,0,0.14); }
         .map-chip.red { color:#ff918b; background:rgba(255,69,58,0.075); border-color:rgba(255,69,58,0.13); }
         .map-chip.gray { color:#aeb2bb; background:rgba(255,255,255,0.04); border-color:rgba(255,255,255,0.055); }
-        .map-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 14px; }
+        .map-actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin-top: 14px; }
         .map-actions.three { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) 54px; }
         .map-actions.single { grid-template-columns: 1fr; }
         .map-action { display: flex; align-items: center; justify-content: center; border: none; border-radius: 18px; padding: 15px 12px; min-height: 54px; text-align: center; font-weight: 800; text-decoration: none; background: #050507; color: #fff; cursor: pointer; box-sizing: border-box; }
         .map-action.soft { background: rgba(255,255,255,0.08); color: #dfe6f8; }
+        .map-action.cyan { background: rgba(32,228,244,0.10); color: #6ff4ff; }
         .map-action.red { background: rgba(255,69,58,0.12); color: #ff6b62; }
         .map-action.trash { padding: 0; font-size: 22px; color: #ff6b62; }
         .trash-icon { position: relative; display: inline-block; width: 18px; height: 20px; border: 2px solid currentColor; border-top: none; border-radius: 0 0 4px 4px; box-sizing: border-box; }
@@ -3211,47 +3375,606 @@ class A_pwmenu(plugins.Plugin):
         .map-list-item.green { background: rgba(4, 63, 32, 0.85); border: 1px solid rgba(7,140,69,0.8); }
         .map-list-item.blue { background: rgba(7, 31, 69, 0.86); border: 1px solid rgba(10,102,220,0.75); }
         .map-list-item.red { background: rgba(74, 15, 18, 0.88); border: 1px solid rgba(255,69,58,0.72); }
-        .empty-file-list { margin:12px 0 0;padding:0;list-style:none;display:grid;gap:6px; }
-        .empty-file-list li { padding:8px 10px;border-radius:10px;background:rgba(255,255,255,.035);color:#aeb2bb;font-family:monospace;font-size:11px;overflow-wrap:anywhere; }
-        .pwmenu-powered { display:flex;align-items:center;justify-content:center;gap:10px;margin:24px 0 8px;padding:14px;color:#858e93;font-size:11px;font-weight:850;letter-spacing:.14em;text-decoration:none;text-transform:uppercase; }
-        .pwmenu-powered-dot { width:9px;height:9px;border-radius:50%;background:#20e4f4;box-shadow:0 0 16px #20e4f4; }
-        .pwmenu-powered strong { color:#fff;font-weight:900; }
+        .cleanup-file-list, .whitelist-list { margin:12px 0 0;padding:0;list-style:none;display:grid;gap:7px; }
+        .cleanup-file-list li, .whitelist-item { padding:9px 10px;border-radius:11px;background:rgba(255,255,255,.035);color:#aeb2bb;font-size:11px;overflow-wrap:anywhere; }
+        .cleanup-file-list strong { display:block;color:#d8dcdf;font-family:monospace;font-size:11px; }
+        .cleanup-file-list span { display:block;margin-top:3px;color:#7f898e; }
+        .whitelist-form { display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px;margin-top:12px; }
+        .whitelist-input { min-width:0;border:1px solid #333;border-radius:12px;outline:none;background:#0b0d0f;color:#fff;padding:11px 12px;font-size:14px; }
+        .whitelist-input:focus { border-color:rgba(32,228,244,.58);box-shadow:0 0 0 3px rgba(32,228,244,.08); }
+        .whitelist-submit { border:1px solid rgba(32,228,244,.35);border-radius:12px;background:rgba(32,228,244,.08);color:#20e4f4;padding:0 15px;font-weight:850;cursor:pointer; }
+        .whitelist-item { display:flex;align-items:center;justify-content:space-between;gap:10px;color:#e4e8ea; }
+        .whitelist-remove { flex:0 0 auto;border:0;background:transparent;color:#ff6b62;font-size:12px;font-weight:800;cursor:pointer; }
+        .newfpv-credit { --credit-accent:#20e4f4;display:flex;min-width:230px;width:max-content;max-width:100%;box-sizing:border-box;align-items:center;justify-content:space-between;gap:18px;margin:24px auto 8px;padding:12px 13px 12px 16px;border:1px solid rgba(255,255,255,.12);border-radius:17px;background:linear-gradient(110deg,rgba(255,255,255,.055),color-mix(in srgb,var(--credit-accent) 4.5%,transparent));color:#f4f6f7;font-family:Inter,ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif;text-decoration:none;transition:border-color .2s,background .2s,transform .2s; }
+        .newfpv-credit:hover { border-color:color-mix(in srgb,var(--credit-accent) 45%,transparent);background:linear-gradient(110deg,rgba(255,255,255,.075),color-mix(in srgb,var(--credit-accent) 9%,transparent));transform:translateY(-2px); }
+        .newfpv-credit small, .newfpv-credit strong { display:block; }
+        .newfpv-credit small { margin-bottom:1px;color:#7f898e;font-size:9px;font-weight:800;letter-spacing:.15em;text-transform:uppercase; }
+        .newfpv-credit strong { font-size:13px;letter-spacing:.01em; }
+        .newfpv-credit .mark { color:var(--credit-accent); }
+        .newfpv-credit i { display:grid;width:32px;height:32px;flex:0 0 32px;place-items:center;border:1px solid color-mix(in srgb,var(--credit-accent) 30%,transparent);border-radius:50%;color:var(--credit-accent); }
+        .newfpv-credit svg { width:15px;height:15px;fill:none;stroke:currentColor;stroke-width:2.15;stroke-linecap:round;stroke-linejoin:round; }
+        .newfpv-credit.compact { min-width:170px;padding:7px 8px 7px 11px;border-radius:13px; }
+        .newfpv-credit.compact small { font-size:7px; }
+        .newfpv-credit.compact strong { font-size:11px; }
+        .newfpv-credit.compact i { width:27px;height:27px;flex-basis:27px; }
+        .newfpv-credit.compact svg { width:13px;height:13px; }
         .map-list-title { font-size: 18px; font-weight: 850; overflow-wrap:anywhere; }
         .map-list-sub { margin-top: 5px; font-size: 12px; color:#aeb2bb; overflow-wrap:anywhere; }
         @media (max-width: 520px) {
             body { padding: 10px; }
             .tab { font-size: 12px; padding: 8px 4px; }
-            .map-shell { border-radius: 18px; min-height: 640px; }
-            .map-stage { height: 640px; }
+            .map-shell { height: 640px; min-height: 640px; border-radius: 18px; }
+            .map-stage { height: 100%; min-height: 640px; }
             .map-sheet { padding: 32px 18px 20px; }
             .map-title { font-size: 27px; }
             .map-metrics { gap: 8px; }
             .map-metric-value { font-size: 18px; }
             .map-dock { bottom: 14px; max-width: calc(100% - 20px); }
             .map-dock-btn { padding: 11px 13px; }
+            .newfpv-credit { width:100%;min-width:0; }
+            .whitelist-form { grid-template-columns:1fr; }
+            .whitelist-submit { min-height:44px; }
+        }
+
+        :root {
+            color-scheme: dark;
+            --bg: #070809;
+            --card: #101214;
+            --surface-2: #15181b;
+            --text: #f4f6f7;
+            --sub: #9ba3a8;
+            --quiet: #697177;
+            --line: rgba(255,255,255,.10);
+            --line-strong: rgba(255,255,255,.18);
+            --accent: #20e4f4;
+            --accent-contrast: #001013;
+            --input: #0b0d0f;
+            --sep: rgba(255,255,255,.08);
+            --max: 1180px;
+            --radius: 24px;
+        }
+        *, *::before, *::after { box-sizing: border-box; }
+        html { min-height:100%; background:var(--bg); scroll-behavior:smooth; }
+        body {
+            min-height:100vh;
+            overflow-x:hidden;
+            padding:0;
+            background:var(--bg);
+            color:var(--text);
+            font-family:Inter,ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif;
+            line-height:1.55;
+            -webkit-font-smoothing:antialiased;
+        }
+        body::before {
+            content:"";
+            position:fixed;
+            inset:0;
+            z-index:-3;
+            background:
+                radial-gradient(circle at 8% 3%,color-mix(in srgb,var(--accent) 13%,transparent),transparent 29%),
+                radial-gradient(circle at 93% 68%,rgba(157,99,255,.10),transparent 31%),
+                #070809;
+            pointer-events:none;
+        }
+        body::after {
+            content:"";
+            position:fixed;
+            inset:0;
+            z-index:-2;
+            opacity:.72;
+            background-image:linear-gradient(rgba(255,255,255,.018) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.018) 1px,transparent 1px);
+            background-size:90px 90px;
+            pointer-events:none;
+        }
+        button, input { font:inherit; }
+        button:focus-visible, input:focus-visible, a:focus-visible { outline:3px solid var(--accent); outline-offset:3px; }
+        ::selection { background:var(--accent); color:var(--accent-contrast); }
+        .pwmenu-page { width:100%; max-width:none; min-height:100vh; margin:0; }
+        .pw-nav-wrap { position:sticky; top:14px; z-index:100; width:min(calc(100% - 40px),var(--max)); margin:14px auto 0; }
+        .pw-nav {
+            display:grid;
+            grid-template-columns:minmax(0,1fr) auto auto;
+            align-items:center;
+            gap:22px;
+            min-height:64px;
+            padding:8px 10px 8px 18px;
+            border:1px solid var(--line);
+            border-radius:999px;
+            background:rgba(8,10,11,.80);
+            box-shadow:0 16px 60px rgba(0,0,0,.30);
+            backdrop-filter:blur(18px);
+            -webkit-backdrop-filter:blur(18px);
+        }
+        .pw-brand { display:flex;align-items:center;gap:10px;width:max-content;padding:0;border:0;background:transparent;color:#fff;font-size:.78rem;font-weight:900;letter-spacing:.14em;text-transform:uppercase;cursor:pointer; }
+        .pw-brand-dot { width:9px;height:9px;border-radius:50%;background:var(--accent);box-shadow:0 0 16px var(--accent); }
+        .pw-brand-mark { color:var(--accent); }
+        .pw-nav-meta { display:flex;align-items:center;gap:10px;color:#8f989d;font-size:.68rem;font-weight:750;letter-spacing:.045em;text-transform:uppercase; }
+        .pw-nav-meta strong { color:#e8ebed;font-size:.7rem; }
+        .pw-live-dot { width:7px;height:7px;border-radius:50%;background:#30d158;box-shadow:0 0 12px rgba(48,209,88,.75); }
+        .pw-nav-separator { width:1px;height:18px;background:var(--line); }
+        .accent-toggle { display:flex;min-height:44px;align-items:center;justify-content:center;gap:9px;padding:9px 15px;border:1px solid var(--line);border-radius:999px;background:rgba(255,255,255,.035);color:#dce1e3;font-size:.72rem;font-weight:800;cursor:pointer;transition:border-color .2s,background .2s,transform .2s; }
+        .mobile-search-toggle, .mobile-search-close { display:none; }
+        .mobile-search-toggle svg { width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round; }
+        .accent-toggle:hover, .accent-toggle[aria-expanded="true"] { border-color:color-mix(in srgb,var(--accent) 45%,transparent);background:color-mix(in srgb,var(--accent) 8%,transparent);transform:translateY(-1px); }
+        .accent-current { width:14px;height:14px;border:3px solid rgba(255,255,255,.82);border-radius:50%;background:var(--accent);box-shadow:0 0 15px color-mix(in srgb,var(--accent) 60%,transparent); }
+        .accent-panel { position:fixed;z-index:180;top:90px;right:max(20px,calc((100vw - var(--max))/2));width:min(330px,calc(100vw - 28px));padding:17px;border:1px solid var(--line-strong);border-radius:22px;background:rgba(13,16,18,.96);box-shadow:0 28px 80px rgba(0,0,0,.58);backdrop-filter:blur(22px);-webkit-backdrop-filter:blur(22px);animation:accent-in .2s ease both; }
+        @keyframes accent-in { from { opacity:0;transform:translateY(-8px) scale(.98); } to { opacity:1;transform:none; } }
+        .accent-panel-head { display:flex;align-items:center;justify-content:space-between;gap:20px;margin-bottom:15px; }
+        .accent-panel-head small, .accent-panel-head strong { display:block; }
+        .accent-panel-head small { color:var(--accent);font-size:.58rem;font-weight:850;letter-spacing:.14em;text-transform:uppercase; }
+        .accent-panel-head strong { margin-top:2px;font-size:1rem; }
+        .accent-panel-head button { display:grid;width:34px;height:34px;place-items:center;border:1px solid var(--line);border-radius:50%;background:rgba(255,255,255,.035);color:#9ba3a8;font-size:22px;cursor:pointer; }
+        .accent-presets { display:grid;grid-template-columns:repeat(6,1fr);gap:8px; }
+        .accent-swatch { position:relative;aspect-ratio:1;border:2px solid transparent;border-radius:50%;background:var(--swatch);box-shadow:inset 0 0 0 4px #111518;cursor:pointer;transition:transform .18s,border-color .18s; }
+        .accent-swatch:hover { transform:translateY(-2px) scale(1.06); }
+        .accent-swatch.active { border-color:#fff;transform:scale(1.08); }
+        .accent-custom { display:flex;align-items:center;justify-content:space-between;gap:16px;margin-top:15px;padding:12px 13px;border:1px solid var(--line);border-radius:15px;background:rgba(255,255,255,.025); }
+        .accent-custom small, .accent-custom strong { display:block; }
+        .accent-custom small { color:#788186;font-size:.55rem;font-weight:850;letter-spacing:.12em;text-transform:uppercase; }
+        .accent-custom strong { margin-top:2px;font-size:.75rem; }
+        .accent-custom input { width:42px;height:32px;padding:0;border:0;border-radius:10px;background:transparent;cursor:pointer; }
+        .pwmenu-main { width:min(calc(100% - 40px),var(--max));margin:0 auto;padding:0 0 70px; }
+        .pw-hero { position:relative;display:grid;min-height:480px;overflow:hidden;grid-template-columns:minmax(0,1.2fr) minmax(330px,.72fr);align-items:center;gap:70px;padding:82px 0 62px;isolation:isolate; }
+        .pw-hero::before { content:"";position:absolute;left:-9%;top:5%;z-index:-2;width:620px;height:620px;border:1px solid color-mix(in srgb,var(--accent) 13%,transparent);border-radius:50%;box-shadow:0 0 140px color-mix(in srgb,var(--accent) 6%,transparent);pointer-events:none; }
+        .pw-hero::after { content:"";position:absolute;inset:0;z-index:-3;opacity:.14;background-image:linear-gradient(rgba(255,255,255,.1) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.1) 1px,transparent 1px);background-size:72px 72px;mask-image:radial-gradient(circle at 38% 50%,#000,transparent 68%);pointer-events:none; }
+        .pw-eyebrow { display:flex;align-items:center;gap:11px;margin:0 0 17px;color:var(--accent);font-size:.7rem;font-weight:850;letter-spacing:.18em;text-transform:uppercase; }
+        .pw-eyebrow::before { content:"";width:28px;height:1px;background:currentColor;box-shadow:0 0 12px currentColor; }
+        .pw-hero h1 { margin:0;color:#f4f6f7;font-size:clamp(4.5rem,8.4vw,8rem);font-weight:900;letter-spacing:-.075em;line-height:.86; }
+        .pw-hero-outline { color:transparent;-webkit-text-stroke:2px color-mix(in srgb,var(--accent) 85%,#fff); }
+        .pw-hero-line { max-width:690px;margin:26px 0 0;color:#c8ced1;font-size:clamp(1.05rem,2vw,1.5rem);font-weight:680;line-height:1.35;letter-spacing:-.025em; }
+        .pw-hero-chips { display:flex;flex-wrap:wrap;gap:8px;margin-top:25px; }
+        .pw-hero-chips span { display:inline-flex;align-items:center;gap:8px;padding:8px 11px;border:1px solid var(--line);border-radius:999px;background:rgba(13,16,18,.72);color:#aab2b6;font-size:.68rem;font-weight:750; }
+        .pw-hero-chips i { width:6px;height:6px;border-radius:50%;background:var(--accent);box-shadow:0 0 9px var(--accent); }
+        .pw-hero-proof { display:grid;gap:10px; }
+        .pw-hero-proof article { position:relative;min-height:126px;padding:20px 21px;border:1px solid var(--line);border-radius:21px;background:linear-gradient(135deg,rgba(17,21,23,.94),rgba(10,12,14,.90));transition:border-color .2s,transform .2s; }
+        .pw-hero-proof article:hover { border-color:color-mix(in srgb,var(--accent) 34%,transparent);transform:translateX(-4px); }
+        .pw-hero-proof article>span { position:absolute;right:20px;top:19px;color:var(--accent);font-size:.58rem;font-weight:900;letter-spacing:.13em;text-transform:uppercase; }
+        .pw-hero-proof strong { display:block;max-width:65%;color:#fff;font-size:1.3rem;overflow-wrap:anywhere; }
+        .pw-hero-proof p { max-width:280px;margin:17px 0 0;color:#7f898e;font-size:.72rem;line-height:1.5; }
+        .pw-workspace { position:relative; }
+        .pw-workspace-bar { position:sticky;top:91px;z-index:70;display:grid;grid-template-columns:minmax(260px,.9fr) minmax(440px,1.1fr);align-items:center;gap:10px;margin-bottom:20px;padding:8px;border:1px solid var(--line);border-radius:25px;background:rgba(8,10,11,.88);box-shadow:0 18px 60px rgba(0,0,0,.27);backdrop-filter:blur(18px);-webkit-backdrop-filter:blur(18px); }
+        .pw-search { display:flex;min-width:0;align-items:center;gap:10px;padding:0 13px; }
+        .pw-search svg { width:18px;height:18px;flex:0 0 18px;fill:none;stroke:#697177;stroke-width:2;stroke-linecap:round; }
+        .pw-search .s-box { width:100%;min-height:46px;margin:0;padding:0;border:0;border-radius:0;background:transparent;color:var(--text);font-size:.86rem; }
+        .pw-search .s-box::placeholder { color:#5f686d; }
+        .tabs { display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:5px;margin:0;padding:0;border-radius:18px;background:rgba(255,255,255,.035); }
+        .tab { display:flex;min-width:0;min-height:46px;align-items:center;justify-content:center;gap:7px;padding:8px 10px;border-radius:15px;color:#d0d5d8;font-size:.78rem;font-weight:800;transition:color .2s,background .2s,transform .2s; }
+        .tab span { color:var(--accent);font-size:.55rem;font-weight:900;letter-spacing:.08em; }
+        .tab-icon { display:grid;width:15px;height:15px;flex:0 0 15px;place-items:center; }
+        .tab-icon svg { width:100%;height:100%;fill:none;stroke:currentColor;stroke-width:1.9;stroke-linecap:round;stroke-linejoin:round; }
+        .tab b { overflow:hidden;font-weight:800;text-overflow:ellipsis;white-space:nowrap; }
+        .tab:hover { color:#fff; }
+        .tab.active { background:var(--accent);color:var(--accent-contrast);box-shadow:0 10px 28px color-mix(in srgb,var(--accent) 14%,transparent); }
+        .tab.active span { color:var(--accent-contrast);opacity:.88; }
+        .notif { position:relative;z-index:60;margin:0 0 16px;border-radius:17px;background:rgba(48,209,88,.10);box-shadow:0 14px 45px rgba(0,0,0,.18); }
+        #v-cracked.list, #v-handshakes.list { display:grid;grid-template-columns:repeat(2,minmax(0,1fr));align-items:start;gap:12px;overflow:visible;border-radius:0;background:transparent; }
+        #v-cracked>.si, #v-handshakes>.si { overflow:hidden;border:1px solid var(--line);border-radius:21px;background:linear-gradient(145deg,rgba(20,23,26,.94),rgba(11,13,15,.94));transition:border-color .2s,transform .2s,background .2s; }
+        #v-cracked>.si>.row { min-height:112px;padding:18px 19px;border:0; }
+        #v-cracked>.si:hover, #v-handshakes>.si:hover { border-color:color-mix(in srgb,var(--accent) 38%,transparent);background:linear-gradient(145deg,color-mix(in srgb,var(--accent) 5%,#14171a),#0d0f11);transform:translateY(-2px); }
+        #v-handshakes>.si>.row { min-height:112px;padding:18px 19px;border:0; }
+        #v-cracked .tit, #v-handshakes .tit { max-width:100%;font-size:1rem;overflow-wrap:anywhere; }
+        .badge { border:1px solid var(--line);border-radius:999px;background:rgba(255,255,255,.045);color:#8d969b;font-size:.53rem;letter-spacing:.07em; }
+        .pwd { color:var(--accent); }
+        .subs { padding:0 10px 10px;border:0;background:rgba(0,0,0,.18); }
+        .sub-row { gap:14px;padding:12px 10px;border-top:1px solid var(--line);border-bottom:0; }
+        .capture-row { display:block; }
+        .capture-file-info { min-width:0; }
+        .capture-file-bssid { overflow:hidden;color:#dce1e3;font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:.68rem;text-overflow:ellipsis;white-space:nowrap; }
+        .capture-file-meta { margin-top:2px;color:#727c81;font-size:.56rem; }
+        .capture-file-info .quality-badge { display:inline-flex;margin-top:4px;padding:3px 6px;font-size:.48rem; }
+        .network-expanded-tools { display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;padding:10px;border-top:1px solid var(--line); }
+        .network-expanded-action { display:flex;min-width:0;min-height:48px;align-items:center;justify-content:center;gap:9px;padding:8px 12px;border:1px solid var(--line);border-radius:13px;background:rgba(255,255,255,.035);color:#dce2e4;font-size:.66rem;font-weight:850;cursor:pointer;transition:border-color .2s,background .2s,color .2s,transform .2s; }
+        .network-expanded-action:hover { border-color:color-mix(in srgb,var(--accent) 42%,transparent);background:color-mix(in srgb,var(--accent) 7%,transparent);color:var(--accent);transform:translateY(-1px); }
+        .network-expanded-action svg { width:16px;height:16px;flex:0 0 16px;fill:none;stroke:currentColor;stroke-width:1.9;stroke-linecap:round;stroke-linejoin:round; }
+        .network-expanded-tools > :only-child { grid-column:1/-1; }
+        .credential-expanded { margin:10px;padding:12px;border:1px solid color-mix(in srgb,var(--accent) 24%,var(--line));border-radius:14px;background:color-mix(in srgb,var(--accent) 5%,rgba(255,255,255,.02)); }
+        .credential-label { color:#7f898e;font-size:.5rem;font-weight:900;letter-spacing:.12em;text-transform:uppercase; }
+        .credential-value { margin-top:5px;color:var(--accent);font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:.9rem;font-weight:800;overflow-wrap:anywhere;user-select:text; }
+        .credential-actions { display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:7px;margin-top:10px; }
+        .capture-actions { display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:6px;margin-top:9px;padding-top:9px;border-top:1px solid var(--line); }
+        .capture-action { display:flex;min-width:0;min-height:48px;box-sizing:border-box;flex-direction:column;align-items:center;justify-content:center;gap:3px;padding:5px 3px;border:1px solid var(--line);border-radius:12px;background:rgba(255,255,255,.035);color:#dbe1e3;text-align:center;text-decoration:none;cursor:pointer; }
+        .capture-action:hover { border-color:color-mix(in srgb,var(--accent) 42%,transparent);color:var(--accent); }
+        .capture-action svg { width:17px;height:17px;fill:none;stroke:currentColor;stroke-width:1.9;stroke-linecap:round;stroke-linejoin:round; }
+        .capture-action span { font-size:.48rem;font-weight:900;letter-spacing:.02em; }
+        .capture-action.accent { border-color:color-mix(in srgb,var(--accent) 28%,transparent);color:var(--accent); }
+        .capture-action.danger { border-color:rgba(255,69,58,.22);color:#ff7169; }
+        .btn-grp { flex-wrap:wrap;justify-content:flex-end;gap:5px; }
+        .btn-xs { margin:0;padding:6px 9px;border:1px solid var(--line);background:rgba(255,255,255,.045);color:var(--accent); }
+        .icon-btn { display:grid;min-width:34px;height:34px;place-items:center;padding:0;border:1px solid var(--line);border-radius:50%;background:rgba(255,255,255,.035);font-size:14px;transition:border-color .2s,background .2s,transform .2s; }
+        .icon-btn:hover { border-color:color-mix(in srgb,var(--accent) 45%,transparent);background:color-mix(in srgb,var(--accent) 8%,transparent);transform:translateY(-1px); }
+        .icon-btn svg, .arr svg { width:15px;height:15px;fill:none;stroke:currentColor;stroke-width:1.9;stroke-linecap:round;stroke-linejoin:round; }
+        .btn-whitelist, .btn-add { color:var(--accent); }
+        .arr { display:grid;width:34px;height:34px;place-items:center;margin-left:7px;border:1px solid var(--line);border-radius:50%;background:rgba(255,255,255,.025);color:#899398;cursor:pointer;transition:transform .2s,color .2s,border-color .2s; }
+        .si.open .arr { border-color:color-mix(in srgb,var(--accent) 35%,transparent);color:var(--accent);transform:rotate(90deg); }
+        #v-cracked>.newfpv-credit, #v-handshakes>.newfpv-credit { grid-column:1/-1; }
+        #v-other { grid-template-columns:repeat(2,minmax(0,1fr));align-items:start;gap:14px; }
+        #v-other:not(.hidden) { display:grid; }
+        .mobile-profile-card { display:none; }
+        .card { height:100%;margin:0;padding:22px;border:1px solid var(--line);border-radius:23px;background:linear-gradient(145deg,rgba(20,23,26,.94),rgba(11,13,15,.94));box-shadow:none; }
+        .card h3 { letter-spacing:-.025em; }
+        .btn { border-radius:999px;background:var(--accent);color:var(--accent-contrast);font-size:.82rem;transition:transform .2s,box-shadow .2s,background .2s; }
+        .btn:hover { transform:translateY(-2px);box-shadow:0 14px 38px color-mix(in srgb,var(--accent) 15%,transparent); }
+        .whitelist-input { border-color:var(--line);background:#0b0d0f; }
+        .whitelist-input:focus { border-color:color-mix(in srgb,var(--accent) 58%,transparent);box-shadow:0 0 0 3px color-mix(in srgb,var(--accent) 8%,transparent); }
+        .whitelist-submit { border-color:color-mix(in srgb,var(--accent) 35%,transparent);background:color-mix(in srgb,var(--accent) 8%,transparent);color:var(--accent); }
+        .newfpv-credit { --credit-accent:var(--accent);min-width:300px;padding:15px 16px 15px 19px;border-radius:19px; }
+        .newfpv-credit small { font-size:10px; }
+        .newfpv-credit strong { font-size:16px; }
+        .newfpv-credit i { width:38px;height:38px;flex-basis:38px; }
+        .newfpv-credit svg { width:17px;height:17px; }
+        #v-other>.newfpv-credit { grid-column:1/-1; }
+        .view-map .pw-nav-wrap, .view-map .pw-workspace-bar { position:relative;top:auto; }
+        .map-shell { height:calc(100vh - 150px);min-height:680px;border:1px solid var(--line);border-radius:25px;background:#090b0c;box-shadow:0 24px 70px rgba(0,0,0,.30); }
+        .map-stage { background-color:#0a0c0d;background-image:linear-gradient(rgba(255,255,255,.022) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.022) 1px,transparent 1px),radial-gradient(circle at 72% 18%,color-mix(in srgb,var(--accent) 8%,transparent),transparent 35%);background-size:64px 64px,64px 64px,auto; }
+        .map-stage:after { background:linear-gradient(180deg,rgba(5,7,8,.04),rgba(5,7,8,.23)); }
+        .map-glass { border-color:var(--line);background:rgba(8,11,12,.88);box-shadow:0 18px 55px rgba(0,0,0,.38); }
+        .map-topbar { gap:9px; }
+        .map-search-wrap { min-height:52px;padding:2px 14px;border:1px solid var(--line);transition:border-color .2s,box-shadow .2s; }
+        .map-search-wrap:focus-within { border-color:color-mix(in srgb,var(--accent) 58%,transparent);box-shadow:0 0 0 3px color-mix(in srgb,var(--accent) 9%,transparent),0 18px 55px rgba(0,0,0,.38); }
+        .map-search { color:var(--text);font-size:.86rem; }
+        .map-search::placeholder { color:#687177; }
+        .map-gps-dot { width:52px;height:52px;flex:0 0 52px;border:1px solid var(--line);background:rgba(8,11,12,.92);color:#7e898f;box-shadow:0 18px 55px rgba(0,0,0,.38); }
+        .map-gps-dot.browser { color:var(--accent); }
+        .map-gps-pop { padding:16px 17px;border:1px solid var(--line);border-radius:20px;background:rgba(8,11,12,.95);box-shadow:0 24px 65px rgba(0,0,0,.48); }
+        .map-point { border-color:var(--accent);background:#f6f8f8;color:#071012;box-shadow:0 8px 22px color-mix(in srgb,var(--accent) 24%,transparent); }
+        .map-point.me { border-color:#f4f6f7;background:var(--accent);color:var(--accent-contrast);box-shadow:0 0 0 10px color-mix(in srgb,var(--accent) 18%,transparent),0 8px 20px rgba(0,0,0,.28); }
+        .map-empty { border:1px solid var(--line);background:rgba(8,11,12,.91);color:#b9c0c4; }
+        .map-dock { gap:5px;padding:6px;border:1px solid var(--line);background:rgba(8,11,12,.92); }
+        .map-dock-btn { min-height:42px;padding:10px 15px;color:#cbd1d4;font-size:.72rem;letter-spacing:.015em;transition:background .2s,color .2s,transform .2s; }
+        .map-dock-btn:hover { color:#fff;transform:translateY(-1px); }
+        .map-dock-btn.active, .map-dock-btn.green.active, .map-dock-btn.blue.active { background:var(--accent);color:var(--accent-contrast);box-shadow:0 8px 24px color-mix(in srgb,var(--accent) 17%,transparent); }
+        .map-sheet { border:1px solid var(--line-strong);border-bottom:0;border-radius:28px 28px 0 0;background:linear-gradient(155deg,rgba(18,22,24,.985),rgba(8,10,11,.99));box-shadow:0 -24px 70px rgba(0,0,0,.52); }
+        .map-handle { background:var(--accent);box-shadow:0 0 13px color-mix(in srgb,var(--accent) 50%,transparent); }
+        .map-title { color:#f4f6f7;font-size:clamp(2rem,4vw,3.15rem);font-weight:900;letter-spacing:-.055em; }
+        .map-sub { color:#8f999e;font-size:.82rem; }
+        .map-close, .map-back { border:1px solid var(--line);background:rgba(255,255,255,.035);color:#d6dcdf; }
+        .map-close:hover, .map-back:hover { border-color:color-mix(in srgb,var(--accent) 45%,transparent);color:var(--accent); }
+        .map-metric { border:1px solid var(--line);border-radius:18px;background:linear-gradient(145deg,rgba(255,255,255,.038),rgba(255,255,255,.014)); }
+        .map-metric-label { color:#7f898e;font-size:.61rem;letter-spacing:.1em; }
+        .map-metric-value { color:#f4f6f7; }
+        .map-status { border:1px solid var(--line);border-radius:17px;background:rgba(255,255,255,.025);color:#c1c8cc; }
+        .map-chip { border-color:var(--line);background:rgba(255,255,255,.035); }
+        .map-action { min-height:52px;border:1px solid color-mix(in srgb,var(--accent) 30%,transparent);border-radius:999px;background:var(--accent);color:var(--accent-contrast);transition:transform .2s,box-shadow .2s,border-color .2s; }
+        .map-action:hover { transform:translateY(-2px);box-shadow:0 12px 32px color-mix(in srgb,var(--accent) 14%,transparent); }
+        .map-action.soft, .map-action.cyan { border-color:color-mix(in srgb,var(--accent) 25%,transparent);background:color-mix(in srgb,var(--accent) 8%,#0c0f11);color:var(--accent); }
+        .map-action.red { border-color:rgba(255,69,58,.24);background:rgba(255,69,58,.09);color:#ff756d; }
+        .map-list-item { border:1px solid var(--line);border-radius:18px;background:linear-gradient(145deg,rgba(255,255,255,.045),rgba(255,255,255,.018));transition:border-color .2s,transform .2s; }
+        .map-list-item:hover { border-color:color-mix(in srgb,var(--accent) 38%,transparent);transform:translateY(-1px); }
+        .map-toast { background:var(--accent);color:var(--accent-contrast); }
+        /* Compact map workspace */
+        .map-shell { border-radius:18px; }
+        .map-topbar { top:12px;left:12px;right:12px;gap:7px; }
+        .map-filter-toggle { position:relative;display:flex;min-height:40px;flex:0 0 auto;align-items:center;gap:8px;padding:0 11px;border:1px solid var(--line);border-radius:14px;background:rgba(8,11,12,.9);color:#cbd2d5;font-size:.66rem;font-weight:850;cursor:pointer;box-shadow:0 18px 55px rgba(0,0,0,.3); }
+        .map-filter-toggle input { position:absolute;opacity:0;pointer-events:none; }
+        .map-filter-track { position:relative;width:31px;height:18px;border-radius:999px;background:rgba(255,255,255,.12);transition:background .2s; }
+        .map-filter-track::after { content:"";position:absolute;left:3px;top:3px;width:12px;height:12px;border-radius:50%;background:#8b969b;transition:transform .2s,background .2s,box-shadow .2s; }
+        .map-filter-toggle input:checked + .map-filter-track { background:color-mix(in srgb,var(--accent) 25%,transparent); }
+        .map-filter-toggle input:checked + .map-filter-track::after { background:var(--accent);box-shadow:0 0 9px var(--accent);transform:translateX(13px); }
+        .map-search-wrap { min-height:40px;padding:0 11px;border-radius:14px; }
+        .map-search { min-height:38px;padding:0 3px;font-size:.76rem; }
+        .map-gps-dot { width:40px;height:40px;flex-basis:40px; }
+        #gpsStatusDot { display:none!important; }
+        .map-gps-dot:before { width:10px;height:10px;box-shadow:0 0 0 4px color-mix(in srgb,currentColor 18%,transparent); }
+        .map-gps-pop { top:59px;right:12px;left:12px;max-width:285px;padding:10px 12px;border-radius:14px;font-size:.69rem;line-height:1.3; }
+        .map-gps-pop b { margin-bottom:2px;font-size:.76rem; }
+        .map-empty { top:68px;left:12px;right:12px;padding:11px;border-radius:14px;font-size:.72rem; }
+        .map-point { min-width:28px;height:28px;padding:0 6px;border-width:4px;font-size:.68rem; }
+        .map-point.me { width:19px;height:19px;border-width:4px;box-shadow:0 0 0 7px color-mix(in srgb,var(--accent) 16%,transparent),0 6px 15px rgba(0,0,0,.28); }
+        .map-dock { bottom:13px;gap:3px;padding:4px;border-radius:15px; }
+        .map-dock-btn { min-height:32px;padding:6px 11px;border-radius:11px;font-size:.63rem;letter-spacing:0; }
+        .map-sheet { min-height:0;max-height:72%;padding:25px 16px 14px;border-radius:20px 20px 0 0; }
+        .map-handle { top:8px;width:34px;height:4px; }
+        .map-title-row { gap:9px;margin-bottom:10px; }
+        .map-title-main { min-width:0;flex:1;text-align:left; }
+        .map-title { font-size:1.38rem;line-height:1.05;letter-spacing:-.035em; }
+        .map-sub { margin-top:4px;font-size:.68rem;line-height:1.35; }
+        .map-close { width:34px;height:34px;font-size:21px; }
+        .map-back { min-height:34px;padding:6px 10px;font-size:.68rem; }
+        .map-metrics { gap:6px;margin-bottom:9px; }
+        .map-metric { padding:8px 6px;border-radius:12px; }
+        .map-metric-label { font-size:.49rem;letter-spacing:.075em; }
+        .map-metric-value { margin-top:3px;font-size:.95rem; }
+        .map-secret { margin-top:7px;padding:10px;border-radius:13px;font-size:.72rem; }
+        .map-copy { padding:7px 9px;border-radius:9px;font-size:.64rem; }
+        .map-password { margin-top:4px;font-size:1.2rem; }
+        .map-status { margin-top:7px;padding:8px 10px;border-radius:12px;font-size:.67rem;line-height:1.35; }
+        .map-chips { gap:5px;margin-top:7px; }
+        .map-chip { min-height:23px;padding:3px 7px;font-size:.58rem; }
+        .map-chip:before { width:5px;height:5px; }
+        .map-actions { gap:6px;margin-top:8px; }
+        .map-actions.three { grid-template-columns:minmax(0,1fr) minmax(0,1fr) 40px; }
+        .map-action { min-height:38px;padding:7px 9px;border-radius:12px;font-size:.66rem;line-height:1.2; }
+        .map-action.trash { font-size:17px; }
+        .trash-icon { width:15px;height:17px; }
+        .map-list { gap:6px;margin-top:7px; }
+        .map-list-item { padding:9px 10px;border-radius:12px; }
+        .map-list-title { font-size:.82rem!important;line-height:1.25; }
+        .map-list-sub { margin-top:3px;font-size:.61rem;line-height:1.35; }
+        .map-toast { bottom:61px;padding:8px 11px;font-size:.66rem; }
+        .map-title-row { position:relative;padding-right:38px; }
+        .map-close { position:absolute;top:0;right:0; }
+        .map-back { width:34px;padding:0;font-size:0; }
+        .map-back::before { content:"←";font-size:15px;line-height:1; }
+        .map-compact-meta { display:flex;flex-wrap:wrap;gap:5px;margin-top:7px; }
+        .map-compact-meta span { padding:5px 7px;border:1px solid var(--line);border-radius:9px;background:rgba(255,255,255,.025);color:#aeb7bb;font-size:.58rem;font-weight:750; }
+        .map-icon-actions { display:grid;width:100%;grid-template-columns:repeat(auto-fit,minmax(52px,1fr));gap:6px;margin-top:10px; }
+        .map-icon-action { display:grid;width:auto;min-width:0;height:46px;box-sizing:border-box;place-items:center;padding:5px 3px;border:1px solid var(--line);border-radius:12px;background:rgba(255,255,255,.035);color:#dce1e3;text-decoration:none;cursor:pointer; }
+        .map-icon-action:hover { border-color:color-mix(in srgb,var(--accent) 42%,transparent);color:var(--accent); }
+        .map-icon-action svg { width:17px;height:17px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round; }
+        .map-icon-action span { display:block;margin-top:2px;font-size:.46rem;font-weight:850;letter-spacing:.02em; }
+        .map-icon-action.primary { border-color:color-mix(in srgb,var(--accent) 30%,transparent);background:color-mix(in srgb,var(--accent) 8%,transparent);color:var(--accent); }
+        .map-icon-action.danger { border-color:rgba(255,69,58,.22);color:#ff7169; }
+        .map-more { margin-top:8px;border:1px solid var(--line);border-radius:11px;background:rgba(255,255,255,.018); }
+        .map-more summary { padding:8px 10px;color:#aeb7bb;font-size:.62rem;font-weight:800;cursor:pointer;list-style:none; }
+        .map-more summary::-webkit-details-marker { display:none; }
+        .map-more summary::after { content:"+";float:right;color:var(--accent); }
+        .map-more[open] summary::after { content:"−"; }
+        .map-more .map-list { padding:0 6px 6px; }
+        .map-overview-link { display:flex;width:100%;align-items:center;justify-content:space-between;gap:10px;margin-top:8px;padding:9px 10px;border:1px solid var(--line);border-radius:11px;background:rgba(255,255,255,.022);color:#cbd2d5;cursor:pointer; }
+        .map-overview-link span { display:flex;align-items:center;gap:7px;font-size:.62rem; }
+        .map-overview-link svg { width:15px;height:15px;fill:none;stroke:var(--accent);stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round; }
+        .map-overview-link strong { color:var(--accent);font-size:.78rem; }
+        .map-cluster-list .map-list-item { display:grid;grid-template-columns:minmax(0,1fr) auto;grid-template-rows:auto auto;gap:2px 8px;padding:7px 9px;border-color:var(--line);border-left-width:3px;background:rgba(255,255,255,.025); }
+        .map-cluster-list .map-list-item.green { border-left-color:#30d158; }
+        .map-cluster-list .map-list-item.blue { border-left-color:var(--accent); }
+        .map-cluster-list .map-list-item.red { border-left-color:#ff453a; }
+        .map-cluster-list .map-list-title { grid-column:1;grid-row:1;font-size:.72rem!important; }
+        .map-cluster-list .map-list-sub { grid-column:1;grid-row:2;font-size:.53rem; }
+        .map-cluster-list .map-chip { grid-column:2;grid-row:1/3;align-self:center;margin:0; }
+        .map-desktop-footer { display:none; }
+        @media (hover:hover) and (pointer:fine) {
+            .card { transition:border-color .2s,transform .2s,background .2s; }
+            .card:hover { border-color:color-mix(in srgb,var(--accent) 28%,transparent);background:linear-gradient(145deg,color-mix(in srgb,var(--accent) 4%,#14171a),#0d0f11);transform:translateY(-2px); }
+        }
+        @media (max-width:920px) {
+            .pw-hero { min-height:0;grid-template-columns:1fr;gap:38px;padding-top:75px; }
+            .pw-hero-proof { grid-template-columns:repeat(3,minmax(0,1fr)); }
+            .pw-hero-proof article { min-height:150px; }
+            .pw-workspace-bar { grid-template-columns:1fr; }
+            #v-cracked.list, #v-handshakes.list { grid-template-columns:1fr; }
+        }
+        @media (max-width:700px) {
+            body { padding:0 0 calc(88px + env(safe-area-inset-bottom)); }
+            body.view-map { height:100svh;overflow:hidden;padding:0; }
+            body::after { background-size:64px 64px; }
+            .pw-nav-wrap { display:none; }
+            .pw-nav { min-height:58px;grid-template-columns:minmax(0,1fr) auto auto auto;gap:8px;padding:6px 7px 6px 15px;border-radius:25px;background:rgba(8,11,12,.92); }
+            .pw-nav-meta>span:not(.pw-live-dot), .pw-nav-separator { display:none; }
+            .pw-nav-meta { gap:6px; }
+            .pw-nav-meta strong { font-size:.61rem; }
+            .accent-toggle { width:42px;height:42px;min-height:42px;padding:0;border-radius:50%; }
+            .mobile-search-toggle { display:none; }
+            .mobile-search-toggle[aria-expanded="true"] { border-color:color-mix(in srgb,var(--accent) 45%,transparent);background:color-mix(in srgb,var(--accent) 8%,transparent);color:var(--accent); }
+            .accent-label { display:none; }
+            .accent-panel { position:fixed;left:14px;right:14px;top:auto;bottom:calc(82px + env(safe-area-inset-bottom));width:auto;border-radius:24px;animation:accent-mobile-in .24s ease both; }
+            @keyframes accent-mobile-in { from { opacity:0;transform:translateY(18px) scale(.98); } to { opacity:1;transform:none; } }
+            .pwmenu-main { width:min(calc(100% - 28px),var(--max));padding-bottom:20px; }
+            .pw-hero { display:none; }
+            .pw-hero::before { left:-55%;top:-10%;width:130vw;height:130vw; }
+            .pw-hero::after { mask-image:radial-gradient(circle at 35% 35%,#000,transparent 72%); }
+            .pw-eyebrow { margin-bottom:12px;font-size:.59rem; }
+            .pw-hero h1 { font-size:clamp(3rem,15.5vw,4.4rem);line-height:.88;white-space:nowrap; }
+            .pw-hero-line { margin-top:20px;font-size:1rem;line-height:1.5; }
+            .pw-hero-chips { flex-wrap:nowrap;overflow-x:auto;margin:20px -14px 0;padding:0 14px 7px;scrollbar-width:none; }
+            .pw-hero-chips::-webkit-scrollbar { display:none; }
+            .pw-hero-chips span { flex:0 0 auto; }
+            .pw-hero-proof { display:none; }
+            .pw-workspace { padding-top:14px; }
+            .pw-workspace-bar { position:relative;top:auto;display:block;height:auto;margin:0 0 10px;padding:0;border:0;border-radius:0;background:transparent;box-shadow:none;backdrop-filter:none;-webkit-backdrop-filter:none; }
+            .pw-search { position:relative;left:auto;right:auto;top:auto;z-index:1;min-height:43px;padding:0 12px;border:1px solid var(--line-strong);border-radius:14px;background:rgba(8,10,11,.92);box-shadow:none;opacity:1;visibility:visible;transform:none;pointer-events:auto;backdrop-filter:blur(16px);-webkit-backdrop-filter:blur(16px); }
+            .pw-search .s-box { min-height:41px;font-size:.76rem; }
+            .mobile-search-close { display:none; }
+            .tabs { position:fixed;left:50%;bottom:max(9px,env(safe-area-inset-bottom));z-index:150;width:min(calc(100% - 20px),430px);grid-template-columns:repeat(4,1fr);gap:4px;padding:5px;border:1px solid var(--line);border-radius:20px;background:rgba(10,13,14,.94);box-shadow:0 20px 60px rgba(0,0,0,.55);transform:translateX(-50%);backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px); }
+            .tab { min-height:51px;flex-direction:column;gap:1px;padding:5px 3px;border-radius:15px;color:#d7dcde;font-size:.69rem; }
+            .tab span { font-size:.49rem; }
+            .tab-icon { width:17px;height:17px;flex-basis:17px; }
+            #v-cracked.list, #v-handshakes.list { gap:7px; }
+            #v-cracked>.si, #v-handshakes>.si { border-radius:14px; }
+            #v-cracked>.si>.row, #v-handshakes>.si>.row { min-height:66px;padding:9px 10px; }
+            #v-cracked .tit, #v-handshakes .tit { font-size:.82rem; }
+            #v-cracked .pwd, #v-handshakes .pwd { font-size:.7rem; }
+            #v-cracked .arr, #v-handshakes .arr { width:34px;height:34px;margin-left:5px; }
+            .credential-expanded { margin:7px;padding:10px; }
+            .credential-value { font-size:.82rem; }
+            .network-expanded-tools { padding:7px; }
+            .network-expanded-action { min-height:46px;font-size:.64rem; }
+            .capture-actions { grid-template-columns:repeat(5,minmax(0,1fr));gap:5px; }
+            .capture-action { min-height:49px;border-radius:11px; }
+            #v-other:not(.hidden) { grid-template-columns:1fr;gap:10px; }
+            .mobile-profile-card { display:block;padding:14px;border:1px solid var(--line);border-radius:18px;background:linear-gradient(145deg,rgba(20,23,26,.96),rgba(10,12,14,.96)); }
+            .mobile-profile-top { display:flex;align-items:center;justify-content:space-between;gap:14px; }
+            .mobile-profile-top small, .mobile-profile-top strong, .mobile-profile-top>div>span { display:block; }
+            .mobile-profile-top small { color:var(--accent);font-size:.52rem;font-weight:900;letter-spacing:.14em;text-transform:uppercase; }
+            .mobile-profile-top strong { margin-top:3px;color:#f4f6f7;font-size:1.15rem;letter-spacing:-.03em; }
+            .mobile-profile-top>div>span { margin-top:2px;color:#8d979c;font-size:.63rem; }
+            .mobile-profile-accent { display:flex;min-height:38px;align-items:center;gap:7px;padding:7px 10px;border:1px solid var(--line);border-radius:12px;background:rgba(255,255,255,.035);color:#d9dee0;font-size:.65rem;font-weight:800;cursor:pointer; }
+            .mobile-profile-accent .accent-current { display:block;width:12px;height:12px; }
+            .mobile-xp-track { height:4px;overflow:hidden;margin-top:11px;border-radius:999px;background:rgba(255,255,255,.07); }
+            .mobile-xp-track i { display:block;height:100%;border-radius:inherit;background:var(--accent);box-shadow:0 0 12px color-mix(in srgb,var(--accent) 55%,transparent); }
+            .card { padding:18px;border-radius:20px; }
+            .view-map .pw-search, .view-other .pw-search { display:none; }
+            .view-map .pw-workspace-bar, .view-other .pw-workspace-bar { height:0;margin:0; }
+            .view-map .pw-nav { grid-template-columns:minmax(0,1fr) auto auto; }
+            .view-map .pwmenu-page, .view-map .pwmenu-main, .view-map .pw-workspace { width:100%;height:100%;margin:0;padding:0; }
+            .map-shell { height:calc(100svh - 28px);min-height:560px;border-radius:15px; }
+            .map-stage, .view-map.map-panel-open .map-stage { width:100%;min-height:560px; }
+            .view-map .map-shell { position:fixed;inset:0;z-index:10;width:100%;height:100svh;min-height:0;border:0;border-radius:0; }
+            .view-map .map-stage, .view-map.map-panel-open .map-stage { height:100%;min-height:0; }
+            .map-topbar { top:8px;left:8px;right:8px;gap:6px; }
+            .map-filter-toggle { min-height:38px;padding:0 9px;border-radius:12px;font-size:.61rem; }
+            .map-filter-track { width:29px;height:17px; }
+            .map-filter-track::after { width:11px;height:11px; }
+            .map-filter-toggle input:checked + .map-filter-track::after { transform:translateX(12px); }
+            .map-search-wrap { min-height:38px;padding:0 9px;border-radius:12px; }
+            .map-search { min-height:34px;font-size:.7rem; }
+            .map-gps-dot { width:36px;height:36px;flex-basis:36px; }
+            .map-gps-pop { top:50px;left:8px;right:8px;padding:9px 10px; }
+            .map-sheet { bottom:0;z-index:140;max-height:calc(100% - 52px);padding:25px 12px calc(76px + env(safe-area-inset-bottom));border-radius:22px 22px 0 0; }
+            .map-title { font-size:1.16rem; }
+            .map-title-row { margin-bottom:8px; }
+            .map-close { width:31px;height:31px; }
+            .map-metric { padding:7px 4px; }
+            .map-metric-value { font-size:.84rem; }
+            .map-action { min-height:35px;padding:6px 7px;font-size:.61rem; }
+            .map-list-item { padding:8px 9px; }
+            .map-title-row { padding-right:35px; }
+            .map-close { top:0;right:0; }
+            .map-compact-meta span { padding:4px 6px;font-size:.55rem; }
+            .map-icon-action { width:auto;height:52px;border-radius:13px; }
+            .map-icon-action svg { width:19px;height:19px; }
+            .map-icon-action span { font-size:.5rem; }
+            .view-map .tabs { left:8px;right:8px;bottom:max(7px,env(safe-area-inset-bottom));width:auto;padding:4px;border-radius:17px;transform:none; }
+            .view-map .tab { min-height:43px;font-size:.62rem;border-radius:13px; }
+            .view-map .tab span { font-size:.43rem; }
+            .newfpv-credit { width:100%;min-width:0; }
+        }
+        @media (max-width:430px) {
+            .pw-brand { font-size:.7rem; }
+            .pw-nav-meta strong { max-width:64px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap; }
+            .pw-hero h1 { font-size:clamp(2.85rem,15.5vw,3.85rem); }
+            .pw-hero-line { max-width:330px;font-size:.9rem; }
+            .sub-row { align-items:flex-start;flex-direction:column; }
+            .btn-grp { width:100%;justify-content:flex-start; }
+            .map-topbar { top:8px;left:8px;right:8px; }
+            .map-gps-pop { top:50px;left:8px;right:8px; }
+            .map-dock-btn { padding:5px 7px;font-size:.55rem; }
+        }
+        @media (min-width:701px) {
+            .pw-hero { min-height:340px;gap:46px;padding:52px 0 40px; }
+            .pw-hero h1 { font-size:clamp(4rem,7vw,6.5rem); }
+            .pw-hero-line { margin-top:20px;font-size:clamp(1rem,1.7vw,1.25rem); }
+            .pw-hero-chips { margin-top:18px; }
+            .pw-hero-proof { gap:7px; }
+            .pw-hero-proof article { min-height:96px;padding:15px 16px; }
+            .pw-hero-proof article>span { top:14px;right:15px; }
+            .pw-hero-proof strong { font-size:1.08rem; }
+            .pw-hero-proof p { margin-top:11px;font-size:.65rem; }
+
+            #v-cracked.list, #v-handshakes.list { grid-template-columns:repeat(2,minmax(0,1fr));gap:8px; }
+            #v-cracked>.si, #v-handshakes>.si { border-radius:15px; }
+            #v-cracked>.si>.row, #v-handshakes>.si>.row { min-height:72px;padding:10px 11px; }
+            #v-cracked .tit, #v-handshakes .tit { font-size:.84rem;line-height:1.25; }
+            #v-cracked .pwd, #v-handshakes .pwd { font-size:.75rem; }
+            #v-cracked .sub, #v-handshakes .sub { margin-top:3px;font-size:.62rem; }
+            #v-cracked .icon-btn, #v-handshakes .icon-btn { min-width:29px;width:29px;height:29px;font-size:12px; }
+            #v-cracked .badge, #v-handshakes .badge { padding:3px 6px;font-size:.46rem; }
+            #v-handshakes .subs { padding:0 7px 7px; }
+            #v-handshakes .sub-row { gap:10px;padding:8px 6px; }
+            #v-handshakes .btn-xs { padding:5px 7px;font-size:.58rem; }
+
+            .view-map .pw-hero { display:grid; }
+            .view-map .pwmenu-main { padding-bottom:70px; }
+            .view-map .pw-workspace { padding-top:0; }
+            .view-map .pw-workspace-bar { position:sticky;top:91px;display:grid;width:100%;max-width:none;grid-template-columns:minmax(260px,.9fr) minmax(440px,1.1fr);margin:0 0 20px;padding:8px;border:1px solid var(--line);border-radius:25px;background:rgba(8,10,11,.88);box-shadow:0 18px 60px rgba(0,0,0,.27); }
+            .view-map .pw-workspace-bar .pw-search { display:flex; }
+            .view-map .tabs { gap:5px;width:100%;border-radius:18px;background:rgba(255,255,255,.035); }
+            .view-map .tab { min-height:46px;gap:7px;padding:8px 10px;border-radius:15px;font-size:.72rem; }
+            .view-map .tab-icon { width:15px;height:15px;flex-basis:15px; }
+            .view-map .map-shell { height:calc(100vh - 225px);min-height:480px;border-radius:16px; }
+            .view-map .map-stage { width:100%;transition:width .22s ease; }
+            .view-map.map-panel-open .map-stage { width:calc(100% - 360px); }
+            .view-map .map-topbar { right:12px;width:auto; }
+            .view-map .map-search-wrap { display:flex; }
+            .view-map .map-gps-pop { right:auto;width:285px;margin:0; }
+            .view-map .map-sheet { top:0;right:0;bottom:auto;left:auto;width:350px;max-height:100%;padding:24px 13px 12px;border:1px solid var(--line-strong);border-radius:15px 0 0 15px;animation:mapSlideLeft .2s ease-out; }
+            .view-map .map-handle { top:7px; }
+            .view-map .map-title { font-size:1.22rem; }
+            .view-map .map-dock { bottom:10px; }
+            .view-map .map-desktop-footer { display:block;margin-top:8px; }
+            .view-map .map-desktop-footer .newfpv-credit { margin:0 auto; }
+            @keyframes mapSlideLeft { from { opacity:0;transform:translateX(18px); } to { opacity:1;transform:none; } }
+        }
+        @media (min-width:1100px) {
+            #v-cracked.list, #v-handshakes.list { grid-template-columns:repeat(3,minmax(0,1fr)); }
+        }
+        @media (prefers-reduced-motion:reduce) {
+            html { scroll-behavior:auto; }
+            *, *::before, *::after { animation-duration:.01ms!important;transition-duration:.01ms!important; }
         }
     </style>
 </head>
 <body>
-    <div style="max-width: 800px; margin: 0 auto;">
+    {% macro newfpv_credit(compact=false) -%}
+    <a class="newfpv-credit{% if compact %} compact{% endif %}" href="https://neewfpv.com/" target="_blank" rel="noopener">
+        <span><small>Made by</small><strong>New<span class="mark">FPV</span></strong></span>
+        <i aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"></path><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"></path></svg></i>
+    </a>
+    {%- endmacro %}
+    <div class="pwmenu-page">
 
-        <div class="header">
-            <h1>Passwords</h1>
-            <div class="lvl-info">
-                <div class="lvl-num">Level {{ stats.level }}</div>
-                <div class="lvl-rank">{{ stats.rank }}</div>
-                <div class="lvl-xp">{{ stats.xp }} / {{ stats.next_xp }} XP</div>
-            </div>
+        <header class="pw-nav-wrap">
+            <nav class="pw-nav" aria-label="PWMenu navigation">
+                <button class="pw-brand" type="button" onclick="tab('cracked')" aria-label="Open cracked passwords">
+                    <span class="pw-brand-dot"></span>
+                    <span>PWN<span class="pw-brand-mark">MENU</span></span>
+                </button>
+                <div class="pw-nav-meta">
+                    <span class="pw-live-dot"></span>
+                    <span>{{ stats.files }} captures</span>
+                    <span class="pw-nav-separator"></span>
+                    <strong>Level {{ stats.level }}</strong>
+                </div>
+                <button id="accentToggle" class="accent-toggle accent-trigger" type="button" onclick="toggleAccentPanel(event)" aria-expanded="false" aria-controls="accentPanel">
+                    <span class="accent-current"></span>
+                    <span class="accent-label">Accent</span>
+                </button>
+            </nav>
+        </header>
+        <div id="accentPanel" class="accent-panel hidden" role="dialog" aria-label="Accent color">
+                <div class="accent-panel-head">
+                    <div><small>Interface</small><strong>Accent color</strong></div>
+                    <button type="button" onclick="closeAccentPanel()" aria-label="Close accent picker">&times;</button>
+                </div>
+                <div class="accent-presets">
+                    <button type="button" class="accent-swatch" data-color="#20e4f4" data-name="NewFPV Cyan" style="--swatch:#20e4f4" aria-label="NewFPV Cyan"></button>
+                    <button type="button" class="accent-swatch" data-color="#9d63ff" data-name="Violet" style="--swatch:#9d63ff" aria-label="Violet"></button>
+                    <button type="button" class="accent-swatch" data-color="#4da3ff" data-name="Electric Blue" style="--swatch:#4da3ff" aria-label="Electric Blue"></button>
+                    <button type="button" class="accent-swatch" data-color="#b7ff3c" data-name="Signal Lime" style="--swatch:#b7ff3c" aria-label="Signal Lime"></button>
+                    <button type="button" class="accent-swatch" data-color="#ffe72e" data-name="Mistmee Yellow" style="--swatch:#ffe72e" aria-label="Mistmee Yellow"></button>
+                    <button type="button" class="accent-swatch" data-color="#ff5b71" data-name="Coral" style="--swatch:#ff5b71" aria-label="Coral"></button>
+                </div>
+                <label class="accent-custom">
+                    <span><small>Custom</small><strong id="accentName">NewFPV Cyan</strong></span>
+                    <input id="customAccent" type="color" value="#20e4f4" aria-label="Custom accent color">
+                </label>
         </div>
 
-        <input type="text" id="s" class="s-box" onkeyup="flt()" placeholder="Search...">
+        <main class="pwmenu-main">
+            <section class="pw-hero" aria-labelledby="pwmenuTitle">
+                <div class="pw-hero-copy">
+                    <p class="pw-eyebrow">NewFPV / Pwnagotchi</p>
+                    <h1 id="pwmenuTitle">PWN<span class="pw-hero-outline">MENU</span></h1>
+                    <p class="pw-hero-line">Capture intelligence, passwords and GPS in one field console.</p>
+                    <div class="pw-hero-chips">
+                        <span><i></i>{{ stats.total }} networks</span>
+                        <span><i></i>{{ stats.cracked }} cracked</span>
+                        <span><i></i>{{ stats.gps_points }} GPS points</span>
+                    </div>
+                </div>
+                <aside class="pw-hero-proof" aria-label="PWMenu status">
+                    <article><span>01 / progress</span><strong>{{ stats.percent }}%</strong><p>of captured networks have a known password</p></article>
+                    <article><span>02 / identity</span><strong>{{ stats.rank }}</strong><p>Level {{ stats.level }} &middot; {{ stats.xp }} / {{ stats.next_xp }} XP</p></article>
+                    <article><span>03 / queue</span><strong>{{ ohc_status.pending }}</strong><p>capture file(s) waiting in the persistent OHC queue</p></article>
+                </aside>
+            </section>
 
-        <div class="tabs">
-            <button class="tab active" onclick="tab('cracked')" id="b-cracked">Cracked</button>
-            <button class="tab" onclick="tab('handshakes')" id="b-handshakes">Handshakes</button>
-            <button class="tab" onclick="tab('map')" id="b-map">Map</button>
-            <button class="tab" onclick="tab('other')" id="b-other">Other</button>
-        </div>
+            <section class="pw-workspace" aria-label="Password workspace">
+                <div class="pw-workspace-bar">
+                    <button id="mobileSearchToggle" class="mobile-search-toggle" type="button" onclick="toggleMobileSearch(event)" aria-expanded="false" aria-controls="workspaceSearch" aria-label="Open search">
+                        <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"></circle><path d="m20 20-3.4-3.4"></path></svg>
+                    </button>
+                    <div id="workspaceSearch" class="pw-search" role="search" aria-label="Search current section">
+                        <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"></circle><path d="m20 20-3.4-3.4"></path></svg>
+                        <input type="text" id="s" class="s-box" onkeyup="flt()" placeholder="Search networks, passwords and captures...">
+                        <button class="mobile-search-close" type="button" onclick="closeMobileSearch()" aria-label="Close search">&times;</button>
+                    </div>
+                    <div class="tabs" role="tablist" aria-label="PWMenu sections">
+                        <button class="tab active" onclick="tab('cracked')" id="b-cracked" role="tab"><span class="tab-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="8" cy="15" r="4"></circle><path d="m11 12 8-8m-3 3 2 2m-5 1 2 2"></path></svg></span><b>Cracked</b></button>
+                        <button class="tab" onclick="tab('handshakes')" id="b-handshakes" role="tab"><span class="tab-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M4.9 9.9a10 10 0 0 1 14.2 0M7.8 12.8a6 6 0 0 1 8.4 0m-5.6 2.8a2 2 0 0 1 2.8 0"></path><circle cx="12" cy="19" r="1"></circle></svg></span><b>Handshakes</b></button>
+                        <button class="tab" onclick="tab('map')" id="b-map" role="tab"><span class="tab-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M20 10c0 5-8 11-8 11S4 15 4 10a8 8 0 1 1 16 0Z"></path><circle cx="12" cy="10" r="2.5"></circle></svg></span><b>Map</b></button>
+                        <button class="tab" onclick="tab('other')" id="b-other" role="tab"><span class="tab-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="5" cy="12" r="1.5"></circle><circle cx="12" cy="12" r="1.5"></circle><circle cx="19" cy="12" r="1.5"></circle></svg></span><b>Other</b></button>
+                    </div>
+                </div>
 
         {% if notif %}
         <div id="nt" class="notif {{ 'err' if ntype == 'error' else '' }}"><b>{{ notif }}</b></div>
@@ -3259,63 +3982,93 @@ class A_pwmenu(plugins.Plugin):
 
         <div id="v-cracked" class="list hidden">
             {% for e, d in cracked.items() %}
-            <div class="row si" data-t="{{ e }} {{ d.password }}">
-                <div style="flex-grow:1">
-                    <div class="tit">{{ e }}<span class="badge">{{ d.source }}</span></div>
-                    <span class="pwd">{{ d.password }}</span>
+            <div class="si" data-t="{{ e }} {{ d.password }}">
+                <div class="row" onclick="tog('cracked-{{ loop.index }}')">
+                    <div style="flex-grow:1;min-width:0">
+                        <div class="tit">{{ e }}<span class="badge">{{ d.source }}</span></div>
+                        <div class="sub">Saved credential</div>
+                    </div>
+                    <span class="arr" title="Open credential"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9 6 6 6-6 6"></path></svg></span>
                 </div>
-                <div style="display:flex; gap:10px;">
-                    <button class="icon-btn btn-edit" onclick="ed('{{ e }}', '{{ d.password }}', '{{ d.source }}')" title="Edit">✎</button>
-                    <button class="icon-btn btn-del" onclick="del('{{ e }}', '{{ d.password }}', '{{ d.source }}')" title="Delete">✖</button>
+                <div id="s-cracked-{{ loop.index }}" class="subs">
+                    <div class="credential-expanded">
+                        <div class="credential-label">Password</div>
+                        <div class="credential-value">{{ d.password }}</div>
+                        <div class="credential-actions">
+                            <button class="network-expanded-action" onclick='ed({{ e|tojson }}, {{ d.password|tojson }}, {{ d.source|tojson }})'>Edit password</button>
+                            <button class="network-expanded-action" style="color:var(--danger)" onclick='del({{ e|tojson }}, {{ d.password|tojson }}, {{ d.source|tojson }})'>Delete password</button>
+                        </div>
+                    </div>
                 </div>
             </div>
             {% endfor %}
             {% if not cracked %}<div style="padding:30px;text-align:center;color:var(--sub);">No cracked networks yet.</div>{% endif %}
+            {{ newfpv_credit(false) }}
         </div>
 
         <div id="v-handshakes" class="list hidden">
             {% for g in groups %}
+            {% set group_index = loop.index %}
             <div class="si" data-t="{{ g.essid }}">
                 <div class="row">
-                    <div style="flex-grow:1" onclick="tog('{{ loop.index }}')">
+                    <div style="flex-grow:1;min-width:0" onclick="tog('handshake-{{ loop.index }}')">
                         <div class="tit {{ g.cls }}">{{ g.essid }} {% if g.count > 1 %}<span class="badge">{{ g.count }}</span>{% endif %}{% if g.gps_count > 0 %}<span class="badge">GPS</span>{% endif %}</div>
                         <div class="sub">{{ g.last_seen }}</div>
-                        {% if g.is_cracked %}<span class="pwd">🔑 {{ g.pwd }}</span>{% endif %}
                     </div>
                     <div style="display:flex;align-items:center;">
-                        <button class="icon-btn btn-add" onclick="add('{{ g.essid }}')" title="Add Password">＋</button>
-                        <span class="arr" onclick="tog('{{ loop.index }}')">▶</span>
+                        <span class="arr" onclick="tog('handshake-{{ loop.index }}')" title="Open captures"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9 6 6 6-6 6"></path></svg></span>
                     </div>
                 </div>
-                <div id="s-{{ loop.index }}" class="subs">
-                    {% for f in g.files %}
-                    <div class="sub-row">
-                        <div>
-                            <div style="font-size:13px;">{{ f.bssid }}</div>
-                            <div style="color:var(--sub);font-size:11px;">{{ f.date }} • {{ f.size }}</div>
-                            {% if f.quality.grade %}<div class="quality-badge {{ f.quality.grade|lower }}" title="{{ f.quality.summary }}">{{ f.quality.grade }}</div>{% else %}<div class="quality-badge">Pending analysis</div>{% endif %}
+                <div id="s-handshake-{{ loop.index }}" class="subs">
+                    {% if g.is_cracked and g.pwd %}
+                    <div class="credential-expanded">
+                        <div class="credential-label">Recovered password</div>
+                        <div class="credential-value">{{ g.pwd }}</div>
+                        <div class="credential-actions">
+                            <button class="network-expanded-action" onclick='ed({{ g.essid|tojson }}, {{ g.pwd|tojson }}, {{ g.src|tojson }})'>Edit password</button>
+                            <button class="network-expanded-action" style="color:var(--danger)" onclick='del({{ g.essid|tojson }}, {{ g.pwd|tojson }}, {{ g.src|tojson }})'>Delete password</button>
                         </div>
-                        <div class="btn-grp">
-                            {% if show_wpa %}<button class="btn-xs" onclick='upl({{ f.filename|tojson }})'>WPA</button>{% endif %}
-                            <button class="btn-xs hc" onclick='sendSingleToOhc({{ f.filename|tojson }})'>OHC</button>
-                            <a href="/plugins/A_pwmenu/download-22000/{{ f.filename|urlencode }}" class="btn-xs hc">22000</a>
-                            <a href="/plugins/A_pwmenu/download/{{ f.filename|urlencode }}" class="btn-xs">PCAP</a>
-                            <button class="btn-xs" onclick='rm({{ f.filename|tojson }})' style="color:var(--danger)">×</button>
+                    </div>
+                    {% endif %}
+                    <div class="network-expanded-tools">
+                        {% if not g.is_cracked or not g.pwd %}
+                        <button class="network-expanded-action" onclick='add({{ g.essid|tojson }})' title="Add a recovered password"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="8" cy="15" r="4"></circle><path d="m11 12 7-7m-2 0h4m-2-2v4"></path></svg><span>Add password</span></button>
+                        {% endif %}
+                        <button class="network-expanded-action" onclick='whitelistAdd({{ g.essid|tojson }}, "handshakes")' title="Add this network to the whitelist"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3 5 6v5c0 4.6 2.8 8 7 10 4.2-2 7-5.4 7-10V6l-7-3Z"></path><path d="m9 12 2 2 4-4"></path></svg><span>Whitelist</span></button>
+                    </div>
+                    {% for f in g.files %}
+                    <div class="sub-row capture-row">
+                        <div class="capture-file-info">
+                            <div class="capture-file-bssid">{{ f.bssid or 'Unknown BSSID' }}</div>
+                            <div class="capture-file-meta">{{ f.date }} · {{ f.size }}</div>
+                            {% if f.quality.grade %}<div class="quality-badge {{ f.quality.grade|lower }}" title="{{ f.quality.summary }}">{{ f.quality.grade }}</div>{% else %}<div class="quality-badge">Pending</div>{% endif %}
+                        </div>
+                        <div class="capture-actions">
+                            {% if show_wpa %}<button class="capture-action" onclick='upl({{ f.filename|tojson }})'><svg viewBox="0 0 24 24"><path d="M12 3 5 6v5c0 4.6 2.8 8 7 10 4.2-2 7-5.4 7-10V6l-7-3Z"></path><path d="M9 12h6"></path></svg><span>WPA</span></button>{% endif %}
+                            <button class="capture-action" onclick='sendSingleToOhc({{ f.filename|tojson }})'><svg viewBox="0 0 24 24"><path d="M7 18h10a4 4 0 0 0 .7-7.9A6 6 0 0 0 6.3 8.5 4.8 4.8 0 0 0 7 18Z"></path><path d="m9 13 3-3 3 3m-3-3v6"></path></svg><span>OHC</span></button>
+                            <a href="/plugins/A_pwmenu/download-22000/{{ f.filename|urlencode }}" class="capture-action accent"><svg viewBox="0 0 24 24"><path d="M8 3 6 21m10-18-2 18M3 9h18M2 15h18"></path></svg><span>22000</span></a>
+                            <a href="/plugins/A_pwmenu/download/{{ f.filename|urlencode }}" class="capture-action accent"><svg viewBox="0 0 24 24"><path d="M12 3v12m-4-4 4 4 4-4"></path><path d="M5 19h14"></path></svg><span>PCAP</span></a>
+                            <button class="capture-action danger" onclick='rm({{ f.filename|tojson }})'><svg viewBox="0 0 24 24"><path d="M4 7h16M9 7V4h6v3m-9 0 1 14h10l1-14M10 11v6m4-6v6"></path></svg><span>Delete</span></button>
                         </div>
                     </div>
                     {% endfor %}
                 </div>
             </div>
             {% endfor %}
+            {{ newfpv_credit(false) }}
         </div>
 
         <div id="v-map" class="map-shell hidden">
             <div class="map-stage" id="mapStage">
                 <div class="map-topbar">
+                    <label class="map-filter-toggle map-glass" title="Show only cracked networks">
+                        <input id="mapCrackedToggle" type="checkbox" onchange="setMapFilter(this.checked ? 'cracked' : 'all')">
+                        <span class="map-filter-track"></span><b>Cracked</b>
+                    </label>
                     <div class="map-search-wrap map-glass">
                         <input type="text" id="mapSearch" class="map-search" oninput="renderMap()" placeholder="Search networks...">
                     </div>
-                    <button id="gpsStatusDot" class="map-gps-dot offline" onclick="toggleGpsStatus()" title="GPS status"></button>
+                    <button id="gpsStatusDot" class="map-gps-dot offline hidden" type="button" tabindex="-1" aria-hidden="true"></button>
                 </div>
                 <div id="gpsStatusPop" class="map-gps-pop hidden"></div>
                 <div id="mapEmpty" class="map-empty hidden">
@@ -3324,12 +4077,7 @@ class A_pwmenu(plugins.Plugin):
                 </div>
                 <div id="yandexMap" class="ymap-real"></div>
                 <div id="mapMarkers"></div>
-                <div id="mapDock" class="map-dock map-glass">
-                    <button id="mapAllBtn" class="map-dock-btn active" onclick="setMapFilter('all')">Map</button>
-                    <button id="mapCrackedBtn" class="map-dock-btn green" onclick="setMapFilter('cracked')">Cracked</button>
-                    <button id="mapNoGpsBtn" class="map-dock-btn blue" onclick="showNoGpsList()">No GPS</button>
-                    <button id="mapSummaryBtn" class="map-dock-btn" onclick="showMapSummary()">Stats</button>
-                </div>
+                <div id="mapDock" class="hidden" style="display:none!important" aria-hidden="true"><button id="mapAllBtn"></button><button id="mapCrackedBtn"></button><button id="mapNoGpsBtn"></button></div>
                 <div id="mapToast" class="map-toast">Copied</div>
             </div>
             <div id="mapSheet" class="map-sheet hidden">
@@ -3365,12 +4113,31 @@ class A_pwmenu(plugins.Plugin):
                         <div style="margin-top:6px;font-size:11px;overflow-wrap:anywhere;">{{ gps_status.detail }}</div>
                         {% endif %}
                     </div>
+                    <button class="map-overview-link" type="button" onclick="showNoGpsList()">
+                        <span><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 10c0 5-8 11-8 11S4 15 4 10a8 8 0 1 1 16 0Z"></path><path d="m9 9 6 6m0-6-6 6"></path></svg><b>No GPS networks</b></span>
+                        <strong>{{ stats.no_gps }}</strong>
+                    </button>
                 </div>
                 <div id="mapDetails" class="hidden"></div>
             </div>
         </div>
+        <footer class="map-desktop-footer">{{ newfpv_credit(false) }}</footer>
 
         <div id="v-other" class="hidden">
+            <section class="mobile-profile-card" aria-label="Pwnagotchi identity and appearance">
+                <div class="mobile-profile-top">
+                    <div>
+                        <small>Identity</small>
+                        <strong>{{ stats.rank }}</strong>
+                        <span>Level {{ stats.level }} &middot; {{ stats.xp }} / {{ stats.next_xp }} XP</span>
+                    </div>
+                    <button id="mobileAccentToggle" class="mobile-profile-accent accent-trigger" type="button" onclick="toggleAccentPanel(event)" aria-expanded="false" aria-controls="accentPanel">
+                        <i class="accent-current"></i>
+                        <span>Theme</span>
+                    </button>
+                </div>
+                <div class="mobile-xp-track" aria-label="Level progress {{ stats.lvl_percent }} percent"><i style="width:{{ stats.lvl_percent }}%"></i></div>
+            </section>
             <div class="card" style="padding:15px;text-align:left;">
                 <h3 style="margin-top:0;text-align:center;">OnlineHashCrack</h3>
                 <button class="btn" style="margin-top:0;background:#ff9f0a;" onclick="sendAllMissingToOhc()">Send all missing to OHC</button>
@@ -3392,6 +4159,27 @@ class A_pwmenu(plugins.Plugin):
                 <div class="sub" style="margin-top:4px;">
                     {{ pot_health.duplicates }} duplicate(s) - {{ pot_health.invalid }} invalid line(s) - {{ pot_health.nul_bytes }} NUL byte(s)
                 </div>
+            </div>
+
+            <div class="card" style="padding:15px;text-align:left;">
+                <h3 style="margin-top:0;text-align:center;">Network Whitelist</h3>
+                <div class="sub">Add an exact network name. Changes are written atomically and applied to the running Pwnagotchi session.</div>
+                <form method="POST" action="/plugins/A_pwmenu/whitelist-add" class="whitelist-form">
+                    <input type="hidden" name="csrf_token" value="{{ token }}">
+                    <input type="hidden" name="return_tab" value="other">
+                    <input class="whitelist-input" type="text" name="network" maxlength="128" autocomplete="off" placeholder="Network name" required>
+                    <button class="whitelist-submit">Add network</button>
+                </form>
+                <ul class="whitelist-list">
+                    {% for network in whitelist %}
+                    <li class="whitelist-item">
+                        <span>{{ network }}</span>
+                        <button class="whitelist-remove" type="button" onclick='whitelistRemove({{ network|tojson }})'>Remove</button>
+                    </li>
+                    {% else %}
+                    <li class="whitelist-item"><span>No active whitelist entries.</span></li>
+                    {% endfor %}
+                </ul>
             </div>
 
             <div class="card">
@@ -3439,40 +4227,28 @@ class A_pwmenu(plugins.Plugin):
             </div>
 
             <div class="card" style="padding:15px;text-align:left;">
-                <h3 style="margin-top:0;text-align:center;">Empty PCAP Cleanup</h3>
-                <div style="font-weight:800;color:{{ 'var(--danger)' if empty_report.count else 'var(--green)' }};">
-                    {{ empty_report.count }} confirmed empty 24-byte PCAP file(s)
+                <h3 style="margin-top:0;text-align:center;">Capture Cleanup</h3>
+                <div style="font-weight:800;color:{{ 'var(--danger)' if cleanup_report.count else 'var(--green)' }};">
+                    {{ cleanup_report.count }} cleanup candidate(s)
                 </div>
-                <div class="sub" style="margin-top:6px;">Only valid PCAP headers with no packets are included. The list is checked again immediately before deletion.</div>
-                {% if empty_report.names %}
-                <ul class="empty-file-list">
-                    {% for name in empty_report.names %}<li>{{ name }}</li>{% endfor %}
-                    {% if empty_report.more %}<li>+ {{ empty_report.more }} more file(s)</li>{% endif %}
+                <div class="sub" style="margin-top:6px;">{{ cleanup_report.empty_count }} empty header(s) and {{ cleanup_report.unusable_count }} analyzed unusable capture(s). Every file and signature is checked again immediately before deletion.</div>
+                {% if cleanup_report.display_files %}
+                <ul class="cleanup-file-list">
+                    {% for item in cleanup_report.display_files %}<li><strong>{{ item.name }}</strong><span>{{ item.reason }}</span></li>{% endfor %}
+                    {% if cleanup_report.more %}<li><strong>+ {{ cleanup_report.more }} more file(s)</strong></li>{% endif %}
                 </ul>
-                <form method="POST" action="/plugins/A_pwmenu/clean-empty-pcaps" onsubmit="return confirm('Permanently remove {{ empty_report.count }} confirmed empty PCAP file(s) and their companion metadata?')">
+                <form method="POST" action="/plugins/A_pwmenu/clean-captures" onsubmit="return confirm('Permanently remove {{ cleanup_report.count }} reviewed empty or unusable capture file(s) and their companion metadata?')">
                     <input type="hidden" name="csrf_token" value="{{ token }}">
-                    <input type="hidden" name="report_token" value="{{ empty_report.token }}">
-                    <button class="btn red">Remove Confirmed Empty PCAPs</button>
+                    <input type="hidden" name="report_token" value="{{ cleanup_report.token }}">
+                    <button class="btn red">Clean Reviewed Captures</button>
                 </form>
                 {% endif %}
             </div>
 
-            <div class="card" style="border:1px solid var(--danger);">
-                <h3 style="margin-top:0; color:var(--danger)">Danger Zone</h3>
-                <form method="POST" action="/plugins/A_pwmenu/clean-broken" onsubmit="return confirm('Clean broken?')">
-                    <input type="hidden" name="csrf_token" value="{{ token }}">
-                    <button class="btn red">Clean Broken Files</button>
-                </form>
-                <form method="POST" action="/plugins/A_pwmenu/nuke-all" onsubmit="return confirm('NUKE ALL?')">
-                    <input type="hidden" name="csrf_token" value="{{ token }}">
-                    <button class="btn red" style="background:transparent; border-color:var(--sub); color:var(--sub);">Nuke Everything</button>
-                </form>
-            </div>
-
-            <a class="pwmenu-powered" href="https://neewfpv.com/" target="_blank" rel="noopener">
-                <span class="pwmenu-powered-dot"></span><span>Powered by <strong>NewFPV</strong></span>
-            </a>
+            {{ newfpv_credit(false) }}
         </div>
+            </section>
+        </main>
     </div>
 
     <script>
@@ -3488,9 +4264,12 @@ class A_pwmenu(plugins.Plugin):
         let yandexMap = null;
         let yandexObjects = null;
         let yandexReady = false;
+        let yandexLoader = null;
         let activeMapGroup = null;
+        const accentStorageKey = 'a_pwmenu_accent_v1';
 
         const t0 = '{{ tab }}';
+        initAccentPicker();
         tab(t0);
         startPhoneGps(false);
         updateGpsStatusDot();
@@ -3504,6 +4283,95 @@ class A_pwmenu(plugins.Plugin):
             document.body.appendChild(f); f.submit();
         }
 
+        function accentContrast(hex) {
+            const value = String(hex || '').replace('#', '');
+            if(!/^[0-9a-f]{6}$/i.test(value)) return '#001013';
+            const rgb = [0, 2, 4].map(index => parseInt(value.slice(index, index + 2), 16) / 255);
+            const linear = rgb.map(channel => channel <= .03928 ? channel / 12.92 : Math.pow((channel + .055) / 1.055, 2.4));
+            const luminance = .2126 * linear[0] + .7152 * linear[1] + .0722 * linear[2];
+            return luminance > .42 ? '#001013' : '#ffffff';
+        }
+
+        function applyAccent(color, name, persist) {
+            if(!/^#[0-9a-f]{6}$/i.test(String(color || ''))) return;
+            const normalized = color.toLowerCase();
+            document.documentElement.style.setProperty('--accent', normalized);
+            document.documentElement.style.setProperty('--accent-contrast', accentContrast(normalized));
+            const custom = document.getElementById('customAccent');
+            const label = document.getElementById('accentName');
+            if(custom) custom.value = normalized;
+            if(label) label.textContent = name || normalized.toUpperCase();
+            document.querySelectorAll('.accent-swatch').forEach(button => {
+                button.classList.toggle('active', button.dataset.color.toLowerCase() === normalized);
+            });
+            if(persist) {
+                try {
+                    localStorage.setItem(accentStorageKey, JSON.stringify({color:normalized, name:name || normalized.toUpperCase()}));
+                } catch(error) {}
+                document.cookie = 'a_pwmenu_accent=' + normalized.slice(1) + '; Max-Age=31536000; Path=/; SameSite=Lax';
+            }
+        }
+
+        function initAccentPicker() {
+            let saved = null;
+            try { saved = JSON.parse(localStorage.getItem(accentStorageKey) || 'null'); } catch(error) {}
+            if(!saved || !saved.color) {
+                const cookieMatch = document.cookie.match(/(?:^|;\s*)a_pwmenu_accent=([0-9a-f]{6})(?:;|$)/i);
+                if(cookieMatch) saved = {color:'#' + cookieMatch[1], name:'Saved ' + cookieMatch[1].toUpperCase()};
+            }
+            applyAccent(saved && saved.color ? saved.color : '#20e4f4', saved && saved.name ? saved.name : 'NewFPV Cyan', false);
+            document.querySelectorAll('.accent-swatch').forEach(button => {
+                button.addEventListener('click', () => applyAccent(button.dataset.color, button.dataset.name, true));
+            });
+            const custom = document.getElementById('customAccent');
+            if(custom) {
+                custom.addEventListener('input', event => applyAccent(event.target.value, 'Custom ' + event.target.value.toUpperCase(), true));
+            }
+            document.addEventListener('click', event => {
+                const panel = document.getElementById('accentPanel');
+                const toggles = Array.from(document.querySelectorAll('.accent-trigger'));
+                if(panel && !panel.classList.contains('hidden') && !panel.contains(event.target) && !toggles.some(toggle => toggle.contains(event.target))) closeAccentPanel();
+                const search = document.getElementById('workspaceSearch');
+                const searchToggle = document.getElementById('mobileSearchToggle');
+                if(document.body.classList.contains('mobile-search-open') && search && !search.contains(event.target) && searchToggle && !searchToggle.contains(event.target)) closeMobileSearch();
+            });
+            document.addEventListener('keydown', event => {
+                if(event.key === 'Escape') {
+                    closeAccentPanel();
+                    closeMobileSearch();
+                }
+            });
+        }
+
+        function toggleMobileSearch(event) {
+            if(event) event.stopPropagation();
+            const toggle = document.getElementById('mobileSearchToggle');
+            const opening = !document.body.classList.contains('mobile-search-open');
+            document.body.classList.toggle('mobile-search-open', opening);
+            if(toggle) toggle.setAttribute('aria-expanded', opening ? 'true' : 'false');
+            if(opening) setTimeout(() => document.getElementById('s').focus(), 90);
+        }
+
+        function closeMobileSearch() {
+            document.body.classList.remove('mobile-search-open');
+            const toggle = document.getElementById('mobileSearchToggle');
+            if(toggle) toggle.setAttribute('aria-expanded', 'false');
+        }
+
+        function toggleAccentPanel(event) {
+            if(event) event.stopPropagation();
+            const panel = document.getElementById('accentPanel');
+            const opening = panel.classList.contains('hidden');
+            panel.classList.toggle('hidden', !opening);
+            document.querySelectorAll('.accent-trigger').forEach(toggle => toggle.setAttribute('aria-expanded', opening ? 'true' : 'false'));
+        }
+
+        function closeAccentPanel() {
+            const panel = document.getElementById('accentPanel');
+            if(panel) panel.classList.add('hidden');
+            document.querySelectorAll('.accent-trigger').forEach(toggle => toggle.setAttribute('aria-expanded', 'false'));
+        }
+
         function sel(i) {
             if(i.files[0]) {
                 document.getElementById('fn').innerText = i.files[0].name;
@@ -3513,6 +4381,16 @@ class A_pwmenu(plugins.Plugin):
         }
 
         function add(e) { const p=prompt("Password for "+e+":"); if(p) post('add-password', {essid:e, password:p}); }
+        function whitelistAdd(network, returnTab) {
+            if(confirm('Add "' + network + '" to the whitelist?')) {
+                post('whitelist-add', {network:network, return_tab:returnTab || 'other'});
+            }
+        }
+        function whitelistRemove(network) {
+            if(confirm('Remove "' + network + '" from the whitelist?')) {
+                post('whitelist-remove', {network:network});
+            }
+        }
         function ed(e,o) { const p=prompt("Edit "+e+":", o); if(p&&p!==o) post('update-password', {essid:e, password:p}); }
         function del(e, p, s) {
             if(confirm("Delete password for "+e+"?")) {
@@ -3556,6 +4434,14 @@ class A_pwmenu(plugins.Plugin):
             toast.classList.add('show');
             clearTimeout(showToast.t);
             showToast.t = setTimeout(() => toast.classList.remove('show'), 1300);
+        }
+
+        function setMapPanelOpen(open) {
+            document.body.classList.toggle('map-panel-open', !!open);
+            setTimeout(() => {
+                if(yandexMap) yandexMap.container.fitToViewport();
+                renderMap();
+            }, 60);
         }
 
         function revealPassword(id) {
@@ -3654,7 +4540,7 @@ class A_pwmenu(plugins.Plugin):
         }
 
         function pointChips(item, missingGps) {
-            return `<div class="map-chips">${qualityStatusBlock(item)}${ohcStatusBlock(item)}${gpsStatusChip(item, missingGps)}</div>`;
+            return `<div class="map-chips">${qualityStatusBlock(item)}${gpsStatusChip(item, missingGps)}</div>`;
         }
 
         function mapItemClass(item) {
@@ -3662,18 +4548,25 @@ class A_pwmenu(plugins.Plugin):
             return item && item.is_cracked ? 'green' : 'blue';
         }
 
-        function networkActions(filename, isCracked, ohcExpr, wpaExpr) {
-            if(isCracked) {
-                return `<div class="map-actions single">
-                    <button class="map-action red" onclick='rm(${jsq(filename)})'>Delete</button>
-                </div>`;
-            }
-            const wpaAction = wpaEnabled ? `<button class="map-action soft" onclick='${wpaExpr}'>Send WPA-sec</button>` : '';
-            return `<div class="map-actions">
-                <a class="map-action" href="/plugins/A_pwmenu/download/${encodeURIComponent(filename)}">Download .pcap</a>
-                <button class="map-action soft" onclick='${ohcExpr}'>Send OHC</button>
-                ${wpaAction}
-                <button class="map-action red trash" title="Delete" onclick='rm(${jsq(filename)})'><span class="trash-icon"></span></button>
+        function mapActionIcon(name) {
+            const icons = {
+                download: '<svg viewBox="0 0 24 24"><path d="M12 3v12m-4-4 4 4 4-4"></path><path d="M5 19h14"></path></svg>',
+                ohc: '<svg viewBox="0 0 24 24"><path d="M7 18h10a4 4 0 0 0 .7-7.9A6 6 0 0 0 6.3 8.5 4.8 4.8 0 0 0 7 18Z"></path><path d="m9 13 3-3 3 3m-3-3v6"></path></svg>',
+                wpa: '<svg viewBox="0 0 24 24"><path d="M12 3 5 6v5c0 4.6 2.8 8 7 10 4.2-2 7-5.4 7-10V6l-7-3Z"></path><path d="M9 12h6"></path></svg>',
+                whitelist: '<svg viewBox="0 0 24 24"><path d="M12 3 5 6v5c0 4.6 2.8 8 7 10 4.2-2 7-5.4 7-10V6l-7-3Z"></path><path d="m9 12 2 2 4-4"></path></svg>',
+                trash: '<svg viewBox="0 0 24 24"><path d="M4 7h16M9 7V4h6v3m-9 0 1 14h10l1-14M10 11v6m4-6v6"></path></svg>'
+            };
+            return icons[name] || '';
+        }
+
+        function networkActions(networkName, filename, isCracked, ohcExpr, wpaExpr) {
+            const download = `<a class="map-icon-action primary" href="/plugins/A_pwmenu/download/${encodeURIComponent(filename)}" title="Download PCAP">${mapActionIcon('download')}<span>PCAP</span></a>`;
+            const ohc = isCracked ? '' : `<button class="map-icon-action" onclick='${ohcExpr}' title="Send to OHC">${mapActionIcon('ohc')}<span>OHC</span></button>`;
+            const wpa = !isCracked && wpaEnabled ? `<button class="map-icon-action" onclick='${wpaExpr}' title="Send to WPA-sec">${mapActionIcon('wpa')}<span>WPA</span></button>` : '';
+            return `<div class="map-icon-actions">
+                ${download}${ohc}${wpa}
+                <button class="map-icon-action" onclick='whitelistAdd(${jsq(networkName)}, "map")' title="Add to whitelist">${mapActionIcon('whitelist')}<span>Allow</span></button>
+                <button class="map-icon-action danger" title="Delete capture" onclick='rm(${jsq(filename)})'>${mapActionIcon('trash')}<span>Delete</span></button>
             </div>`;
         }
 
@@ -3781,6 +4674,8 @@ class A_pwmenu(plugins.Plugin):
 
         function setMapFilter(mode) {
             mapFilter = mode;
+            const toggle = document.getElementById('mapCrackedToggle');
+            if(toggle) toggle.checked = mode === 'cracked';
             document.getElementById('mapAllBtn').classList.toggle('active', mode === 'all');
             document.getElementById('mapCrackedBtn').classList.toggle('active', mode === 'cracked');
             document.getElementById('mapNoGpsBtn').classList.toggle('active', false);
@@ -3789,6 +4684,7 @@ class A_pwmenu(plugins.Plugin):
         }
 
         function showMapSummary() {
+            setMapPanelOpen(true);
             selectedMapPoint = null;
             document.getElementById('mapSheet').classList.remove('hidden');
             document.getElementById('mapSummary').classList.remove('hidden');
@@ -3797,6 +4693,7 @@ class A_pwmenu(plugins.Plugin):
         }
 
         function showNoGpsList() {
+            setMapPanelOpen(true);
             selectedMapPoint = null;
             document.getElementById('mapNoGpsBtn').classList.add('active');
             document.getElementById('mapAllBtn').classList.remove('active');
@@ -3809,8 +4706,7 @@ class A_pwmenu(plugins.Plugin):
             const rows = noGpsNetworks.map((n, idx) => `
                 <button class="map-list-item ${mapItemClass(n)}" onclick="showNoGpsPoint(${idx})">
                     <div class="map-list-title">${esc(n.essid)}</div>
-                    <div class="map-list-sub">${esc(n.vendor || 'Unknown vendor')} - ${esc(n.bssid || 'no bssid')} - ${esc(n.date)} - ${n.count} capture${n.count === 1 ? '' : 's'}</div>
-                    ${n.password ? `<div style="margin-top:10px;color:#8effb8;font-weight:850">Cracked</div>` : ''}
+                    <div class="map-list-sub">${esc(n.vendor || 'Unknown vendor')} · ${n.count} capture${n.count === 1 ? '' : 's'}</div>
                 </button>`).join('');
             d.innerHTML = `
                 <div class="map-title-row">
@@ -3826,6 +4722,7 @@ class A_pwmenu(plugins.Plugin):
         function showNoGpsPoint(idx) {
             const n = noGpsNetworks[idx];
             if(!n) return;
+            setMapPanelOpen(true);
             selectedMapPoint = n;
             document.getElementById('mapSheet').classList.remove('hidden');
             document.getElementById('mapSummary').classList.add('hidden');
@@ -3841,8 +4738,7 @@ class A_pwmenu(plugins.Plugin):
                         </div>
                         <button class="map-copy" onclick='copyText(${jsq(n.password)})'>Copy</button>
                     </div>
-                </div>` : `
-                <div class="map-secret blue"><b>Encrypted</b></div>`;
+                </div>` : '';
             const fileRows = (n.files || []).slice(0, 5).map(f => `
                 <div class="map-list-item ${mapItemClass(f)}">
                     <div class="map-list-title" style="font-size:15px">${esc(f.filename)}</div>
@@ -3858,16 +4754,15 @@ class A_pwmenu(plugins.Plugin):
                     </div>
                     <button class="map-close" onclick="hideMapPoint()">&times;</button>
                 </div>
-                <div class="map-metrics">
-                    <div class="map-metric"><div class="map-metric-label">Captures</div><div class="map-metric-value" style="font-size:15px">${esc(n.count || 1)}</div></div>
-                    <div class="map-metric"><div class="map-metric-label">GPS</div><div class="map-metric-value" style="font-size:15px">Missing</div></div>
-                    <div class="map-metric"><div class="map-metric-label">Vendor</div><div class="map-metric-value" style="font-size:15px">${esc(n.vendor || 'Unknown vendor')}</div></div>
+                <div class="map-compact-meta">
+                    <span>${esc(n.count || 1)} capture${Number(n.count || 1) === 1 ? '' : 's'}</span>
+                    <span>GPS missing</span>
+                    <span>${esc(n.vendor || 'Unknown vendor')}</span>
                 </div>
-                <div class="map-status">Captured: ${esc(n.date || 'unknown')}</div>
                 ${pointChips(n, true)}
                 ${pass}
-                ${fileRows ? `<div class="map-status">${n.files.length} capture file${n.files.length === 1 ? '' : 's'}</div><div class="map-list">${fileRows}</div>` : ''}
-                ${n.filename ? networkActions(n.filename, !!n.password, `sendNoGpsToOhc(noGpsNetworks[${idx}])`, `sendNoGpsToWpa(noGpsNetworks[${idx}])`) : ''}`;
+                ${fileRows ? `<details class="map-more"><summary>${n.files.length} capture file${n.files.length === 1 ? '' : 's'}</summary><div class="map-list">${fileRows}</div></details>` : ''}
+                ${n.filename ? networkActions(n.essid, n.filename, !!n.password, `sendNoGpsToOhc(noGpsNetworks[${idx}])`, `sendNoGpsToWpa(noGpsNetworks[${idx}])`) : ''}`;
         }
 
         function mapBounds(points) {
@@ -3942,9 +4837,28 @@ class A_pwmenu(plugins.Plugin):
             return '#1e9bff';
         }
 
+        function loadYandexMaps() {
+            if(window.ymaps) return Promise.resolve(window.ymaps);
+            if(yandexLoader) return yandexLoader;
+            yandexLoader = new Promise((resolve, reject) => {
+                const script = document.createElement('script');
+                script.src = 'https://api-maps.yandex.ru/2.1/?apikey=&lang=en_US';
+                script.async = true;
+                script.onload = () => window.ymaps ? resolve(window.ymaps) : reject(new Error('Yandex Maps API unavailable'));
+                script.onerror = () => reject(new Error('Yandex Maps API failed to load'));
+                document.head.appendChild(script);
+            }).catch(error => {
+                console.warn('[A_pwmenu] ' + error.message + '; using the offline map.');
+                yandexLoader = null;
+                return null;
+            });
+            return yandexLoader;
+        }
+
         function initYandexMap() {
-            if(!window.ymaps) return;
-            window.ymaps.ready(() => {
+            loadYandexMaps().then(api => {
+                if(!api) return;
+                api.ready(() => {
                 if(yandexMap) return;
                 try {
                 const pts = mapPoints.length ? mapPoints : [{lat: 55.751244, lon: 37.618423}];
@@ -4005,6 +4919,7 @@ class A_pwmenu(plugins.Plugin):
                     if(el) el.classList.remove('ready');
                     renderMap();
                 }
+                });
             });
         }
 
@@ -4083,6 +4998,7 @@ class A_pwmenu(plugins.Plugin):
                 return;
             }
             if(!fromGroup) activeMapGroup = null;
+            setMapPanelOpen(true);
             selectedMapPoint = p;
             document.getElementById('mapSheet').classList.remove('hidden');
             document.getElementById('mapDock').classList.add('hidden');
@@ -4099,10 +5015,7 @@ class A_pwmenu(plugins.Plugin):
                         </div>
                         <button class="map-copy" onclick='copyText(${jsq(p.password)})'>Copy</button>
                     </div>
-                </div>` : `
-                <div class="map-secret blue">
-                    <b>Encrypted</b>
-                </div>`;
+                </div>` : '';
             const history = (p.history || []).slice(1, 5).map(h => `
                 <div class="map-list-item ${mapItemClass(h)}">
                     <div class="map-list-title" style="font-size:15px">${esc(h.date)}</div>
@@ -4112,25 +5025,25 @@ class A_pwmenu(plugins.Plugin):
             d.innerHTML = `
                 <div class="map-title-row">
                     ${backButton}
-                    <div>
+                    <div class="map-title-main">
                         <div class="map-title">${esc(p.essid)}</div>
                         <div class="map-sub">${esc(p.bssid || 'no bssid')}</div>
                     </div>
                     <button class="map-close" onclick="hideMapPoint()">&times;</button>
                 </div>
-                <div class="map-metrics">
-                    <div class="map-metric"><div class="map-metric-label">Captures</div><div class="map-metric-value" style="font-size:15px">${esc(p.captures || 1)}</div></div>
-                    <div class="map-metric"><div class="map-metric-label">Security</div><div class="map-metric-value" style="font-size:15px">${esc(p.encryption || 'WPA2')}</div></div>
-                    <div class="map-metric"><div class="map-metric-label">Vendor</div><div class="map-metric-value" style="font-size:15px">${esc(p.vendor || 'Unknown vendor')}</div></div>
+                <div class="map-compact-meta">
+                    <span>${esc(p.captures || 1)} capture${Number(p.captures || 1) === 1 ? '' : 's'}</span>
+                    <span>${esc(p.encryption || 'WPA2')}</span>
+                    <span>${esc(p.vendor || 'Unknown vendor')}</span>
                 </div>
-                <div class="map-status">Captured: ${esc(p.date)}</div>
                 ${pointChips(p, false)}
                 ${pass}
-                ${history ? `<div class="map-status">${p.history.length} nearby captures</div><div class="map-list">${history}</div>` : ''}
-                ${networkActions(p.filename, !!p.password, `sendSingleToOhc(${jsq(p.filename)})`, `sendSingleToWpa(${jsq(p.filename)})`)}`;
+                ${history ? `<details class="map-more"><summary>${p.history.length} nearby captures</summary><div class="map-list">${history}</div></details>` : ''}
+                ${networkActions(p.essid, p.filename, !!p.password, `sendSingleToOhc(${jsq(p.filename)})`, `sendSingleToWpa(${jsq(p.filename)})`)}`;
         }
 
         function showMapGroup(p) {
+            setMapPanelOpen(true);
             activeMapGroup = p;
             selectedMapPoint = p;
             document.getElementById('mapSheet').classList.remove('hidden');
@@ -4143,26 +5056,25 @@ class A_pwmenu(plugins.Plugin):
                 const gpsAge = m.gps_stale ? ` - GPS ${Math.max(1, Math.round((Number(m.gps_age_at_capture || 0)) / 60))} min old` : '';
                 return `<button class="map-list-item ${mapItemClass(m)}" onclick="showMapPointFromGroup(${idx})">
                     <div class="map-list-title">${esc(m.essid)}</div>
-                    <div class="map-list-sub">${esc(m.vendor || 'Unknown vendor')} - ${esc(m.bssid || 'no bssid')}${gpsAge}</div>
+                    <div class="map-list-sub">${esc(m.vendor || 'Unknown vendor')}${gpsAge}</div>
                     ${qualityStatusBlock(m)}
-                    ${m.password ? `<div style="margin-top:10px;color:#8effb8;font-weight:850">Cracked</div>` : ''}
                 </button>`;
             }).join('');
             p.visibleMembers = visibleMembers;
             d.innerHTML = `
                 <div class="map-title-row">
-                    <div>
+                    <div class="map-title-main">
                         <div class="map-title">${visibleMembers.length} networks</div>
                         <div class="map-sub">Same spot cluster</div>
                     </div>
                     <button class="map-close" onclick="hideMapPoint()">&times;</button>
                 </div>
-                <div class="map-actions">
-                    <a class="map-action" href="${clusterDownloadUrl(p)}">Download all .pcap</a>
-                    <button class="map-action soft" onclick="sendClusterToOhc(activeMapGroup)">Send OHC</button>
-                    ${wpaEnabled ? '<button class="map-action soft" onclick="sendClusterToWpa(activeMapGroup)">Send WPA-sec</button>' : ''}
+                <div class="map-icon-actions">
+                    <a class="map-icon-action primary" href="${clusterDownloadUrl(p)}" title="Download all PCAP files">${mapActionIcon('download')}<span>All</span></a>
+                    <button class="map-icon-action" onclick="sendClusterToOhc(activeMapGroup)" title="Send cluster to OHC">${mapActionIcon('ohc')}<span>OHC</span></button>
+                    ${wpaEnabled ? `<button class="map-icon-action" onclick="sendClusterToWpa(activeMapGroup)" title="Send cluster to WPA-sec">${mapActionIcon('wpa')}<span>WPA</span></button>` : ''}
                 </div>
-                <div class="map-list">${rows || '<div class="map-status">No cracked networks here.</div>'}</div>`;
+                <div class="map-list map-cluster-list">${rows || '<div class="map-status">No networks here.</div>'}</div>`;
         }
 
         function showMapPointFromGroup(idx) {
@@ -4173,6 +5085,7 @@ class A_pwmenu(plugins.Plugin):
         }
 
         function hideMapPoint() {
+            setMapPanelOpen(false);
             selectedMapPoint = null;
             activeMapGroup = null;
             document.getElementById('mapSheet').classList.add('hidden');
@@ -4185,16 +5098,25 @@ class A_pwmenu(plugins.Plugin):
         }
 
         function tab(t) {
+            closeMobileSearch();
+            document.body.classList.remove('view-cracked', 'view-handshakes', 'view-map', 'view-other');
+            document.body.classList.add('view-' + t);
             document.querySelectorAll('.list, #v-other, #v-map').forEach(e=>e.classList.add('hidden'));
             const view = document.getElementById(t==='other'?'v-other':'v-'+t);
             view.classList.remove('hidden');
             if(t!=='other' && t!=='map') view.classList.add('list');
-            document.querySelectorAll('.tab').forEach(e=>e.classList.remove('active'));
-            document.getElementById('b-'+t).classList.add('active');
+            document.querySelectorAll('.tab').forEach(e=>{
+                e.classList.remove('active');
+                e.setAttribute('aria-selected', 'false');
+            });
+            const activeButton = document.getElementById('b-'+t);
+            activeButton.classList.add('active');
+            activeButton.setAttribute('aria-selected', 'true');
             if(t==='map') {
                 startPhoneGps(false);
                 initYandexMap();
                 setTimeout(() => {
+                    const sheet = document.getElementById('mapSheet');
                     if(yandexMap) yandexMap.container.fitToViewport();
                     renderMap();
                 }, 80);
@@ -4203,15 +5125,33 @@ class A_pwmenu(plugins.Plugin):
         }
 
         function tog(id) {
-            let s = document.getElementById('s-'+id);
-            s.style.display = s.style.display==='block' ? 'none' : 'block';
+            const target = document.getElementById('s-'+id);
+            if(!target) return;
+            const opening = target.style.display !== 'block';
+            document.querySelectorAll('#v-cracked .subs, #v-handshakes .subs').forEach(panel => {
+                panel.style.display = 'none';
+                const card = panel.closest('.si');
+                if(card) card.classList.remove('open');
+            });
+            if(opening) {
+                target.style.display = 'block';
+                const card = target.closest('.si');
+                if(card) card.classList.add('open');
+                requestAnimationFrame(() => card && card.scrollIntoView({block:'center', behavior:'smooth'}));
+            }
         }
 
         function flt() {
-            let v = document.getElementById('s').value.toUpperCase();
+            const raw = document.getElementById('s').value;
+            let v = raw.toUpperCase();
             let active = document.querySelector('.tab.active').id.replace('b-','');
             if(active === 'other') return;
-            if(active === 'map') { renderMap(); return; }
+            if(active === 'map') {
+                const mapSearch = document.getElementById('mapSearch');
+                if(mapSearch) mapSearch.value = raw;
+                renderMap();
+                return;
+            }
             let act = 'v-' + active;
             document.getElementById(act).querySelectorAll('.si').forEach(el=>{
                 el.style.display = el.getAttribute('data-t').toUpperCase().includes(v) ? '' : 'none';
