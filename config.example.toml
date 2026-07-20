@@ -31,6 +31,11 @@ main.plugins.A_pwmenu.gpsd_host = "127.0.0.1"
 main.plugins.A_pwmenu.gpsd_port = 2947
 main.plugins.A_pwmenu.gpsd_poll_interval = 10
 
+# Capture analysis and safe automatic replacement of older weak captures.
+main.plugins.A_pwmenu.quality_auto_scan = true
+main.plugins.A_pwmenu.quality_scan_delay_ms = 250
+main.plugins.A_pwmenu.auto_replace_unusable = true
+
 # Operational limits.
 main.plugins.A_pwmenu.timezone = 0
 main.plugins.A_pwmenu.time_sync_interval = 1800

@@ -2,6 +2,19 @@
 
 All notable changes to A_pwmenu are documented here.
 
+## 1.3.0 — 2026-07-20
+
+- Rebuilt the web interface as a responsive field console with a compact mobile layout, desktop workspace, redesigned capture actions, persistent bottom navigation, and improved map details.
+- Added six accent presets plus a custom color picker, with the selected theme saved locally in the browser.
+- Added in-app Pwnagotchi network whitelist management with exact-name validation, atomic `config.toml` updates, an automatic backup, and immediate runtime synchronization.
+- Replaced separate destructive cleanup actions with one preview-and-confirm workflow for empty and analyzed-unusable captures; every path, signature, and current quality result is revalidated immediately before deletion.
+- Removed the broad “nuke all” web action so routine cleanup cannot erase every capture and local potfile in one click.
+- Added PCAP, OHC, WPA-sec, whitelist, and delete actions directly to the redesigned handshake and map views.
+- Added gzip compression for large HTML responses, reducing the static interface payload from roughly 139 KB to 28 KB before dynamic capture data.
+- Changed Yandex Maps to load asynchronously only when the Map tab is opened, so the main page no longer waits for an external map script.
+- Added transport regression tests for gzip negotiation and the uncompressed UTF-8 fallback; updated UI and cleanup regression coverage.
+- Moved the complete user guide to [neewfpv.com/wiki/pwnagochi](https://neewfpv.com/wiki/pwnagochi) and reduced the repository README to installation and essential configuration.
+
 ## 1.2.0 — 2026-07-18
 
 - Added signature-aware `Excellent`, `Usable`, `Partial`, and `Unusable` capture quality analysis based on the installed `hcxpcapngtool` report and generated mode 22000 hashes.
