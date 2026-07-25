@@ -47,7 +47,7 @@ logging.info("[A_pwmenu] Module init.")
 
 class A_pwmenu(plugins.Plugin):
     __author__ = 'NewFPV'
-    __version__ = '1.3.2'
+    __version__ = '1.3.5'
     __license__ = 'GPL3'
     __description__ = 'Ultimate Password Manager'
 
@@ -55,6 +55,7 @@ class A_pwmenu(plugins.Plugin):
         self.ready = False
         self.handshake_dirs = ['/root/handshakes/', '/home/pi/handshakes/']
         self.potfile_ohc = '/root/handshakes/onlinehashcrack.cracked.potfile'
+        self.potfile_handshake_lab = '/root/handshakes/handshake-lab.cracked.potfile'
         self.potfile_manual = '/root/handshakes/manual.potfile'
         self.data_file = '/root/handshakes/.a_pwmenu_data.json'
         self.ohc_export_file = '/root/handshakes/.a_pwmenu_ohc_export.json'
@@ -94,6 +95,7 @@ class A_pwmenu(plugins.Plugin):
         self.ohc_scheduler_thread = None
         self.ohc_scheduler_wakeup = threading.Event()
         self.capture_analysis_lock = threading.Lock()
+        self.password_verify_lock = threading.Lock()
         self.quality_thread_lock = threading.Lock()
         self.quality_scan_thread = None
         self.quality_pending = set()
@@ -102,14 +104,28 @@ class A_pwmenu(plugins.Plugin):
         self._agent = None
         self.config_path = '/etc/pwnagotchi/config.toml'
         self.whitelist_lock = threading.RLock()
+        self.display_password_element = 'pwmenu_password'
+        self.quickdic_lock = threading.Lock()
+        self.quickdic_pending = []
+        self.quickdic_wakeup = threading.Event()
+        self.quickdic_running = False
+        self.quickdic_thread = None
+        self.quickdic_display_status = ''
+        self.quickdic_display_until = 0
+
+    def _module_enabled(self, name, default=True):
+        return self._option_bool(f'module_{name}_enabled', default)
 
     def on_loaded(self):
         logging.info("[A_pwmenu] Loaded.")
         self._ensure_file(self.potfile_ohc)
+        self._ensure_file(self.potfile_handshake_lab)
         self._ensure_file(self.potfile_manual)
         self._normalize_potfile(self.potfile_ohc)
+        self._normalize_potfile(self.potfile_handshake_lab)
         self._normalize_potfile(self.potfile_manual)
         self._load_data()
+        self._repair_whitelist_aliases()
         self.options.setdefault('time_sync_interval', 1800)
         self.options.setdefault('phone_gps_enabled', True)
         self.options.setdefault('phone_gps_max_age', 600)
@@ -131,34 +147,85 @@ class A_pwmenu(plugins.Plugin):
         self.options.setdefault('import_max_bytes', 2097152)
         self.options.setdefault('archive_memory_limit', 2097152)
         self.options.setdefault('hcxpcapngtool_timeout', 90)
+        self.options.setdefault('password_verify_timeout', 45)
         self.options.setdefault('ohc_retry_poll_interval', 60)
         self.options.setdefault('ohc_reconcile_on_start', False)
         self.options.setdefault('quality_auto_scan', True)
         self.options.setdefault('quality_scan_delay_ms', 250)
         self.options.setdefault('auto_replace_unusable', True)
-        self._start_pwndroid_ws()
+        self.options.setdefault('module_web_enabled', True)
+        self.options.setdefault('module_gps_enabled', True)
+        self.options.setdefault('module_ohc_enabled', True)
+        self.options.setdefault('module_wpa_sec_enabled', True)
+        self.options.setdefault('module_quality_enabled', True)
+        self.options.setdefault('module_whitelist_enabled', True)
+        self.options.setdefault('module_time_sync_enabled', True)
+        self.options.setdefault('module_display_password_enabled', True)
+        self.options.setdefault('module_quickdic_enabled', True)
+        self.options.setdefault('display_password_orientation', 'horizontal')
+        self.options.setdefault('display_password_max_length', 22)
+        self.options.setdefault('display_password_empty_text', 'No cracked passwords')
+        self.options.setdefault('display_password_wpa_sec', True)
+        self.options.setdefault('display_password_ohc', True)
+        self.options.setdefault('display_password_handshake_lab', True)
+        self.options.setdefault('display_password_manual', True)
+        self.options.setdefault('display_password_quickdic', True)
+        self.options.setdefault('display_password_horizontal_x', -1)
+        self.options.setdefault('display_password_horizontal_y', -1)
+        self.options.setdefault('display_password_vertical_x', -1)
+        self.options.setdefault('display_password_vertical_y', -1)
+        self.options.setdefault('quickdic_wordlist_folder', '/home/pi/wordlists/')
+        self.options.setdefault('quickdic_recursive', False)
+        self.options.setdefault('quickdic_timeout', 300)
+        self.options.setdefault('quickdic_max_queue', 32)
+        self.options.setdefault('quickdic_face', '(·ω·)')
+        self.options.setdefault('quickdic_update_display', True)
+        self.options.setdefault('quickdic_status_seconds', 12)
+        self.options.setdefault('quickdic_status_template', 'Cracked password: {password}')
+        self.options.setdefault('quickdic_telegram_enabled', False)
+        self.options.setdefault('quickdic_telegram_bot_token', '')
+        self.options.setdefault('quickdic_telegram_chat_id', '')
+        self.options.setdefault('quickdic_telegram_timeout', 15)
+        if self._module_enabled('gps') and self._option_bool('pwndroid_ws_enabled', True):
+            self._start_pwndroid_ws()
         self.ready = True
-        self.quality_scan_running = True
-        if self._option_bool('quality_auto_scan', True):
+        self.quality_scan_running = self._module_enabled('quality')
+        if self.quality_scan_running and self._option_bool('quality_auto_scan', True):
             self._start_quality_scan_thread(scan_all=True)
-        if self._option_bool('ohc_auto_upload', True):
+        if (
+            self._module_enabled('ohc')
+            and self._option_bool('ohc_enabled', True)
+            and self._option_bool('ohc_auto_upload', True)
+        ):
             reconcile = self._option_bool('ohc_reconcile_on_start', False)
             if reconcile:
                 with self.data_lock:
                     self.data['ohc_reconcile_requested'] = True
             self._queue_ohc_files(force=reconcile)
-        self._start_ohc_scheduler()
+            self._start_ohc_scheduler()
+        if self._module_enabled('quickdic'):
+            self._start_quickdic_worker()
 
     def on_ui_setup(self, ui):
         with ui._lock:
-            ui.add_element(self.gps_indicator_name, LabeledValue(
-                color=BLACK,
-                label='G',
-                value='-',
-                position=(ui.width() / 2 - 38, 0),
-                label_font=fonts.Bold,
-                text_font=fonts.Medium
-            ))
+            if self._module_enabled('gps'):
+                ui.add_element(self.gps_indicator_name, LabeledValue(
+                    color=BLACK,
+                    label='G',
+                    value='-',
+                    position=(ui.width() / 2 - 38, 0),
+                    label_font=fonts.Bold,
+                    text_font=fonts.Medium
+                ))
+            if self._module_enabled('display_password'):
+                ui.add_element(self.display_password_element, LabeledValue(
+                    color=BLACK,
+                    label='',
+                    value='',
+                    position=self._display_password_position(ui),
+                    label_font=fonts.Bold,
+                    text_font=getattr(fonts, 'Small', fonts.Medium),
+                ))
 
     def on_ready(self, agent):
         self._agent = agent
@@ -166,10 +233,16 @@ class A_pwmenu(plugins.Plugin):
     def on_ui_update(self, ui):
         if not self.ready:
             return
-        try:
-            ui.set(self.gps_indicator_name, 'C' if self._fresh_live_gps() else '-')
-        except Exception as e:
-            logging.debug(f"[A_pwmenu] GPS indicator update failed: {e}")
+        if self._module_enabled('gps'):
+            try:
+                ui.set(self.gps_indicator_name, 'C' if self._fresh_live_gps() else '-')
+            except Exception as e:
+                logging.debug(f"[A_pwmenu] GPS indicator update failed: {e}")
+        if self._module_enabled('display_password'):
+            try:
+                ui.set(self.display_password_element, self._display_password_text())
+            except Exception as e:
+                logging.debug(f"[A_pwmenu] Password display update failed: {e}")
         if self.ohc_uploading:
             idx = int(time.time()) % len(self.ohc_upload_faces)
             self.ohc_upload_face = self.ohc_upload_faces[idx]
@@ -188,32 +261,48 @@ class A_pwmenu(plugins.Plugin):
                 ui.set('status', self.ohc_display_status[:32])
             except Exception as e:
                 logging.debug(f"[A_pwmenu] OHC display result failed: {e}")
+        elif self.quickdic_display_status and time.time() < self.quickdic_display_until:
+            try:
+                ui.set('face', str(self.options.get('quickdic_face') or '(·ω·)'))
+                ui.set('status', self.quickdic_display_status[:64])
+            except Exception as e:
+                logging.debug(f"[A_pwmenu] QuickDic display result failed: {e}")
         try:
             interval = int(self.options.get('time_sync_interval', 1800))
         except (TypeError, ValueError):
             interval = 1800
 
-        if time.time() - self.last_sync > interval:
+        if self._module_enabled('time_sync') and time.time() - self.last_sync > interval:
             self._start_time_sync_thread()
 
     def on_unload(self, ui):
         self.pwndroid_running = False
         self.ohc_scheduler_running = False
         self.quality_scan_running = False
+        self.quickdic_running = False
         self.ohc_scheduler_wakeup.set()
+        self.quickdic_wakeup.set()
         try:
             with ui._lock:
-                ui.remove_element(self.gps_indicator_name)
+                if self._module_enabled('gps'):
+                    ui.remove_element(self.gps_indicator_name)
+                if self._module_enabled('display_password'):
+                    ui.remove_element(self.display_password_element)
         except Exception:
             pass
 
     def on_internet_available(self, agent):
-        if self.ready and self._option_bool('ohc_auto_upload', True):
+        if (
+            self.ready
+            and self._module_enabled('ohc')
+            and self._option_bool('ohc_enabled', True)
+            and self._option_bool('ohc_auto_upload', True)
+        ):
             self._queue_ohc_files(force=False)
             self._start_ohc_upload_thread()
 
     def on_handshake(self, agent, filename, access_point, client_station):
-        loc = self._fresh_live_gps()
+        loc = self._fresh_live_gps() if self._module_enabled('gps') else None
         if loc:
             try:
                 now = time.time()
@@ -236,14 +325,325 @@ class A_pwmenu(plugins.Plugin):
                 logging.info(f"[A_pwmenu] Saved PwnDroid GPS to {gps_filename}")
             except Exception as e:
                 logging.error(f"[A_pwmenu] Could not save PwnDroid GPS: {e}")
-        if self._option_bool('ohc_auto_upload', True):
+        if (
+            self._module_enabled('ohc')
+            and self._option_bool('ohc_enabled', True)
+            and self._option_bool('ohc_auto_upload', True)
+        ):
             self._queue_ohc_files([os.path.basename(filename)], force=False)
             self._start_ohc_upload_thread()
-        self._start_quality_scan_thread([os.path.basename(filename)])
+        if self._module_enabled('quality'):
+            self._start_quality_scan_thread([os.path.basename(filename)])
+        if self._module_enabled('quickdic'):
+            self._queue_quickdic(agent, filename, access_point)
+
+    def _display_password_position(self, ui):
+        if (
+            getattr(ui, 'is_waveshare_v2', lambda: False)()
+            or getattr(ui, 'is_waveshare_v3', lambda: False)()
+            or getattr(ui, 'is_waveshare_v4', lambda: False)()
+        ):
+            horizontal, vertical = (0, 95), (180, 61)
+        elif getattr(ui, 'is_waveshare_v1', lambda: False)():
+            horizontal, vertical = (0, 95), (170, 61)
+        elif getattr(ui, 'is_waveshare144lcd', lambda: False)():
+            horizontal, vertical = (0, 92), (78, 67)
+        elif getattr(ui, 'is_inky', lambda: False)():
+            horizontal, vertical = (0, 83), (165, 54)
+        elif getattr(ui, 'is_waveshare27inch', lambda: False)():
+            horizontal, vertical = (0, 153), (216, 122)
+        else:
+            horizontal, vertical = (0, 91), (180, 61)
+        orientation = str(
+            self.options.get('display_password_orientation', 'horizontal')
+        ).strip().lower()
+        default = vertical if orientation == 'vertical' else horizontal
+        prefix = 'vertical' if orientation == 'vertical' else 'horizontal'
+        x = self._option_int(f'display_password_{prefix}_x', -1)
+        y = self._option_int(f'display_password_{prefix}_y', -1)
+        return (default[0] if x < 0 else x, default[1] if y < 0 else y)
+
+    def _latest_display_credential(self):
+        sources = []
+        potfiles = []
+        if self._option_bool('display_password_wpa_sec', True):
+            potfiles.extend([
+                '/root/handshakes/wpa-sec.cracked.potfile',
+                '/home/pi/handshakes/wpa-sec.cracked.potfile',
+            ])
+        if self._option_bool('display_password_ohc', True):
+            potfiles.append(self.potfile_ohc)
+        if self._option_bool('display_password_handshake_lab', True):
+            potfiles.append(self.potfile_handshake_lab)
+        if self._option_bool('display_password_manual', True):
+            potfiles.append(self.potfile_manual)
+        for path in dict.fromkeys(potfiles):
+            try:
+                lines, _ = self._read_pot_lines(path)
+                record = next(
+                    (
+                        parsed for parsed in (
+                            self._parse_pot_line(line) for line in reversed(lines)
+                        )
+                        if parsed and parsed.get('password')
+                    ),
+                    None,
+                )
+                if record:
+                    sources.append((
+                        os.path.getmtime(path),
+                        str(record.get('essid') or ''),
+                        str(record.get('password') or ''),
+                    ))
+            except OSError as error:
+                logging.debug(f"[A_pwmenu] Password display could not read {path}: {error}")
+        if self._option_bool('display_password_quickdic', True):
+            for directory in self.handshake_dirs:
+                if not os.path.isdir(directory):
+                    continue
+                for path in glob.glob(os.path.join(directory, '*.pcap.cracked')):
+                    try:
+                        with open(path, 'r', encoding='utf-8', errors='ignore') as handle:
+                            password = handle.read().strip()
+                        if not password:
+                            continue
+                        essid, _ = self._handshake_identity(
+                            os.path.basename(path)[:-len('.cracked')]
+                        )
+                        sources.append((os.path.getmtime(path), essid, password))
+                    except OSError as error:
+                        logging.debug(
+                            f"[A_pwmenu] Password display could not read {path}: {error}"
+                        )
+        return max(sources, default=None, key=lambda item: item[0])
+
+    def _display_password_text(self):
+        latest = self._latest_display_credential()
+        if not latest:
+            return str(
+                self.options.get('display_password_empty_text')
+                or 'No cracked passwords'
+            )
+        _, essid, password = latest
+        max_length = max(8, self._option_int('display_password_max_length', 22))
+        text = f"{essid}:{password}"
+        if len(text) <= max_length:
+            return text
+        available = max_length - len(password) - 2
+        if available > 0:
+            return f"{essid[:available]}.:{password}"
+        password_room = max(1, max_length - 4)
+        return f"{essid[:1]}.:{password[:password_room]}."
+
+    def _start_quickdic_worker(self):
+        if self.quickdic_thread and self.quickdic_thread.is_alive():
+            return
+        self.quickdic_running = True
+        self.quickdic_thread = threading.Thread(
+            target=self._quickdic_worker_loop,
+            daemon=True,
+            name='pwmenu-quickdic',
+        )
+        self.quickdic_thread.start()
+
+    def _queue_quickdic(self, agent, filename, access_point):
+        if not filename or not os.path.isfile(filename):
+            return False
+        maximum = max(1, self._option_int('quickdic_max_queue', 32))
+        with self.quickdic_lock:
+            known = {item[1] for item in self.quickdic_pending}
+            if filename in known or len(self.quickdic_pending) >= maximum:
+                return False
+            self.quickdic_pending.append((agent, filename, access_point))
+        self.quickdic_wakeup.set()
+        return True
+
+    def _quickdic_worker_loop(self):
+        while self.quickdic_running:
+            with self.quickdic_lock:
+                item = self.quickdic_pending.pop(0) if self.quickdic_pending else None
+                if not self.quickdic_pending:
+                    self.quickdic_wakeup.clear()
+            if not item:
+                self.quickdic_wakeup.wait(5)
+                continue
+            try:
+                self._run_quickdic(*item)
+            except Exception as error:
+                logging.error(f"[A_pwmenu] QuickDic worker failed: {error}")
+
+    def _quickdic_access_point_bssid(self, access_point, filename):
+        if isinstance(access_point, dict):
+            for key in ('bssid', 'BSSID', 'mac', 'MAC'):
+                compact = self._compact_bssid(access_point.get(key))
+                if compact:
+                    return compact
+        _, bssid = self._handshake_identity(filename)
+        return bssid
+
+    def _quickdic_wordlists(self):
+        folder = os.path.realpath(
+            str(self.options.get('quickdic_wordlist_folder') or '/home/pi/wordlists/')
+        )
+        recursive = self._option_bool('quickdic_recursive', False)
+        pattern = os.path.join(folder, '**', '*.txt') if recursive else os.path.join(folder, '*.txt')
+        return sorted(
+            path for path in glob.glob(
+                pattern,
+                recursive=recursive,
+            )
+            if os.path.isfile(path)
+        )
+
+    def _run_quickdic(self, agent, filename, access_point):
+        executable = shutil.which('aircrack-ng')
+        if not executable and os.path.isfile('/usr/bin/aircrack-ng'):
+            executable = '/usr/bin/aircrack-ng'
+        if not executable:
+            logging.warning("[A_pwmenu] QuickDic disabled at runtime: aircrack-ng is unavailable")
+            return False
+        bssid = self._quickdic_access_point_bssid(access_point, filename)
+        essid, filename_bssid = self._handshake_identity(filename)
+        bssid = bssid or filename_bssid
+        if not bssid:
+            check = subprocess.run(
+                [executable, filename],
+                check=False,
+                capture_output=True,
+                text=True,
+                errors='replace',
+                timeout=min(60, self._option_int('quickdic_timeout', 300)),
+            )
+            match = re.search(
+                r'((?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}).*?\b1\s+handshake\b',
+                check.stdout or '',
+                re.IGNORECASE,
+            )
+            bssid = self._compact_bssid(match.group(1)) if match else ''
+        if not bssid:
+            logging.info(f"[A_pwmenu] QuickDic skipped {os.path.basename(filename)}: no complete handshake")
+            return False
+
+        cracked = self._get_cracked_data()
+        passwords, exact_essid = self._known_passwords_for_capture(
+            cracked, essid, bssid
+        )
+        if passwords:
+            verified, changed = self._verify_capture_passwords(
+                filename,
+                exact_essid,
+                bssid,
+                passwords,
+                self._credential_source_revision(),
+            )
+            if changed:
+                self._save_data()
+            if verified:
+                logging.info(
+                    f"[A_pwmenu] QuickDic skipped {os.path.basename(filename)}: known password verified"
+                )
+                return True
+
+        wordlists = self._quickdic_wordlists()
+        if not wordlists:
+            logging.warning("[A_pwmenu] QuickDic has no .txt wordlists")
+            return False
+        output_path = filename + '.cracked'
+        try:
+            os.remove(output_path)
+        except FileNotFoundError:
+            pass
+        result = subprocess.run(
+            [
+                executable,
+                '-w', ','.join(wordlists),
+                '-l', output_path,
+                '-q',
+                '-b', self._colon_bssid(bssid),
+                filename,
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            errors='replace',
+            timeout=self._option_int('quickdic_timeout', 300),
+        )
+        output = (result.stdout or '') + '\n' + (result.stderr or '')
+        if not re.search(r'\bKEY\s+FOUND!?\s*(?:\[|$)', output, re.IGNORECASE):
+            logging.info(f"[A_pwmenu] QuickDic exhausted {os.path.basename(filename)}")
+            return False
+        try:
+            with open(output_path, 'r', encoding='utf-8', errors='ignore') as handle:
+                password = handle.read().strip()
+        except OSError:
+            password = ''
+        if not password:
+            match = re.search(r'\bKEY\s+FOUND!?\s*\[(.*?)\]', output, re.IGNORECASE)
+            password = match.group(1).strip() if match else ''
+        if not password:
+            logging.warning("[A_pwmenu] QuickDic found a key but could not read it")
+            return False
+
+        with self.data_lock:
+            self.data.setdefault('capture_password_checks', {}).pop(
+                os.path.basename(filename), None
+            )
+        self._save_data()
+        template = str(
+            self.options.get('quickdic_status_template')
+            or 'Cracked password: {password}'
+        )
+        try:
+            status = template.format(essid=exact_essid or essid, password=password)
+        except (KeyError, ValueError):
+            status = f"Cracked password: {password}"
+        if self._option_bool('quickdic_update_display', True):
+            self.quickdic_display_status = status
+            self.quickdic_display_until = time.time() + max(
+                1, self._option_int('quickdic_status_seconds', 12)
+            )
+            try:
+                view = agent.view()
+                view.set('face', str(self.options.get('quickdic_face') or '(·ω·)'))
+                view.set('status', status[:64])
+                view.update(force=True)
+            except Exception as error:
+                logging.debug(f"[A_pwmenu] QuickDic display update failed: {error}")
+        if self._option_bool('quickdic_telegram_enabled', False):
+            self._quickdic_send_telegram(exact_essid or essid, password)
+        try:
+            plugins.on('cracked', access_point, password)
+        except Exception as error:
+            logging.debug(f"[A_pwmenu] QuickDic cracked event failed: {error}")
+        logging.info(f"[A_pwmenu] QuickDic recovered {exact_essid or essid}")
+        return True
+
+    def _quickdic_send_telegram(self, essid, password):
+        token = str(self.options.get('quickdic_telegram_bot_token') or '').strip()
+        chat_id = str(self.options.get('quickdic_telegram_chat_id') or '').strip()
+        if not token or not chat_id:
+            logging.warning("[A_pwmenu] QuickDic Telegram is enabled but credentials are missing")
+            return False
+        try:
+            response = requests.post(
+                f"https://api.telegram.org/bot{token}/sendMessage",
+                data={
+                    'chat_id': chat_id,
+                    'text': f"Pwnagotchi cracked {essid}: {password}",
+                },
+                timeout=self._option_int('quickdic_telegram_timeout', 15),
+            )
+            response.raise_for_status()
+            return True
+        except requests.RequestException as error:
+            logging.warning(f"[A_pwmenu] QuickDic Telegram send failed: {error}")
+            return False
 
     def on_webhook(self, path, request):
         if not self.ready:
             return "Loading..."
+        if not self._module_enabled('web'):
+            return make_response("PWMenu web module is disabled", 404)
         if path is None:
             path = '/'
 
@@ -253,13 +653,19 @@ class A_pwmenu(plugins.Plugin):
                     essid = request.form.get('essid')
                     pwd = request.form.get('password')
                     source = request.form.get('source')
-                    if self._delete_password(essid, pwd, source):
+                    bssid = request.form.get('bssid')
+                    if self._delete_password(essid, pwd, source, bssid):
                         return self._render_page(notification="Password deleted", notif_type="success")
                     else:
                         return self._render_page(notification="Could not delete password (readonly source?)", notif_type="error")
 
                 if path == 'update-password':
-                    self._update_password(request.form.get('essid'), request.form.get('password'))
+                    self._update_password(
+                        request.form.get('essid'),
+                        request.form.get('password'),
+                        request.form.get('bssid'),
+                        request.form.get('old_password'),
+                    )
                     return self._render_page(notification="Password updated", notif_type="success")
 
                 if path == 'delete-file':
@@ -277,13 +683,22 @@ class A_pwmenu(plugins.Plugin):
                     )
 
                 if path == 'whitelist-add':
+                    if not self._module_enabled('whitelist'):
+                        return self._render_page(notification="Whitelist module is disabled", notif_type="error")
                     name = request.form.get('network') or ''
-                    changed, message = self._add_to_whitelist(name)
+                    changed, message = self._add_to_whitelist(
+                        name,
+                        request.form.get('bssid') or '',
+                    )
                     requested_tab = request.form.get('return_tab') or 'other'
                     active_tab = requested_tab if requested_tab in ('handshakes', 'map', 'other') else 'other'
                     return self._whitelist_action_response(request, changed, message, active_tab)
 
                 if path == 'whitelist-add-excellent':
+                    if not self._module_enabled('whitelist'):
+                        return self._whitelist_action_response(
+                            request, False, "Whitelist module is disabled", 'map'
+                        )
                     try:
                         names = json.loads(request.form.get('networks') or '[]')
                         if not isinstance(names, list):
@@ -294,24 +709,36 @@ class A_pwmenu(plugins.Plugin):
                     return self._whitelist_action_response(request, changed, message, 'map')
 
                 if path == 'whitelist-remove':
+                    if not self._module_enabled('whitelist'):
+                        return self._whitelist_action_response(
+                            request, False, "Whitelist module is disabled", 'other'
+                        )
                     changed, message = self._remove_from_whitelist(request.form.get('network') or '')
                     requested_tab = request.form.get('return_tab') or 'other'
                     active_tab = requested_tab if requested_tab in ('handshakes', 'map', 'other') else 'other'
                     return self._whitelist_action_response(request, changed, message, active_tab)
 
                 if path == 'wpa-sec-upload':
+                    if not self._module_enabled('wpa_sec'):
+                        return self._render_page(notification="WPA-sec module is disabled", notif_type="error")
                     res, is_err = self._handle_wpa_upload(request)
                     return self._render_page(notification=res, notif_type="error" if is_err else "success", active_tab="handshakes")
 
                 if path == 'wpa-sec-upload-cluster':
+                    if not self._module_enabled('wpa_sec'):
+                        return self._action_response(request, "WPA-sec module is disabled", True, 'map')
                     res, is_err = self._handle_wpa_cluster_upload(request)
                     return self._action_response(request, res, is_err, 'map')
 
                 if path == 'ohc-upload-cluster':
+                    if not self._module_enabled('ohc'):
+                        return self._action_response(request, "OHC module is disabled", True, 'map')
                     res, is_err = self._handle_ohc_cluster_upload(request)
                     return self._action_response(request, res, is_err, 'map')
 
                 if path == 'ohc-upload-all-missing':
+                    if not self._module_enabled('ohc'):
+                        return self._render_page(notification="OHC module is disabled", notif_type="error")
                     res, is_err = self._handle_ohc_all_missing()
                     return self._render_page(notification=res, notif_type="error" if is_err else "success", active_tab="handshakes")
 
@@ -320,12 +747,18 @@ class A_pwmenu(plugins.Plugin):
                     return self._render_page(notification="Password added", notif_type="success")
 
                 if path == 'phone-gps':
+                    if not self._module_enabled('gps'):
+                        resp = make_response(json.dumps({'ok': False, 'message': 'GPS module disabled'}))
+                        resp.headers['Content-Type'] = 'application/json'
+                        return resp
                     ok, msg = self._update_phone_gps(request)
                     resp = make_response(json.dumps({'ok': ok, 'message': msg}))
                     resp.headers['Content-Type'] = 'application/json'
                     return resp
 
                 if path == 'sync-time':
+                    if not self._module_enabled('time_sync'):
+                        return self._render_page(notification="Time sync module is disabled", notif_type="error", active_tab='other')
                     if self._sync_time_now():
                         return self._render_page(notification="Time synchronized!", notif_type="success", active_tab='other')
                     else:
@@ -349,6 +782,8 @@ class A_pwmenu(plugins.Plugin):
                         )
                         if report['invalid']:
                             message += f", {report['invalid']} invalid"
+                        if report.get('source'):
+                            message += f", source {report['source']}"
                         if report.get('ohc_tasks'):
                             message += f", OHC snapshot {report['ohc_tasks']} task(s)"
                         return self._render_page(notification=message, notif_type="success", active_tab='other')
@@ -420,7 +855,7 @@ class A_pwmenu(plugins.Plugin):
         ohc_status = self._ohc_status()
         pot_health = self._potfile_health(self.potfile_ohc)
         cleanup_report = self._capture_cleanup_report()
-        whitelist = self._get_whitelist()
+        whitelist = self._get_whitelist() if self._module_enabled('whitelist') else []
         ach = self._update_achievements(groups, cracked)
 
         t_nets = len(groups)
@@ -438,7 +873,9 @@ class A_pwmenu(plugins.Plugin):
         }
 
         tok = generate_csrf() if generate_csrf else ""
-        show_wpa = bool(self.options.get('wpa_sec_key'))
+        show_wpa = bool(
+            self._module_enabled('wpa_sec') and self.options.get('wpa_sec_key')
+        )
 
         html = render_template_string(self._get_html(),
             groups=groups, cracked=cracked, notif=notification, ntype=notif_type,
@@ -594,7 +1031,7 @@ class A_pwmenu(plugins.Plugin):
         return f"OHC upload started for {queued} file(s)", False
 
     def _handle_ohc_all_missing(self):
-        if not self._option_bool('ohc_enabled', True):
+        if not self._module_enabled('ohc') or not self._option_bool('ohc_enabled', True):
             return "OHC disabled", True
         if not self._ohc_key():
             return "OHC API key missing", True
@@ -690,10 +1127,23 @@ class A_pwmenu(plugins.Plugin):
         if '_' not in name:
             return name, ''
         essid, raw_bssid = name.rsplit('_', 1)
-        bssid = re.sub(r'[^0-9a-f]', '', raw_bssid.lower())
+        bssid = self._compact_bssid(raw_bssid)
         if len(bssid) != 12:
             return name, ''
         return essid, bssid
+
+    def _compact_bssid(self, value):
+        compact = re.sub(r'[^0-9a-f]', '', str(value or '').lower())
+        return compact if len(compact) == 12 else ''
+
+    def _colon_bssid(self, value):
+        compact = self._compact_bssid(value)
+        if not compact:
+            return ''
+        return ':'.join(compact[index:index + 2] for index in range(0, 12, 2))
+
+    def _normalized_essid_key(self, value):
+        return re.sub(r'[\W_]+', '', str(value or ''), flags=re.UNICODE).casefold()
 
     def _quality_metric(self, report, label):
         match = re.search(rf'^{re.escape(label)}\.*:\s*(\d+)', report, re.MULTILINE | re.IGNORECASE)
@@ -814,6 +1264,23 @@ class A_pwmenu(plugins.Plugin):
                         hashes = list(dict.fromkeys(line.strip() for line in handle if line.strip()))
                 report = (result.stdout or '') + '\n' + (result.stderr or '')
                 quality = self._classify_capture_quality(report, hashes, file_size)
+                capture_essid, capture_bssid = self._handshake_identity(path)
+                hash_networks = [
+                    self._wpa_hash_network(hash_line)
+                    for hash_line in hashes
+                ]
+                hash_networks = [network for network in hash_networks if network[0]]
+                exact = next(
+                    (
+                        network for network in hash_networks
+                        if capture_bssid and network[1] == capture_bssid
+                    ),
+                    hash_networks[0] if len(hash_networks) == 1 else None,
+                )
+                if exact:
+                    quality['essid'], quality['bssid'] = exact
+                elif capture_essid:
+                    quality['essid'], quality['bssid'] = capture_essid, capture_bssid
                 return hashes, self._store_capture_quality(path, quality)
         except Exception as e:
             logging.error(f"[A_pwmenu] Capture analysis failed for {path}: {e}")
@@ -879,6 +1346,7 @@ class A_pwmenu(plugins.Plugin):
         self.data.setdefault('ohc_files', {}).pop(name, None)
         self.data.setdefault('ohc_found_files', {}).pop(name, None)
         self.data.setdefault('capture_quality', {}).pop(name, None)
+        self.data.setdefault('capture_password_checks', {}).pop(name, None)
         self.data.setdefault('ohc_pending_files', {}).pop(path, None)
         self.data.setdefault('ohc_file_signatures', {}).pop(path, None)
         hash_files = self.data.setdefault('ohc_hash_files', {})
@@ -1000,7 +1468,7 @@ class A_pwmenu(plugins.Plugin):
                         path = value
                 if not path:
                     path = self._find_handshake_path(name)
-                if path and self._essid_from_filename(name) not in cracked and path not in paths:
+                if path and not self._is_locally_cracked(name, cracked) and path not in paths:
                     paths.append(path)
             return paths
 
@@ -1008,7 +1476,7 @@ class A_pwmenu(plugins.Plugin):
             if not os.path.exists(directory):
                 continue
             for path in glob.glob(os.path.join(directory, '*.pcap')):
-                if self._essid_from_filename(os.path.basename(path)) not in cracked and path not in paths:
+                if not self._is_locally_cracked(os.path.basename(path), cracked) and path not in paths:
                     paths.append(path)
         return paths
 
@@ -1048,7 +1516,7 @@ class A_pwmenu(plugins.Plugin):
         paths = []
         changed = False
         for path, record in pending.items():
-            if self._essid_from_filename(os.path.basename(path)) in cracked:
+            if self._is_locally_cracked(os.path.basename(path), cracked):
                 with self.data_lock:
                     self.data.setdefault('ohc_pending_files', {}).pop(path, None)
                 self._ohc_mark_path(path, 'local_cracked', 'Password already known locally')
@@ -1104,7 +1572,7 @@ class A_pwmenu(plugins.Plugin):
             self.ohc_scheduler_wakeup.clear()
 
     def _start_ohc_upload_thread(self, filenames=None):
-        if not self._option_bool('ohc_enabled', True):
+        if not self._module_enabled('ohc') or not self._option_bool('ohc_enabled', True):
             return
         if filenames:
             self._queue_ohc_files(filenames, force=True)
@@ -1152,7 +1620,7 @@ class A_pwmenu(plugins.Plugin):
                 self.ohc_scheduler_wakeup.set()
 
     def _ohc_upload_files(self, filenames=None, manual=False):
-        if not self._option_bool('ohc_enabled', True):
+        if not self._module_enabled('ohc') or not self._option_bool('ohc_enabled', True):
             return "OHC disabled", True
         key = self._ohc_key()
         if not key:
@@ -1614,6 +2082,7 @@ class A_pwmenu(plugins.Plugin):
             'ohc_file_signatures': {},
             'ohc_reconcile_requested': False,
             'capture_quality': {},
+            'capture_password_checks': {},
             'replacement_history': [],
             'empty_cleanup_history': []
         }
@@ -1647,6 +2116,8 @@ class A_pwmenu(plugins.Plugin):
             self.data['ohc_file_signatures'] = {}
         if not isinstance(self.data.get('capture_quality'), dict):
             self.data['capture_quality'] = {}
+        if not isinstance(self.data.get('capture_password_checks'), dict):
+            self.data['capture_password_checks'] = {}
         if not isinstance(self.data.get('replacement_history'), list):
             self.data['replacement_history'] = []
         if not isinstance(self.data.get('empty_cleanup_history'), list):
@@ -1975,7 +2446,10 @@ class A_pwmenu(plugins.Plugin):
             pending = len(self.data.get('ohc_pending_files', {}) or {})
         retry_in = max(0, int(self._ohc_retry_at() - time.time()))
         return {
-            'enabled': self._option_bool('ohc_enabled', True),
+            'enabled': (
+                self._module_enabled('ohc')
+                and self._option_bool('ohc_enabled', True)
+            ),
             'uploading': self.ohc_uploading,
             'face': self.ohc_upload_face if self.ohc_uploading else '0__0',
             'last': self.ohc_last_result,
@@ -2382,7 +2856,7 @@ class A_pwmenu(plugins.Plugin):
         return {'level': lvl, 'rank': rank, 'xp': xp, 'next_xp': next_xp, 'lvl_percent': lvl_p, 'badges': my_badges}
 
     def _add_manual_password(self, essid, bssid, pwd):
-        m = bssid if bssid and len(bssid)==17 else "00:00:00:00:00:00"
+        m = self._colon_bssid(bssid) or "00:00:00:00:00:00"
         try:
             with self.potfile_lock:
                 self._normalize_potfile(self.potfile_manual)
@@ -2399,28 +2873,34 @@ class A_pwmenu(plugins.Plugin):
         except OSError as e:
             logging.error(f"[A_pwmenu] Could not add manual password: {e}")
 
-    def _delete_password(self, essid, pwd=None, source=None):
+    def _delete_password(self, essid, pwd=None, source=None, bssid=None):
         deleted = False
+        compact_bssid = self._compact_bssid(bssid)
 
-        if os.path.exists(self.potfile_manual):
-            original, _ = self._read_pot_lines(self.potfile_manual)
-            lines = [line for line in original if f":{essid}:" not in line]
+        def keep(line):
+            record = self._parse_pot_line(line)
+            if not record:
+                return True
+            identity_matches = (
+                self._compact_bssid(record.get('bssid')) == compact_bssid
+                if compact_bssid else record.get('essid') == essid
+            )
+            password_matches = not pwd or record.get('password') == pwd
+            return not (identity_matches and password_matches)
+
+        for path in (self.potfile_manual, self.potfile_ohc, self.potfile_handshake_lab):
+            if not os.path.exists(path):
+                continue
+            original, _ = self._read_pot_lines(path)
+            lines = [line for line in original if keep(line)]
             deleted = deleted or len(lines) != len(original)
             if len(lines) != len(original):
-                self._write_pot_lines(self.potfile_manual, lines)
-
-        if os.path.exists(self.potfile_ohc):
-            original, _ = self._read_pot_lines(self.potfile_ohc)
-            lines = [line for line in original if f":{essid}:" not in line]
-            deleted = deleted or len(lines) != len(original)
-            if len(lines) != len(original):
-                self._write_pot_lines(self.potfile_ohc, lines)
-
+                self._write_pot_lines(path, lines)
         return deleted
 
-    def _update_password(self, essid, pwd):
-        self._delete_password(essid)
-        self._add_manual_password(essid, "", pwd)
+    def _update_password(self, essid, pwd, bssid=None, old_password=None):
+        self._delete_password(essid, old_password, None, bssid)
+        self._add_manual_password(essid, bssid, pwd)
 
     def _delete_specific_file(self, fname):
         name = self._safe_handshake_name(fname)
@@ -2549,6 +3029,89 @@ class A_pwmenu(plugins.Plugin):
         except (AttributeError, TypeError) as error:
             logging.warning(f"[A_pwmenu] Could not update runtime whitelist: {error}")
 
+    def _repair_whitelist_aliases(self):
+        """Replace punctuation-stripped aliases only when one exact recovered SSID is known."""
+        try:
+            current = self._get_whitelist()
+            if not current:
+                return 0
+            canonical = {}
+            exact_names = set()
+            for record in self._get_cracked_data().values():
+                essid = str(record.get('essid') or '').strip()
+                if essid:
+                    exact_names.add(essid)
+            identities, _, _ = self._load_ohc_export_snapshot()
+            for identity in identities:
+                if '|' in identity:
+                    essid = identity.split('|', 1)[1].strip()
+                    if essid:
+                        exact_names.add(essid)
+            with self.data_lock:
+                quality_records = list(
+                    getattr(self, 'data', {}).get('capture_quality', {}).values()
+                )
+            for record in quality_records:
+                essid = str((record or {}).get('essid') or '').strip()
+                if essid:
+                    exact_names.add(essid)
+            for essid in exact_names:
+                key = self._normalized_essid_key(essid)
+                if essid and key:
+                    canonical.setdefault(key, set()).add(essid)
+            repaired = []
+            changed = 0
+            for name in current:
+                candidates = canonical.get(self._normalized_essid_key(name), set())
+                replacement = next(iter(candidates)) if len(candidates) == 1 else name
+                changed += int(replacement != name)
+                if replacement not in repaired:
+                    repaired.append(replacement)
+                elif replacement == name:
+                    changed += 1
+            repaired = sorted(repaired, key=str.casefold)
+            if repaired != current:
+                self._write_whitelist_config(repaired)
+                self._set_runtime_whitelist(repaired)
+                logging.info(
+                    f"[A_pwmenu] Repaired {changed} punctuation-stripped whitelist alias(es)"
+                )
+            return changed
+        except (OSError, ValueError, TypeError) as error:
+            logging.warning(f"[A_pwmenu] Could not repair whitelist aliases: {error}")
+            return 0
+
+    def _canonical_whitelist_name(self, name, bssid):
+        value = self._validate_whitelist_name(name)
+        compact_bssid = self._compact_bssid(bssid)
+        if not compact_bssid:
+            return value, False
+
+        cracked = self._get_cracked_data()
+        matches = [
+            record for record in cracked.values()
+            if self._compact_bssid(record.get('bssid')) == compact_bssid
+            and str(record.get('essid') or '').strip()
+        ]
+        if matches:
+            return self._validate_whitelist_name(matches[-1]['essid']), True
+
+        for directory in self.handshake_dirs:
+            if not os.path.isdir(directory):
+                continue
+            for path in glob.glob(os.path.join(directory, '*.pcap')):
+                _, file_bssid = self._handshake_identity(path)
+                if file_bssid != compact_bssid:
+                    continue
+                quality = self._quality_file_record(os.path.basename(path), path)
+                if not quality.get('essid'):
+                    _, quality = self._run_capture_analysis(path)
+                exact = str(quality.get('essid') or '').strip()
+                quality_bssid = self._compact_bssid(quality.get('bssid'))
+                if exact and (not quality_bssid or quality_bssid == compact_bssid):
+                    return self._validate_whitelist_name(exact), True
+        return value, False
+
     def _validate_whitelist_name(self, name):
         value = str(name or '').strip()
         if not value:
@@ -2559,15 +3122,24 @@ class A_pwmenu(plugins.Plugin):
             raise ValueError('Network name contains unsupported characters')
         return value
 
-    def _add_to_whitelist(self, name):
+    def _add_to_whitelist(self, name, bssid=''):
         try:
-            value = self._validate_whitelist_name(name)
+            value, resolved = self._canonical_whitelist_name(name, bssid)
             with self.whitelist_lock:
                 names = self._get_whitelist()
+                original = list(names)
+                if resolved:
+                    key = self._normalized_essid_key(value)
+                    names = [
+                        item for item in names
+                        if self._normalized_essid_key(item) != key
+                    ]
                 if value in names:
                     return False, f"{value} is already in the whitelist"
                 names.append(value)
                 names = sorted(dict.fromkeys(names), key=str.casefold)
+                if names == original:
+                    return False, f"{value} is already in the whitelist"
                 self._write_whitelist_config(names)
                 self._set_runtime_whitelist(names)
             logging.info(f"[A_pwmenu] Added network to whitelist: {value}")
@@ -2760,7 +3332,8 @@ class A_pwmenu(plugins.Plugin):
             'duplicates': 0,
             'ignored': 0,
             'invalid': 0,
-            'ohc_tasks': 0
+            'ohc_tasks': 0,
+            'source': ''
         }
 
     def _ohc_export_tasks_from_json(self, data):
@@ -2786,18 +3359,24 @@ class A_pwmenu(plugins.Plugin):
         return f"{bssid}|{essid}", bssid
 
     def _ohc_hash_task_identity(self, hash_line):
-        parts = str(hash_line or '').strip().lstrip('$').split('*')
-        if len(parts) < 6 or parts[0] != 'WPA' or parts[1] not in ('01', '02'):
-            return None, None
-        mac = parts[3].lower()
-        if not re.fullmatch(r'[0-9a-f]{12}', mac):
+        essid, mac = self._wpa_hash_network(hash_line)
+        if not mac:
             return None, None
         bssid = ':'.join(mac[i:i + 2] for i in range(0, 12, 2))
+        return f"{bssid}|{essid}", bssid
+
+    def _wpa_hash_network(self, hash_line):
+        parts = str(hash_line or '').strip().lstrip('$').split('*')
+        if len(parts) < 6 or parts[0] != 'WPA' or parts[1] not in ('01', '02'):
+            return '', ''
+        mac = parts[3].lower()
+        if not re.fullmatch(r'[0-9a-f]{12}', mac):
+            return '', ''
         try:
             essid = bytes.fromhex(parts[5]).decode('utf-8', errors='replace').strip()
         except (TypeError, ValueError):
             essid = ''
-        return f"{bssid}|{essid}", bssid
+        return essid, mac
 
     def _ohc_hash_in_export(self, hash_line, identities, bssids):
         identity, bssid = self._ohc_hash_task_identity(hash_line)
@@ -2911,29 +3490,63 @@ class A_pwmenu(plugins.Plugin):
     def _imp_csv(self, txt):
         report = self._new_import_report()
         entries = []
+        handshake_lab_entries = []
         try:
             reader = csv.DictReader(io.StringIO(txt))
             for row in reader:
                 status = row.get('status') or row.get('Status')
                 password = row.get('password') or row.get('Password')
                 task = row.get('task') or row.get('Task') or row.get('SSID')
-                if status != 'FOUND':
+                if str(status or '').upper() != 'FOUND':
                     report['ignored'] += 1
                     continue
-                line = self._fmt_task(task, password)
+                is_handshake_lab = self._is_handshake_lab_row(row)
+                line = self._fmt_structured_task(row, password) if is_handshake_lab else None
+                if not line:
+                    line = self._fmt_task(task, password)
                 if line:
-                    entries.append(line)
+                    if is_handshake_lab:
+                        handshake_lab_entries.append(line)
+                        report['source'] = 'Handshake Lab'
+                    else:
+                        entries.append(line)
                 else:
                     report['invalid'] += 1
         except (csv.Error, OSError, TypeError, ValueError) as e:
             logging.error(f"[A_pwmenu] CSV import failed: {e}")
             raise ValueError(f"CSV import failed: {e}")
-        return self._merge_import_lines(entries, report)
+        self._merge_import_lines(entries, report, self.potfile_ohc)
+        self._merge_import_lines(
+            handshake_lab_entries,
+            report,
+            self.potfile_handshake_lab,
+        )
+        return report
+
+    def _is_handshake_lab_row(self, row):
+        source = str(row.get('source') or row.get('Source') or '')
+        version = str(row.get('format_version') or row.get('Format Version') or '')
+        return (
+            'handshake lab' in source.casefold()
+            or version.casefold().startswith('newfpv-handshake-lab-results-')
+        )
+
+    def _fmt_structured_task(self, row, password):
+        essid = row.get('essid')
+        if essid is None:
+            essid = row.get('ESSID')
+        bssid = row.get('bssid')
+        if bssid is None:
+            bssid = row.get('BSSID')
+        mac = self._colon_bssid(bssid)
+        if essid is None or not mac or not password:
+            return None
+        return f"{mac}:{mac}:{str(essid)}:{str(password)}"
 
     def _fmt_task(self, task, password):
         if not task or not password:
             return None
-        clean_task = re.sub(r'<[^>]+>', '', str(task)).strip()
+        clean_task = html.unescape(re.sub(r'<[^>]+>', '', str(task))).replace('\xa0', ' ').strip()
         return self._fmt(clean_task, str(password))
 
     def _fmt(self, t, p):
@@ -2963,6 +3576,15 @@ class A_pwmenu(plugins.Plugin):
         if record:
             return record['bssid'], record['essid'], record['password']
         return 'raw', line
+
+    def _credential_key(self, line):
+        record = self._parse_pot_line(line)
+        if not record:
+            return 'raw', line
+        bssid = self._compact_bssid(record.get('bssid'))
+        if bssid and bssid != '000000000000':
+            return 'bssid', bssid, record['password']
+        return 'essid', self._normalized_essid_key(record.get('essid')), record['password']
 
     def _read_pot_lines(self, path):
         if not os.path.exists(path):
@@ -3058,15 +3680,19 @@ class A_pwmenu(plugins.Plugin):
                 'invalid': 0, 'nul_bytes': 0, 'bytes': 0, 'error': str(e)
             }
 
-    def _merge_import_lines(self, entries, report):
+    def _merge_import_lines(self, entries, report, destination=None):
+        destination = destination or self.potfile_ohc
+        if not entries:
+            return report
         with self.potfile_lock:
-            self._normalize_potfile(self.potfile_ohc)
-            existing_lines, _ = self._read_pot_lines(self.potfile_ohc)
-            existing_lines, existing_keys, _ = self._dedupe_pot_lines(existing_lines)
+            self._normalize_potfile(destination)
+            existing_lines, _ = self._read_pot_lines(destination)
+            existing_lines, _, _ = self._dedupe_pot_lines(existing_lines)
+            existing_keys = {self._credential_key(line) for line in existing_lines}
             input_keys = set()
             additions = []
             for line in entries:
-                key = self._pot_line_key(line)
+                key = self._credential_key(line)
                 if key in input_keys:
                     report['duplicates'] += 1
                     continue
@@ -3077,8 +3703,8 @@ class A_pwmenu(plugins.Plugin):
                 existing_keys.add(key)
                 additions.append(line)
             if additions:
-                self._write_pot_lines(self.potfile_ohc, existing_lines + additions)
-        report['added'] = len(additions)
+                self._write_pot_lines(destination, existing_lines + additions)
+        report['added'] += len(additions)
         return report
 
     def _read_pot(self, p):
@@ -3108,45 +3734,160 @@ class A_pwmenu(plugins.Plugin):
         m.seek(0)
         return send_file(m, mimetype='application/zip', as_attachment=True, download_name='uncracked-handshakes.zip')
 
-    def _known_cracked_ap_identities(self):
-        """Return exact (ESSID, BSSID) identities with a locally known password."""
-        identities = set()
-        potfiles = [
+    def _credential_source_revision(self):
+        """Fingerprint credential files by metadata without persisting password hashes."""
+        paths = [
+            self.potfile_ohc,
+            self.potfile_handshake_lab,
+            self.potfile_manual,
             '/root/handshakes/wpa-sec.cracked.potfile',
             '/home/pi/handshakes/wpa-sec.cracked.potfile',
-            self.potfile_ohc,
-            self.potfile_manual,
         ]
-        for path in potfiles:
-            if not os.path.exists(path):
-                continue
-            try:
-                lines, _ = self._read_pot_lines(path)
-                for line in lines:
-                    record = self._parse_pot_line(line)
-                    if not record or not record.get('password'):
-                        continue
-                    bssid = re.sub(r'[^0-9a-f]', '', record.get('bssid', '').lower())
-                    if len(bssid) == 12:
-                        identities.add((record.get('essid', ''), bssid))
-            except OSError as error:
-                logging.warning(f"[A_pwmenu] Could not read cracked identities from {path}: {error}")
-
         for directory in self.handshake_dirs:
-            if not os.path.exists(directory):
+            paths.extend(glob.glob(os.path.join(directory, '*.pcap.cracked')))
+        metadata = []
+        for path in sorted(set(paths)):
+            try:
+                stat = os.stat(path)
+                metadata.append(
+                    f"{os.path.realpath(path)}:{stat.st_mtime_ns}:{stat.st_size}"
+                )
+            except OSError:
                 continue
-            for result_path in glob.glob(os.path.join(directory, '*.pcap.cracked')):
+        return hashlib.sha256('\n'.join(metadata).encode('utf-8')).hexdigest()
+
+    def _known_passwords_for_capture(self, cracked, essid, bssid):
+        compact_bssid = self._compact_bssid(bssid)
+        matches = []
+        if compact_bssid:
+            matches = [
+                record for record in cracked.values()
+                if self._compact_bssid(record.get('bssid')) == compact_bssid
+            ]
+        else:
+            normalized = self._normalized_essid_key(essid)
+            matches = [
+                record for record in cracked.values()
+                if (
+                    not self._compact_bssid(record.get('bssid'))
+                    and self._normalized_essid_key(record.get('essid')) == normalized
+                )
+            ]
+        passwords = []
+        for record in matches:
+            password = str(record.get('password') or '')
+            if (
+                password
+                and '\x00' not in password
+                and '\r' not in password
+                and '\n' not in password
+                and password not in passwords
+            ):
+                passwords.append(password)
+        exact_essid = next(
+            (
+                str(record.get('essid') or '').strip()
+                for record in reversed(matches)
+                if str(record.get('essid') or '').strip()
+            ),
+            essid,
+        )
+        return passwords, exact_essid
+
+    def _capture_is_crackable(self, path):
+        name = os.path.basename(path)
+        quality = self._quality_file_record(name, path)
+        if not quality:
+            hashes, quality = self._run_capture_analysis(path)
+            return bool(hashes)
+        try:
+            return int(quality.get('hashes', 0) or 0) > 0
+        except (TypeError, ValueError):
+            return False
+
+    def _verify_capture_passwords(self, path, essid, bssid, passwords, credential_revision):
+        """Return (verified, cache_changed) after an aircrack-ng dictionary check."""
+        if not passwords:
+            return False, False
+        name = os.path.basename(path)
+        capture_signature = self._ohc_file_signature(path)
+        with self.data_lock:
+            cached = dict(
+                self.data.setdefault('capture_password_checks', {}).get(name, {}) or {}
+            )
+        if (
+            cached.get('capture_signature') == capture_signature
+            and cached.get('credential_revision') == credential_revision
+            and cached.get('tool') == 'aircrack-ng'
+        ):
+            return bool(cached.get('verified')), False
+
+        executable = shutil.which('aircrack-ng')
+        if not executable and os.path.isfile('/usr/bin/aircrack-ng'):
+            executable = '/usr/bin/aircrack-ng'
+        if not executable:
+            logging.warning(
+                f"[A_pwmenu] Cannot verify known password for {name}: aircrack-ng is unavailable"
+            )
+            return False, False
+
+        wordlist_path = None
+        try:
+            fd, wordlist_path = tempfile.mkstemp(prefix='pwmenu-known-', suffix='.txt')
+            try:
+                os.chmod(wordlist_path, 0o600)
+            except OSError:
+                pass
+            with os.fdopen(fd, 'w', encoding='utf-8', newline='\n') as handle:
+                handle.write('\n'.join(passwords) + '\n')
+                handle.flush()
+                os.fsync(handle.fileno())
+
+            compact_bssid = self._compact_bssid(bssid)
+            selector = (
+                ['-b', self._colon_bssid(compact_bssid)]
+                if compact_bssid
+                else ['-e', str(essid or '')]
+            )
+            result = subprocess.run(
+                [executable, '-q', *selector, '-w', wordlist_path, path],
+                check=False,
+                capture_output=True,
+                text=True,
+                errors='replace',
+                timeout=self._option_int('password_verify_timeout', 45),
+            )
+            output = (result.stdout or '') + '\n' + (result.stderr or '')
+            verified = bool(re.search(r'\bKEY\s+FOUND!?\s*(?:\[|$)', output, re.IGNORECASE))
+            conclusive = verified or bool(
+                re.search(r'\bKEY\s+NOT\s+FOUND\b', output, re.IGNORECASE)
+            )
+            if not conclusive:
+                logging.warning(
+                    f"[A_pwmenu] aircrack-ng could not conclusively verify {name}; keeping it exportable"
+                )
+                return False, False
+            with self.data_lock:
+                self.data.setdefault('capture_password_checks', {})[name] = {
+                    'capture_signature': capture_signature,
+                    'credential_revision': credential_revision,
+                    'verified': verified,
+                    'candidate_count': len(passwords),
+                    'tool': 'aircrack-ng',
+                    'checked_at': int(time.time()),
+                }
+            return verified, True
+        except (OSError, subprocess.SubprocessError) as error:
+            logging.warning(
+                f"[A_pwmenu] Known-password verification failed for {name}: {error}"
+            )
+            return False, False
+        finally:
+            if wordlist_path:
                 try:
-                    with open(result_path, 'r', errors='ignore') as handle:
-                        if not handle.read().strip():
-                            continue
-                    capture_name = os.path.basename(result_path)[:-len('.cracked')]
-                    essid, bssid = self._handshake_identity(capture_name)
-                    if bssid:
-                        identities.add((essid, bssid))
-                except OSError as error:
-                    logging.warning(f"[A_pwmenu] Could not read QuickDic identity {result_path}: {error}")
-        return identities
+                    os.remove(wordlist_path)
+                except FileNotFoundError:
+                    pass
 
     def _capture_export_score(self, path):
         name = os.path.basename(path)
@@ -3172,25 +3913,44 @@ class A_pwmenu(plugins.Plugin):
         )
 
     def _uncracked_export_files(self):
-        """Select one best capture per exact AP, excluding only exact cracked APs."""
-        cracked_identities = self._known_cracked_ap_identities()
+        """Export every crackable unresolved AP, using its best remaining capture."""
+        cracked = self._get_cracked_data()
+        credential_revision = self._credential_source_revision()
         selected = {}
-        for directory in self.handshake_dirs:
-            if not os.path.exists(directory):
-                continue
-            for path in glob.glob(os.path.join(directory, '*.pcap')):
-                name = os.path.basename(path)
-                essid, bssid = self._handshake_identity(name)
-                if bssid and (essid, bssid) in cracked_identities:
+        cache_changed = False
+        with self.password_verify_lock:
+            for directory in self.handshake_dirs:
+                if not os.path.exists(directory):
                     continue
+                for path in glob.glob(os.path.join(directory, '*.pcap')):
+                    if not self._capture_is_crackable(path):
+                        continue
+                    name = os.path.basename(path)
+                    essid, bssid = self._handshake_identity(name)
+                    passwords, exact_essid = self._known_passwords_for_capture(
+                        cracked, essid, bssid
+                    )
+                    verified, changed = self._verify_capture_passwords(
+                        path,
+                        exact_essid,
+                        bssid,
+                        passwords,
+                        credential_revision,
+                    )
+                    cache_changed = cache_changed or changed
+                    if verified:
+                        continue
 
-                # A filename without a valid BSSID cannot safely be merged with another AP.
-                identity = (essid, bssid) if bssid else ('file', name)
-                score = self._capture_export_score(path)
-                current = selected.get(identity)
-                if current is None or score > current[0]:
-                    selected[identity] = (score, path, name)
+                    # BSSID is the AP identity even if its ESSID changed. Without a
+                    # valid BSSID, keep files separate rather than merge unrelated APs.
+                    identity = ('bssid', bssid) if bssid else ('file', name)
+                    score = self._capture_export_score(path)
+                    current = selected.get(identity)
+                    if current is None or score > current[0]:
+                        selected[identity] = (score, path, name)
 
+        if cache_changed:
+            self._save_data()
         files = [(item[1], item[2]) for item in selected.values()]
         files.sort(key=lambda item: item[1].casefold())
         return files
@@ -3222,7 +3982,15 @@ class A_pwmenu(plugins.Plugin):
 
     def _serve_password_list(self):
         c = self._get_cracked_data()
-        t = "\n".join([f"{e}:{d['password']}" for e, d in c.items()])
+        seen = set()
+        lines = []
+        for record in c.values():
+            value = (record.get('essid', ''), record.get('password', ''))
+            if not value[0] or not value[1] or value in seen:
+                continue
+            seen.add(value)
+            lines.append(f"{value[0]}:{value[1]}")
+        t = "\n".join(lines)
         m = io.BytesIO(t.encode('utf-8'))
         return send_file(m, mimetype='text/plain', as_attachment=True, download_name='passwords.txt')
 
@@ -3266,23 +4034,34 @@ class A_pwmenu(plugins.Plugin):
                 try:
                     fn = os.path.basename(f)
                     st = os.stat(f)
-                    nm = fn.replace('.pcap', '')
-                    pts = nm.split('_')
-                    if len(pts)>=2 and len(pts[-1]) in [12,17]:
-                        bs=pts[-1]
-                        es="_".join(pts[:-1])
-                    elif len(pts)>=2 and len(pts[-1]) == 12:
-                        bs=pts[-1]
-                        es="_".join(pts[:-1])
-                    else:
-                        es=nm
-                        bs=""
-
-                    if es not in grps:
-                        isc = es in cracked
-                        grps[es] = {'essid': es, 'files': [], 'ts': 0, 'is_cracked': isc,
-                                    'pwd': cracked[es]['password'] if isc else '', 'src': cracked[es]['source'] if isc else '',
-                                    'lat': None, 'lon': None, 'gps_source': ''}
+                    es, bs = self._handshake_identity(fn)
+                    credential = self._find_cracked_record(cracked, es, bs)
+                    quality = self._quality_file_record(fn, f)
+                    quality_essid = str(quality.get('essid') or '').strip()
+                    quality_bssid = self._compact_bssid(quality.get('bssid'))
+                    if quality_bssid and bs and quality_bssid != bs:
+                        quality_essid = ''
+                    group_key = ('bssid', bs) if bs else ('essid', es)
+                    if group_key not in grps:
+                        display_essid = (
+                            credential.get('essid')
+                            if credential
+                            else quality_essid or es
+                        )
+                        grps[group_key] = {
+                            'essid': display_essid or es,
+                            'capture_essid': es,
+                            'bssid': bs,
+                            'files': [],
+                            'ts': 0,
+                            'is_cracked': bool(credential),
+                            'pwd': credential.get('password', '') if credential else '',
+                            'src': credential.get('source', '') if credential else '',
+                            'lat': None,
+                            'lon': None,
+                            'gps_source': ''
+                        }
+                    group = grps[group_key]
 
                     date_str = get_local_time(st.st_mtime, tz_offset)
 
@@ -3299,7 +4078,7 @@ class A_pwmenu(plugins.Plugin):
                         'filename': fn, 'bssid': bs, 'size': f"{round(st.st_size/1024,1)}KB",
                         'date': date_str,
                         'ts': st.st_mtime,
-                        'quality': self._quality_file_record(fn, f)
+                        'quality': quality
                     }
                     if not file_info['quality']:
                         quality_pending.append(fn)
@@ -3312,15 +4091,15 @@ class A_pwmenu(plugins.Plugin):
                             'gps_stale': loc.get('gps_stale', False),
                             'gps_age_at_capture': loc.get('gps_age_at_capture', 0)
                         })
-                        if grps[es].get('lat') is None or st.st_mtime >= grps[es].get('gps_ts', 0):
-                            grps[es]['lat'] = loc.get('lat')
-                            grps[es]['lon'] = loc.get('lon')
-                            grps[es]['gps_source'] = loc.get('source', '')
-                            grps[es]['gps_ts'] = st.st_mtime
+                        if group.get('lat') is None or st.st_mtime >= group.get('gps_ts', 0):
+                            group['lat'] = loc.get('lat')
+                            group['lon'] = loc.get('lon')
+                            group['gps_source'] = loc.get('source', '')
+                            group['gps_ts'] = st.st_mtime
 
-                    grps[es]['files'].append(file_info)
-                    if st.st_mtime > grps[es]['ts']:
-                        grps[es]['ts'] = st.st_mtime
+                    group['files'].append(file_info)
+                    if st.st_mtime > group['ts']:
+                        group['ts'] = st.st_mtime
                 except (OSError, TypeError, ValueError) as e:
                     logging.warning(f"[A_pwmenu] Could not scan handshake {f}: {e}")
         if data_changed:
@@ -3341,10 +4120,41 @@ class A_pwmenu(plugins.Plugin):
         return res
 
     def _get_cracked_data(self):
-        d = {}
+        records = {}
+
+        def add_record(record, source):
+            if not record or not record.get('password'):
+                return
+            essid = str(record.get('essid') or '')
+            password = str(record.get('password') or '')
+            bssid = self._compact_bssid(record.get('bssid'))
+            identity = (
+                ('bssid', bssid, password)
+                if bssid and bssid != '000000000000'
+                else ('essid', self._normalized_essid_key(essid), password)
+            )
+            existing = records.get(identity)
+            if existing:
+                sources = existing.setdefault('sources', [])
+                if source not in sources:
+                    sources.append(source)
+                if source == 'Handshake Lab' and essid:
+                    existing['essid'] = essid
+                existing['source'] = ' · '.join(sources)
+                return
+            records[identity] = {
+                'essid': essid,
+                'bssid': bssid,
+                'password': password,
+                'source': source,
+                'sources': [source],
+            }
+
         pots = [('/root/handshakes/wpa-sec.cracked.potfile', 'WPA-Sec'),
                 ('/home/pi/handshakes/wpa-sec.cracked.potfile', 'WPA-Sec'),
-                (self.potfile_ohc, 'OHC'), (self.potfile_manual, 'Manual')]
+                (self.potfile_ohc, 'OHC'),
+                (self.potfile_handshake_lab, 'Handshake Lab'),
+                (self.potfile_manual, 'Manual')]
         for p, s in pots:
             if os.path.exists(p):
                 try:
@@ -3352,11 +4162,15 @@ class A_pwmenu(plugins.Plugin):
                     for line in lines:
                         record = self._parse_pot_line(line)
                         if record:
-                            d[record['essid']] = {'password': record['password'], 'source': s}
+                            add_record(record, s)
                             continue
                         parts = line.split(':')
                         if len(parts) >= 3:
-                            d[parts[-2]] = {'password': parts[-1], 'source': s}
+                            add_record({
+                                'essid': parts[-2],
+                                'bssid': '',
+                                'password': parts[-1],
+                            }, s)
                 except OSError as e:
                     logging.warning(f"[A_pwmenu] Could not read potfile {p}: {e}")
         for ddir in self.handshake_dirs:
@@ -3366,13 +4180,55 @@ class A_pwmenu(plugins.Plugin):
                         with open(c) as f:
                             pwd = f.read().strip()
                             if pwd:
-                                nm = os.path.basename(c).replace('.pcap.cracked', '')
-                                pts = nm.split('_')
-                                es = "_".join(pts[:-1]) if len(pts)>1 else nm
-                                d[es] = {'password': pwd, 'source': 'QuickDic'}
+                                es, bs = self._handshake_identity(
+                                    os.path.basename(c)[:-len('.cracked')]
+                                )
+                                add_record({
+                                    'essid': es,
+                                    'bssid': bs,
+                                    'password': pwd,
+                                }, 'QuickDic')
                     except (OSError, ValueError, TypeError) as e:
                         logging.warning(f"[A_pwmenu] Could not read QuickDic result {c}: {e}")
-        return d
+        return records
+
+    def _find_cracked_record(self, cracked, essid, bssid):
+        compact_bssid = self._compact_bssid(bssid)
+        if compact_bssid:
+            matches = [
+                record for record in cracked.values()
+                if self._compact_bssid(record.get('bssid')) == compact_bssid
+            ]
+            if matches:
+                return matches[-1]
+
+        exact = [
+            record for record in cracked.values()
+            if record.get('essid') == essid
+        ]
+        if exact:
+            return exact[-1]
+
+        normalized = self._normalized_essid_key(essid)
+        if not normalized:
+            return None
+        matches = [
+            record for record in cracked.values()
+            if self._normalized_essid_key(record.get('essid')) == normalized
+        ]
+        identities = {
+            self._compact_bssid(record.get('bssid')) or record.get('essid')
+            for record in matches
+        }
+        return matches[-1] if len(identities) == 1 and matches else None
+
+    def _is_locally_cracked(self, filename, cracked=None):
+        essid, bssid = self._handshake_identity(filename)
+        return bool(self._find_cracked_record(
+            cracked if cracked is not None else self._get_cracked_data(),
+            essid,
+            bssid,
+        ))
 
     def _get_html(self):
         return """
@@ -4149,12 +5005,12 @@ class A_pwmenu(plugins.Plugin):
         {% endif %}
 
         <div id="v-cracked" class="list hidden">
-            {% for e, d in cracked.items() %}
-            <div class="si" data-t="{{ e }} {{ d.password }}">
+            {% for credential_id, d in cracked.items() %}
+            <div class="si" data-t="{{ d.essid }} {{ d.bssid }} {{ d.password }}">
                 <div class="row" onclick="tog('cracked-{{ loop.index }}')">
                     <div style="flex-grow:1;min-width:0">
-                        <div class="tit">{{ e }}<span class="badge">{{ d.source }}</span></div>
-                        <div class="sub">Saved credential</div>
+                        <div class="tit">{{ d.essid }}<span class="badge">{{ d.source }}</span></div>
+                        <div class="sub">{{ d.bssid or 'Name-only credential' }}</div>
                     </div>
                     <span class="arr" title="Open credential"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9 6 6 6-6 6"></path></svg></span>
                 </div>
@@ -4163,8 +5019,8 @@ class A_pwmenu(plugins.Plugin):
                         <div class="credential-label">Password</div>
                         <div class="credential-value">{{ d.password }}</div>
                         <div class="credential-actions">
-                            <button class="network-expanded-action" onclick='ed({{ e|tojson }}, {{ d.password|tojson }}, {{ d.source|tojson }})'>Edit password</button>
-                            <button class="network-expanded-action" style="color:var(--danger)" onclick='del({{ e|tojson }}, {{ d.password|tojson }}, {{ d.source|tojson }})'>Delete password</button>
+                            <button class="network-expanded-action" onclick='ed({{ d.essid|tojson }}, {{ d.password|tojson }}, {{ d.source|tojson }}, {{ d.bssid|tojson }})'>Edit password</button>
+                            <button class="network-expanded-action" style="color:var(--danger)" onclick='del({{ d.essid|tojson }}, {{ d.password|tojson }}, {{ d.source|tojson }}, {{ d.bssid|tojson }})'>Delete password</button>
                         </div>
                     </div>
                 </div>
@@ -4193,16 +5049,16 @@ class A_pwmenu(plugins.Plugin):
                         <div class="credential-label">Recovered password</div>
                         <div class="credential-value">{{ g.pwd }}</div>
                         <div class="credential-actions">
-                            <button class="network-expanded-action" onclick='ed({{ g.essid|tojson }}, {{ g.pwd|tojson }}, {{ g.src|tojson }})'>Edit password</button>
-                            <button class="network-expanded-action" style="color:var(--danger)" onclick='del({{ g.essid|tojson }}, {{ g.pwd|tojson }}, {{ g.src|tojson }})'>Delete password</button>
+                            <button class="network-expanded-action" onclick='ed({{ g.essid|tojson }}, {{ g.pwd|tojson }}, {{ g.src|tojson }}, {{ g.bssid|tojson }})'>Edit password</button>
+                            <button class="network-expanded-action" style="color:var(--danger)" onclick='del({{ g.essid|tojson }}, {{ g.pwd|tojson }}, {{ g.src|tojson }}, {{ g.bssid|tojson }})'>Delete password</button>
                         </div>
                     </div>
                     {% endif %}
                     <div class="network-expanded-tools">
                         {% if not g.is_cracked or not g.pwd %}
-                        <button class="network-expanded-action" onclick='add({{ g.essid|tojson }})' title="Add a recovered password"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="8" cy="15" r="4"></circle><path d="m11 12 7-7m-2 0h4m-2-2v4"></path></svg><span>Add password</span></button>
+                        <button class="network-expanded-action" onclick='add({{ g.essid|tojson }}, {{ g.bssid|tojson }})' title="Add a recovered password"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="8" cy="15" r="4"></circle><path d="m11 12 7-7m-2 0h4m-2-2v4"></path></svg><span>Add password</span></button>
                         {% endif %}
-                        <button class="network-expanded-action" onclick='whitelistAdd({{ g.essid|tojson }}, "handshakes")' title="Add this network to the whitelist"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3 5 6v5c0 4.6 2.8 8 7 10 4.2-2 7-5.4 7-10V6l-7-3Z"></path><path d="m9 12 2 2 4-4"></path></svg><span>Whitelist</span></button>
+                        <button class="network-expanded-action" onclick='whitelistAdd({{ g.essid|tojson }}, "handshakes", {{ g.bssid|tojson }})' title="Add this network to the whitelist"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3 5 6v5c0 4.6 2.8 8 7 10 4.2-2 7-5.4 7-10V6l-7-3Z"></path><path d="m9 12 2 2 4-4"></path></svg><span>Whitelist</span></button>
                     </div>
                     {% for f in g.files %}
                     <div class="sub-row capture-row">
@@ -4374,7 +5230,7 @@ class A_pwmenu(plugins.Plugin):
                 </div>
                 <a href="/plugins/A_pwmenu/export-passwords" class="btn" style="background:var(--accent);">Export List (.txt)</a>
                 <a href="/plugins/A_pwmenu/download-zip" class="btn">Download All (.zip)</a>
-                <a href="/plugins/A_pwmenu/download-uncracked" class="btn" style="background:#071f45;color:#91c2ff;">Download Best Uncracked (.zip)</a>
+                <a href="/plugins/A_pwmenu/download-uncracked" class="btn" style="background:#071f45;color:#91c2ff;">Download All Uncracked APs (.zip)</a>
                 <form method="POST" action="/plugins/A_pwmenu/sync-time" style="margin-top:10px;">
                     <input type="hidden" name="csrf_token" value="{{ token }}">
                     <button class="btn" style="background:var(--sub);">Sync Time (Google)</button>
@@ -4587,11 +5443,12 @@ class A_pwmenu(plugins.Plugin):
             }
         }
 
-        function add(e) { const p=prompt("Password for "+e+":"); if(p) post('add-password', {essid:e, password:p}); }
-        function whitelistAdd(network, returnTab) {
+        function add(e,b) { const p=prompt("Password for "+e+":"); if(p) post('add-password', {essid:e, bssid:b||'', password:p}); }
+        function whitelistAdd(network, returnTab, bssid) {
             if(confirm('Add "' + network + '" to the whitelist?')) {
-                if(returnTab === 'map') updateWhitelistAsync('whitelist-add', {network:network, return_tab:'map'});
-                else post('whitelist-add', {network:network, return_tab:returnTab || 'other'});
+                const payload = {network:network, bssid:bssid || '', return_tab:returnTab || 'other'};
+                if(returnTab === 'map') updateWhitelistAsync('whitelist-add', payload);
+                else post('whitelist-add', payload);
             }
         }
         function whitelistRemove(network, returnTab) {
@@ -4643,10 +5500,10 @@ class A_pwmenu(plugins.Plugin):
                 await updateWhitelistAsync('whitelist-add-excellent', {networks:JSON.stringify(names)});
             }
         }
-        function ed(e,o) { const p=prompt("Edit "+e+":", o); if(p&&p!==o) post('update-password', {essid:e, password:p}); }
-        function del(e, p, s) {
+        function ed(e,o,s,b) { const p=prompt("Edit "+e+":", o); if(p&&p!==o) post('update-password', {essid:e, bssid:b||'', old_password:o, password:p, source:s||''}); }
+        function del(e, p, s, b) {
             if(confirm("Delete password for "+e+"?")) {
-                post('delete-password', {essid:e, password:p, source:s});
+                post('delete-password', {essid:e, bssid:b||'', password:p, source:s});
             }
         }
         function rm(f) { if(confirm("Delete file "+f+"?")) post('delete-file', {filename:f}); }
@@ -4812,23 +5669,23 @@ class A_pwmenu(plugins.Plugin):
             return icons[name] || '';
         }
 
-        function whitelistAction(networkName) {
+        function whitelistAction(networkName, bssid) {
             const allowed = whitelistedNetworks.has(String(networkName || ''));
             const action = allowed
                 ? `whitelistRemove(${jsq(networkName)}, "map")`
-                : `whitelistAdd(${jsq(networkName)}, "map")`;
+                : `whitelistAdd(${jsq(networkName)}, "map", ${jsq(bssid || '')})`;
             const title = allowed ? 'Remove from whitelist' : 'Add to whitelist';
             const label = allowed ? 'Remove' : 'Allow';
             return `<button class="map-icon-action ${allowed ? 'danger' : ''}" onclick='${action}' title="${title}">${mapActionIcon('whitelist')}<span>${label}</span></button>`;
         }
 
-        function networkActions(networkName, filename, isCracked, ohcExpr, wpaExpr) {
+        function networkActions(networkName, bssid, filename, isCracked, ohcExpr, wpaExpr) {
             const download = `<a class="map-icon-action primary" href="/plugins/A_pwmenu/download/${encodeURIComponent(filename)}" title="Download PCAP">${mapActionIcon('download')}<span>PCAP</span></a>`;
             const ohc = isCracked ? '' : `<button class="map-icon-action" onclick='${ohcExpr}' title="Send to OHC">${mapActionIcon('ohc')}<span>OHC</span></button>`;
             const wpa = !isCracked && wpaEnabled ? `<button class="map-icon-action" onclick='${wpaExpr}' title="Send to WPA-sec">${mapActionIcon('wpa')}<span>WPA</span></button>` : '';
             return `<div class="map-icon-actions">
                 ${download}${ohc}${wpa}
-                ${whitelistAction(networkName)}
+                ${whitelistAction(networkName, bssid)}
                 <button class="map-icon-action danger" title="Delete capture" onclick='rm(${jsq(filename)})'>${mapActionIcon('trash')}<span>Delete</span></button>
             </div>`;
         }
@@ -5025,7 +5882,7 @@ class A_pwmenu(plugins.Plugin):
                 ${pointChips(n, true)}
                 ${pass}
                 ${fileRows ? `<details class="map-more"><summary>${n.files.length} capture file${n.files.length === 1 ? '' : 's'}</summary><div class="map-list">${fileRows}</div></details>` : ''}
-                ${n.filename ? networkActions(n.essid, n.filename, !!n.password, `sendNoGpsToOhc(noGpsNetworks[${idx}])`, `sendNoGpsToWpa(noGpsNetworks[${idx}])`) : ''}`;
+                ${n.filename ? networkActions(n.essid, n.bssid, n.filename, !!n.password, `sendNoGpsToOhc(noGpsNetworks[${idx}])`, `sendNoGpsToWpa(noGpsNetworks[${idx}])`) : ''}`;
         }
 
         function mapBounds(points) {
@@ -5302,7 +6159,7 @@ class A_pwmenu(plugins.Plugin):
                 ${pointChips(p, false)}
                 ${pass}
                 ${history ? `<details class="map-more"><summary>${p.history.length} nearby captures</summary><div class="map-list">${history}</div></details>` : ''}
-                ${networkActions(p.essid, p.filename, !!p.password, `sendSingleToOhc(${jsq(p.filename)})`, `sendSingleToWpa(${jsq(p.filename)})`)}`;
+                ${networkActions(p.essid, p.bssid, p.filename, !!p.password, `sendSingleToOhc(${jsq(p.filename)})`, `sendSingleToWpa(${jsq(p.filename)})`)}`;
         }
 
         function showMapGroup(p) {

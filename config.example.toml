@@ -1,7 +1,18 @@
-# Enable the plugin.
+# Master switch.
 main.plugins.A_pwmenu.enabled = true
 
-# WPA-sec. Leave empty to hide WPA-sec upload controls.
+# Independent feature modules. Disable anything you do not use.
+main.plugins.A_pwmenu.module_web_enabled = true
+main.plugins.A_pwmenu.module_gps_enabled = true
+main.plugins.A_pwmenu.module_ohc_enabled = true
+main.plugins.A_pwmenu.module_wpa_sec_enabled = true
+main.plugins.A_pwmenu.module_quality_enabled = true
+main.plugins.A_pwmenu.module_whitelist_enabled = true
+main.plugins.A_pwmenu.module_time_sync_enabled = true
+main.plugins.A_pwmenu.module_display_password_enabled = true
+main.plugins.A_pwmenu.module_quickdic_enabled = true
+
+# WPA-sec. Leave the key empty when this integration is unused.
 main.plugins.A_pwmenu.wpa_sec_key = ""
 
 # OnlineHashCrack API v2.
@@ -19,7 +30,7 @@ main.plugins.A_pwmenu.pwndroid_gateway = ""
 main.plugins.A_pwmenu.pwndroid_extra_gateways = []
 main.plugins.A_pwmenu.pwndroid_port = 8080
 
-# Browser fixes and capture-sidecar assignment.
+# Browser geolocation and capture-sidecar assignment.
 main.plugins.A_pwmenu.phone_gps_enabled = true
 main.plugins.A_pwmenu.phone_gps_max_age = 600
 main.plugins.A_pwmenu.gps_assign_window = 180
@@ -31,14 +42,50 @@ main.plugins.A_pwmenu.gpsd_host = "127.0.0.1"
 main.plugins.A_pwmenu.gpsd_port = 2947
 main.plugins.A_pwmenu.gpsd_poll_interval = 10
 
-# Capture analysis and safe automatic replacement of older weak captures.
+# Integrated display-password module.
+main.plugins.A_pwmenu.display_password_orientation = "horizontal"
+main.plugins.A_pwmenu.display_password_max_length = 22
+main.plugins.A_pwmenu.display_password_empty_text = "No cracked passwords"
+main.plugins.A_pwmenu.display_password_wpa_sec = true
+main.plugins.A_pwmenu.display_password_ohc = true
+main.plugins.A_pwmenu.display_password_handshake_lab = true
+main.plugins.A_pwmenu.display_password_manual = true
+main.plugins.A_pwmenu.display_password_quickdic = true
+# -1 keeps the display-specific automatic coordinate.
+main.plugins.A_pwmenu.display_password_horizontal_x = -1
+main.plugins.A_pwmenu.display_password_horizontal_y = -1
+main.plugins.A_pwmenu.display_password_vertical_x = -1
+main.plugins.A_pwmenu.display_password_vertical_y = -1
+
+# Integrated better_quickdic module. Work runs in a background queue so capture
+# callbacks are not blocked. Every known password is verified before dictionaries.
+main.plugins.A_pwmenu.quickdic_wordlist_folder = "/home/pi/wordlists/"
+main.plugins.A_pwmenu.quickdic_recursive = false
+main.plugins.A_pwmenu.quickdic_timeout = 300
+main.plugins.A_pwmenu.quickdic_max_queue = 32
+main.plugins.A_pwmenu.quickdic_face = "(·ω·)"
+main.plugins.A_pwmenu.quickdic_update_display = true
+main.plugins.A_pwmenu.quickdic_status_seconds = 12
+main.plugins.A_pwmenu.quickdic_status_template = "Cracked {essid}: {password}"
+main.plugins.A_pwmenu.quickdic_telegram_enabled = false
+main.plugins.A_pwmenu.quickdic_telegram_bot_token = ""
+main.plugins.A_pwmenu.quickdic_telegram_chat_id = ""
+main.plugins.A_pwmenu.quickdic_telegram_timeout = 15
+
+# Capture analysis, verification, and safe automatic replacement.
 main.plugins.A_pwmenu.quality_auto_scan = true
 main.plugins.A_pwmenu.quality_scan_delay_ms = 250
 main.plugins.A_pwmenu.auto_replace_unusable = true
+main.plugins.A_pwmenu.hcxpcapngtool_timeout = 90
+main.plugins.A_pwmenu.password_verify_timeout = 45
 
 # Operational limits.
 main.plugins.A_pwmenu.timezone = 0
 main.plugins.A_pwmenu.time_sync_interval = 1800
-main.plugins.A_pwmenu.hcxpcapngtool_timeout = 90
 main.plugins.A_pwmenu.import_max_bytes = 2097152
 main.plugins.A_pwmenu.archive_memory_limit = 2097152
+
+# After migration, keep the legacy standalone plugins disabled to avoid duplicate
+# screen elements and duplicate dictionary work.
+main.plugins.display-password.enabled = false
+main.plugins.better_quickdic.enabled = false
