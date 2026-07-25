@@ -75,6 +75,68 @@ class WhitelistTests(unittest.TestCase):
         self.assertFalse(changed)
         self.assertIn("unsupported", message)
 
+    def test_bssid_resolves_exact_ssid_and_replaces_sanitized_alias(self):
+        with open(self.config_path, "w", encoding="utf-8") as handle:
+            handle.write('main.name = "test-unit"\nmain.whitelist = ["TPLink8241"]\n')
+        self.plugin._agent._config["main"]["whitelist"] = ["TPLink8241"]
+        self.plugin._get_cracked_data = lambda: {
+            ("bssid", "aabbccddeeff", "secret123"): {
+                "essid": "TP-Link_8241",
+                "bssid": "aabbccddeeff",
+                "password": "secret123",
+            }
+        }
+
+        changed, message = self.plugin._add_to_whitelist(
+            "TPLink8241",
+            "aa:bb:cc:dd:ee:ff",
+        )
+
+        self.assertTrue(changed)
+        self.assertIn("TP-Link_8241", message)
+        self.assertEqual(self.plugin._get_whitelist(), ["TP-Link_8241"])
+
+    def test_whitelist_alias_migration_is_conservative_and_deduplicates(self):
+        with open(self.config_path, "w", encoding="utf-8") as handle:
+            handle.write(
+                'main.name = "test-unit"\n'
+                'main.whitelist = ["TPLink8241", "TP-Link_8241", "Dolphin"]\n'
+            )
+        self.plugin._agent._config["main"]["whitelist"] = [
+            "TPLink8241", "TP-Link_8241", "Dolphin",
+        ]
+        self.plugin._get_cracked_data = lambda: {
+            ("bssid", "aabbccddeeff", "secret123"): {
+                "essid": "TP-Link_8241",
+                "bssid": "aabbccddeeff",
+                "password": "secret123",
+            }
+        }
+
+        repaired = self.plugin._repair_whitelist_aliases()
+
+        self.assertGreaterEqual(repaired, 1)
+        self.assertEqual(self.plugin._get_whitelist(), ["Dolphin", "TP-Link_8241"])
+
+    def test_whitelist_alias_migration_uses_password_free_ohc_snapshot(self):
+        with open(self.config_path, "w", encoding="utf-8") as handle:
+            handle.write(
+                'main.name = "test-unit"\n'
+                'main.whitelist = ["POB45114", "Dolphin"]\n'
+            )
+        self.plugin._agent._config["main"]["whitelist"] = ["POB45114", "Dolphin"]
+        self.plugin._get_cracked_data = lambda: {}
+        self.plugin._load_ohc_export_snapshot = lambda: (
+            {"aa:bb:cc:dd:ee:ff|POB45-114"},
+            {"aa:bb:cc:dd:ee:ff"},
+            {"tasks": 1},
+        )
+
+        repaired = self.plugin._repair_whitelist_aliases()
+
+        self.assertEqual(repaired, 1)
+        self.assertEqual(self.plugin._get_whitelist(), ["Dolphin", "POB45-114"])
+
     def test_group_whitelist_adds_only_excellent_quality_networks(self):
         groups = [
             {"essid": "Home", "files": [{"quality": {"grade": "Excellent"}}]},

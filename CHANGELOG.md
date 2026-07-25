@@ -2,6 +2,29 @@
 
 All notable changes to A_pwmenu are documented here.
 
+## 1.3.5 — 2026-07-25
+
+- Integrated the standalone `display-password` and `better_quickdic` features into A_pwmenu with independent module switches and detailed display, dictionary, queue, timeout, and Telegram settings.
+- Moved QuickDic work to a bounded background queue so Pwnagotchi's handshake callback is not held for several minutes.
+- Made QuickDic verify locally known passwords against each newly captured handshake before attempting wordlists.
+- Changed the uncracked ZIP to include every crackable access point without a cryptographically verified password, while retaining only the best unresolved capture for each exact BSSID.
+- Cached password-verification results by capture and credential-source revisions without storing password material in the state file.
+- Renamed the public guide from `/wiki/pwnagochi` to `/wiki/pwmenu` and expanded module configuration and migration documentation.
+
+## 1.3.4 — 2026-07-25
+
+- Fixed OHC candidate and pending-queue filtering after the credential store became BSSID-aware, preventing locally known networks from being uploaded again.
+- Resolved whitelist additions to the exact SSID from recovered BSSID data or the capture’s WPA hash.
+- Added a conservative startup migration that replaces punctuation-stripped whitelist aliases only when one unambiguous exact SSID exists in recovered data, capture metadata or the imported OHC task snapshot.
+- Stored exact SSID/BSSID metadata in capture-quality records so uncracked groups retain dashes, underscores and other punctuation.
+
+## 1.3.3 — 2026-07-25
+
+- Added a versioned Handshake Lab result format with exact ESSID/BSSID fields and persistent `Handshake Lab` provenance.
+- Matched recovered credentials and uncracked exports by BSSID first, with conservative normalized-ESSID fallback only when no BSSID exists.
+- Merged display duplicates for the same BSSID and password while preserving the original exported ESSID.
+- Made manual password add, edit, and delete actions BSSID-aware.
+
 ## 1.3.2 — 2026-07-20
 
 - Fixed uncracked ZIP selection to match known credentials by exact `ESSID + BSSID` instead of treating every access point with the same ESSID as cracked.
@@ -27,7 +50,7 @@ All notable changes to A_pwmenu are documented here.
 - Added gzip compression for large HTML responses, reducing the static interface payload from roughly 139 KB to 28 KB before dynamic capture data.
 - Changed Yandex Maps to load asynchronously only when the Map tab is opened, so the main page no longer waits for an external map script.
 - Added transport regression tests for gzip negotiation and the uncompressed UTF-8 fallback; updated UI and cleanup regression coverage.
-- Moved the complete user guide to [neewfpv.com/wiki/pwnagochi](https://neewfpv.com/wiki/pwnagochi) and reduced the repository README to installation and essential configuration.
+- Moved the complete user guide to [neewfpv.com/wiki/pwmenu](https://neewfpv.com/wiki/pwmenu) and reduced the repository README to installation and essential configuration.
 
 ## 1.2.0 — 2026-07-18
 

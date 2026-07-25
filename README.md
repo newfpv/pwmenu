@@ -2,7 +2,7 @@
 
 A fast, mobile-first capture and password manager for Pwnagotchi. It combines PCAP quality analysis, local passwords, GPS mapping, WPA-sec, OnlineHashCrack, exports, imports, a persistent upload queue, and safe cleanup in one web interface.
 
-[![Version](https://img.shields.io/badge/version-1.3.2-20e4f4)](./CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-1.3.5-20e4f4)](./CHANGELOG.md)
 [![Tests](https://github.com/newfpv/pwmenu/actions/workflows/test.yml/badge.svg)](https://github.com/newfpv/pwmenu/actions/workflows/test.yml)
 [![License](https://img.shields.io/badge/license-GPL--3.0-30d158)](./LICENSE)
 
@@ -14,9 +14,9 @@ A fast, mobile-first capture and password manager for Pwnagotchi. It combines PC
 - `Excellent` / `Usable` / `Partial` / `Unusable` PCAP quality grades.
 - GPS from PwnDroid, browser geolocation, or GPSD.
 - WPA-sec and OnlineHashCrack uploads with persistent deduplication and backoff.
-- Manual passwords, OHC imports, QuickDic results, exports, and ZIP downloads.
+- Integrated password display and background QuickDic, plus manual passwords, OHC imports, exports, and ZIP downloads.
 - In-app Pwnagotchi whitelist management, including Excellent-only map groups, and confirmation-bound capture cleanup.
-- BSSID-aware uncracked exports that keep only the best capture for each exact access point.
+- BSSID-aware uncracked exports that verify known passwords against each capture and keep the best unresolved capture for every crackable access point.
 - Gzip-compressed HTML, lazy map loading, and in-place map actions for faster Bluetooth access.
 
 ## Install
@@ -26,7 +26,7 @@ sudo cp /usr/local/share/pwnagotchi/custom-plugins/A_pwmenu.py \
   /root/A_pwmenu.py.backup 2>/dev/null || true
 
 sudo wget -O /usr/local/share/pwnagotchi/custom-plugins/A_pwmenu.py \
-  https://raw.githubusercontent.com/newfpv/pwmenu/v1.3.2/A_pwmenu.py
+  https://raw.githubusercontent.com/newfpv/pwmenu/v1.3.5/A_pwmenu.py
 
 sudo chown root:root /usr/local/share/pwnagotchi/custom-plugins/A_pwmenu.py
 sudo chmod 644 /usr/local/share/pwnagotchi/custom-plugins/A_pwmenu.py
@@ -49,9 +49,20 @@ sudo systemctl restart pwnagotchi
 
 Open `http://<pwnagotchi-ip>:8080/plugins/A_pwmenu/`.
 
-## Optional integrations
+## Module switches and optional integrations
 
 ```toml
+# Every subsystem can be disabled independently.
+main.plugins.A_pwmenu.module_web_enabled = true
+main.plugins.A_pwmenu.module_gps_enabled = true
+main.plugins.A_pwmenu.module_ohc_enabled = true
+main.plugins.A_pwmenu.module_wpa_sec_enabled = true
+main.plugins.A_pwmenu.module_quality_enabled = true
+main.plugins.A_pwmenu.module_whitelist_enabled = true
+main.plugins.A_pwmenu.module_time_sync_enabled = true
+main.plugins.A_pwmenu.module_display_password_enabled = true
+main.plugins.A_pwmenu.module_quickdic_enabled = true
+
 # WPA-sec
 main.plugins.A_pwmenu.wpa_sec_key = "REPLACE_ME"
 
@@ -65,15 +76,21 @@ main.plugins.A_pwmenu.pwndroid_ws_enabled = true
 main.plugins.A_pwmenu.pwndroid_mac = "AA:BB:CC:DD:EE:FF"
 main.plugins.A_pwmenu.pwndroid_gateway = ""
 main.plugins.A_pwmenu.pwndroid_port = 8080
+
+# Integrated display-password and better_quickdic
+main.plugins.A_pwmenu.display_password_max_length = 22
+main.plugins.A_pwmenu.quickdic_wordlist_folder = "/home/pi/wordlists/"
+main.plugins.A_pwmenu.quickdic_recursive = false
+main.plugins.A_pwmenu.quickdic_timeout = 300
 ```
 
 See [`config.example.toml`](./config.example.toml) for the complete configuration template.
 
-## Documentation
+## Full PWMenu wiki
 
-The full guide covers installation, every option, the interface, capture quality, cleanup safety, WPA-sec, OHC, GPS/PwnDroid, backups, security, routes, and troubleshooting:
+The full guide covers installation, every option and module switch, migration from `display-password` and `better_quickdic`, the interface, uncracked verification, capture quality, cleanup safety, integrations, backups, routes, and troubleshooting:
 
-**[neewfpv.com/wiki/pwnagochi](https://neewfpv.com/wiki/pwnagochi)**
+### **[Open the complete PWMenu wiki →](https://neewfpv.com/wiki/pwmenu)**
 
 Release history is in [`CHANGELOG.md`](./CHANGELOG.md). Bugs and feature requests are welcome in [GitHub Issues](https://github.com/newfpv/pwmenu/issues).
 

@@ -1,10 +1,13 @@
 import glob
+import csv
+import io
 import os
 import sys
 import tempfile
 import time
 import types
 import unittest
+from unittest import mock
 
 from flask import Flask, render_template_string
 
@@ -41,8 +44,13 @@ class CaptureQualityTests(unittest.TestCase):
         self.plugin = A_pwmenu()
         self.plugin.options = {"auto_replace_unusable": True}
         self.plugin.handshake_dirs = [self.tempdir.name]
+        self.plugin.potfile_ohc = os.path.join(self.tempdir.name, "ohc.potfile")
+        self.plugin.potfile_handshake_lab = os.path.join(self.tempdir.name, "handshake-lab.potfile")
+        self.plugin.potfile_manual = os.path.join(self.tempdir.name, "manual.potfile")
+        self.plugin.ohc_export_file = os.path.join(self.tempdir.name, ".ohc-export.json")
         self.plugin.data_file = os.path.join(self.tempdir.name, ".state.json")
         self.plugin.data = {
+            "xp": 0,
             "seen_files": {},
             "locations": {},
             "ohc_files": {},
@@ -167,15 +175,285 @@ class CaptureQualityTests(unittest.TestCase):
         with open(unknown_path, "wb") as handle:
             handle.write(b"unknown")
 
-        self.plugin.potfile_ohc = os.path.join(self.tempdir.name, "ohc.potfile")
-        self.plugin.potfile_manual = os.path.join(self.tempdir.name, "manual.potfile")
         with open(self.plugin.potfile_ohc, "w", encoding="utf-8") as handle:
-            handle.write("aa:aa:aa:aa:aa:aa:aa:aa:aa:aa:aa:aa:Shared:secret123\n")
+            handle.write("aa:aa:aa:aa:aa:aa:aa:aa:aa:aa:aa:aa:Shared_Network:secret123\n")
+        self.plugin._capture_is_crackable = lambda path: True
+        self.plugin._verify_capture_passwords = (
+            lambda path, essid, bssid, passwords, revision:
+            (path == known_path, False)
+        )
 
         selected = [name for _, name in self.plugin._uncracked_export_files()]
 
         self.assertNotIn("Shared_aaaaaaaaaaaa.pcap", selected)
         self.assertIn("Shared_bbbbbbbbbbbb.pcap", selected)
+
+    def test_uncracked_export_keeps_name_only_capture_when_known_record_has_bssid(self):
+        capture_path = os.path.join(self.tempdir.name, "Shared_Network.pcap")
+        with open(capture_path, "wb") as handle:
+            handle.write(b"unknown-ap")
+        with open(self.plugin.potfile_ohc, "w", encoding="utf-8") as handle:
+            handle.write("aa:aa:aa:aa:aa:aa:aa:aa:aa:aa:aa:aa:Shared_Network:secret123\n")
+        self.plugin._capture_is_crackable = lambda path: True
+
+        selected = [name for _, name in self.plugin._uncracked_export_files()]
+
+        self.assertIn("Shared_Network.pcap", selected)
+
+    def test_handshake_lab_import_preserves_source_and_matches_sanitized_capture(self):
+        output = io.StringIO(newline="")
+        writer = csv.DictWriter(
+            output,
+            fieldnames=[
+                "datetime", "task", "algorithm", "status", "password", "note",
+                "source", "format_version", "essid", "bssid",
+            ],
+        )
+        writer.writeheader()
+        writer.writerow({
+            "datetime": "2026-07-25 12:00:00 UTC",
+            "task": "TP-Link_8241-Guest<br><span class=\"small\">aa:bb:cc:dd:ee:ff</span>",
+            "algorithm": "WPA(2)",
+            "status": "FOUND",
+            "password": "secret123",
+            "note": "Exported by Handshake Lab / Hashcat Web UI",
+            "source": "Handshake Lab / Hashcat Web UI",
+            "format_version": "newfpv-handshake-lab-results-v1",
+            "essid": "TP-Link_8241-Guest",
+            "bssid": "aa:bb:cc:dd:ee:ff",
+        })
+
+        first = self.plugin._process_import(output.getvalue(), "recovered.csv")
+        second = self.plugin._process_import(output.getvalue(), "recovered.csv")
+
+        self.assertEqual(first["added"], 1)
+        self.assertEqual(first["source"], "Handshake Lab")
+        self.assertEqual(second["added"], 0)
+        self.assertEqual(second["already"], 1)
+
+        capture_path = os.path.join(self.tempdir.name, "TPLink8241Guest_aabbccddeeff.pcap")
+        with open(capture_path, "wb") as handle:
+            handle.write(b"capture")
+        self.plugin.data["capture_quality"][os.path.basename(capture_path)] = {
+            "grade": "Usable",
+            "rank": 2,
+            "hashes": 1,
+            "signature": self.plugin._ohc_file_signature(capture_path),
+        }
+        self.plugin._verify_capture_passwords = (
+            lambda path, essid, bssid, passwords, revision: (True, False)
+        )
+
+        cracked = self.plugin._get_cracked_data()
+        groups = self.plugin._scan_and_group_files(cracked)
+        selected = [name for _, name in self.plugin._uncracked_export_files()]
+
+        self.assertEqual(len(cracked), 1)
+        record = next(iter(cracked.values()))
+        self.assertEqual(record["essid"], "TP-Link_8241-Guest")
+        self.assertEqual(record["bssid"], "aabbccddeeff")
+        self.assertEqual(record["source"], "Handshake Lab")
+        self.assertEqual(len(groups), 1)
+        self.assertTrue(groups[0]["is_cracked"])
+        self.assertEqual(groups[0]["essid"], "TP-Link_8241-Guest")
+        self.assertNotIn(os.path.basename(capture_path), selected)
+        self.assertEqual(self.plugin._candidate_ohc_paths(), [])
+
+        self.plugin.data["ohc_pending_files"][capture_path] = {
+            "signature": self.plugin._ohc_file_signature(capture_path),
+            "queued_at": int(time.time()),
+        }
+        self.assertEqual(self.plugin._pending_ohc_paths(), [])
+        self.assertEqual(
+            self.plugin.data["ohc_files"][os.path.basename(capture_path)]["status"],
+            "local_cracked",
+        )
+
+    def test_uncracked_export_keeps_known_bssid_when_password_fails_capture(self):
+        capture_path = os.path.join(
+            self.tempdir.name, "ChangedNetwork_aaaaaaaaaaaa.pcap"
+        )
+        with open(capture_path, "wb") as handle:
+            handle.write(b"new-password-handshake")
+        with open(self.plugin.potfile_ohc, "w", encoding="utf-8") as handle:
+            handle.write(
+                "aa:aa:aa:aa:aa:aa:aa:aa:aa:aa:aa:aa:"
+                "ChangedNetwork:old-password\n"
+            )
+        self.plugin.data["capture_quality"][os.path.basename(capture_path)] = {
+            "grade": "Usable",
+            "rank": 2,
+            "hashes": 1,
+            "signature": self.plugin._ohc_file_signature(capture_path),
+        }
+        self.plugin._verify_capture_passwords = (
+            lambda path, essid, bssid, passwords, revision: (False, False)
+        )
+
+        selected = [name for _, name in self.plugin._uncracked_export_files()]
+
+        self.assertEqual(selected, [os.path.basename(capture_path)])
+
+    def test_uncracked_export_excludes_capture_without_usable_hash(self):
+        capture_path = os.path.join(
+            self.tempdir.name, "Broken_dddddddddddd.pcap"
+        )
+        with open(capture_path, "wb") as handle:
+            handle.write(b"not-crackable")
+        self.plugin.data["capture_quality"][os.path.basename(capture_path)] = {
+            "grade": "Unusable",
+            "rank": 0,
+            "hashes": 0,
+            "signature": self.plugin._ohc_file_signature(capture_path),
+        }
+
+        self.assertEqual(self.plugin._uncracked_export_files(), [])
+
+    def test_aircrack_verification_is_cached_without_password_material(self):
+        capture_path = os.path.join(
+            self.tempdir.name, "Verified_aabbccddeeff.pcap"
+        )
+        with open(capture_path, "wb") as handle:
+            handle.write(b"capture")
+        result = types.SimpleNamespace(
+            returncode=0,
+            stdout="KEY FOUND! [ hidden-secret ]",
+            stderr="",
+        )
+        with mock.patch("A_pwmenu.shutil.which", return_value="/usr/bin/aircrack-ng"), \
+             mock.patch("A_pwmenu.subprocess.run", return_value=result) as run:
+            verified, changed = self.plugin._verify_capture_passwords(
+                capture_path,
+                "Verified",
+                "aabbccddeeff",
+                ["hidden-secret"],
+                "credential-revision",
+            )
+            cached, cached_changed = self.plugin._verify_capture_passwords(
+                capture_path,
+                "Verified",
+                "aabbccddeeff",
+                ["hidden-secret"],
+                "credential-revision",
+            )
+
+        self.assertTrue(verified)
+        self.assertTrue(changed)
+        self.assertTrue(cached)
+        self.assertFalse(cached_changed)
+        run.assert_called_once()
+        command = run.call_args.args[0]
+        self.assertIn("aa:bb:cc:dd:ee:ff", command)
+        self.assertNotIn("hidden-secret", command)
+        serialized = str(self.plugin.data["capture_password_checks"])
+        self.assertNotIn("hidden-secret", serialized)
+
+    def test_integrated_password_display_uses_latest_enabled_source(self):
+        with open(self.plugin.potfile_manual, "w", encoding="utf-8") as handle:
+            handle.write(
+                "aa:bb:cc:dd:ee:ff:aa:bb:cc:dd:ee:ff:"
+                "Manual_Network:manual-pass\n"
+            )
+        quickdic = os.path.join(
+            self.tempdir.name, "Quick_Network_aabbccddeeff.pcap.cracked"
+        )
+        with open(quickdic, "w", encoding="utf-8") as handle:
+            handle.write("quick-pass")
+        now = time.time()
+        os.utime(self.plugin.potfile_manual, (now - 10, now - 10))
+        os.utime(quickdic, (now, now))
+        self.plugin.options.update({
+            "display_password_wpa_sec": False,
+            "display_password_ohc": False,
+            "display_password_handshake_lab": False,
+            "display_password_manual": True,
+            "display_password_quickdic": True,
+            "display_password_max_length": 80,
+        })
+
+        self.assertEqual(
+            self.plugin._display_password_text(),
+            "Quick_Network:quick-pass",
+        )
+
+    def test_integrated_quickdic_skips_scan_when_known_key_verifies(self):
+        capture_path = os.path.join(
+            self.tempdir.name, "Known_aabbccddeeff.pcap"
+        )
+        with open(capture_path, "wb") as handle:
+            handle.write(b"capture")
+        with open(self.plugin.potfile_manual, "w", encoding="utf-8") as handle:
+            handle.write(
+                "aa:bb:cc:dd:ee:ff:aa:bb:cc:dd:ee:ff:Known:known-pass\n"
+            )
+        self.plugin._verify_capture_passwords = (
+            lambda path, essid, bssid, passwords, revision: (True, False)
+        )
+        agent = types.SimpleNamespace(view=lambda: None)
+        with mock.patch("A_pwmenu.shutil.which", return_value="/usr/bin/aircrack-ng"), \
+             mock.patch("A_pwmenu.subprocess.run") as run:
+            result = self.plugin._run_quickdic(
+                agent,
+                capture_path,
+                {"bssid": "aa:bb:cc:dd:ee:ff"},
+            )
+
+        self.assertTrue(result)
+        run.assert_not_called()
+
+    def test_integrated_quickdic_recovers_sidecar_display_and_event(self):
+        capture_path = os.path.join(
+            self.tempdir.name, "Fresh_aabbccddeeff.pcap"
+        )
+        with open(capture_path, "wb") as handle:
+            handle.write(b"capture")
+        wordlist_dir = os.path.join(self.tempdir.name, "wordlists")
+        os.makedirs(wordlist_dir)
+        with open(os.path.join(wordlist_dir, "quick.txt"), "w", encoding="utf-8") as handle:
+            handle.write("fresh-pass\n")
+        self.plugin.options.update({
+            "quickdic_wordlist_folder": wordlist_dir,
+            "quickdic_update_display": True,
+            "quickdic_telegram_enabled": False,
+        })
+
+        class View:
+            def __init__(self):
+                self.values = {}
+                self.updated = False
+            def set(self, key, value):
+                self.values[key] = value
+            def update(self, force=False):
+                self.updated = force
+
+        view = View()
+        agent = types.SimpleNamespace(view=lambda: view)
+
+        def aircrack(command, **kwargs):
+            output_path = command[command.index("-l") + 1]
+            with open(output_path, "w", encoding="utf-8") as handle:
+                handle.write("fresh-pass")
+            return types.SimpleNamespace(
+                returncode=0,
+                stdout="KEY FOUND! [ fresh-pass ]",
+                stderr="",
+            )
+
+        with mock.patch("A_pwmenu.shutil.which", return_value="/usr/bin/aircrack-ng"), \
+             mock.patch("A_pwmenu.subprocess.run", side_effect=aircrack), \
+             mock.patch("A_pwmenu.plugins.on", create=True) as event:
+            result = self.plugin._run_quickdic(
+                agent,
+                capture_path,
+                {"bssid": "aa:bb:cc:dd:ee:ff"},
+            )
+
+        self.assertTrue(result)
+        with open(capture_path + ".cracked", encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), "fresh-pass")
+        self.assertIn("fresh-pass", view.values["status"])
+        self.assertTrue(view.updated)
+        event.assert_called_once()
 
     def test_uncracked_export_keeps_best_duplicate_capture(self):
         second_dir = tempfile.TemporaryDirectory()
@@ -265,7 +543,7 @@ class CaptureQualityTests(unittest.TestCase):
 
         self.assertIn("function qualityStatusBlock", page)
         self.assertIn("Capture Cleanup", page)
-        self.assertIn("Download Best Uncracked", page)
+        self.assertIn("Download All Uncracked APs", page)
         self.assertIn("Made by", page)
         self.assertIn("function loadYandexMaps", page)
         self.assertIn("function whitelistAction", page)
