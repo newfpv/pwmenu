@@ -47,7 +47,7 @@ logging.info("[A_pwmenu] Module init.")
 
 class A_pwmenu(plugins.Plugin):
     __author__ = 'NewFPV'
-    __version__ = '1.3.5'
+    __version__ = '1.3.6'
     __license__ = 'GPL3'
     __description__ = 'Ultimate Password Manager'
 
@@ -1125,7 +1125,9 @@ class A_pwmenu(plugins.Plugin):
     def _handshake_identity(self, filename):
         name = os.path.splitext(os.path.basename(filename or ''))[0]
         if '_' not in name:
-            return name, ''
+            # Hidden/unknown ESSIDs are commonly saved as `<bssid>.pcap`.
+            # Retain the visible stem while still exposing the exact AP identity.
+            return name, self._compact_bssid(name)
         essid, raw_bssid = name.rsplit('_', 1)
         bssid = self._compact_bssid(raw_bssid)
         if len(bssid) != 12:
@@ -1468,7 +1470,7 @@ class A_pwmenu(plugins.Plugin):
                         path = value
                 if not path:
                     path = self._find_handshake_path(name)
-                if path and not self._is_locally_cracked(name, cracked) and path not in paths:
+                if path and not self._capture_has_known_password(path, cracked) and path not in paths:
                     paths.append(path)
             return paths
 
@@ -1476,9 +1478,21 @@ class A_pwmenu(plugins.Plugin):
             if not os.path.exists(directory):
                 continue
             for path in glob.glob(os.path.join(directory, '*.pcap')):
-                if not self._is_locally_cracked(os.path.basename(path), cracked) and path not in paths:
+                if not self._capture_has_known_password(path, cracked) and path not in paths:
                     paths.append(path)
         return paths
+
+    def _best_capture_paths_by_ap(self, paths):
+        """Keep the strongest capture for each resolved BSSID."""
+        selected = {}
+        for path in paths:
+            _, bssid = self._capture_export_network(path)
+            identity = ('bssid', bssid) if bssid else ('file', os.path.realpath(path))
+            score = self._capture_export_score(path)
+            current = selected.get(identity)
+            if current is None or score > current[0]:
+                selected[identity] = (score, path)
+        return [item[1] for item in selected.values()]
 
     def _queue_ohc_files(self, filenames=None, force=False):
         paths = self._candidate_ohc_paths(filenames)
@@ -1516,7 +1530,7 @@ class A_pwmenu(plugins.Plugin):
         paths = []
         changed = False
         for path, record in pending.items():
-            if self._is_locally_cracked(os.path.basename(path), cracked):
+            if self._capture_has_known_password(path, cracked):
                 with self.data_lock:
                     self.data.setdefault('ohc_pending_files', {}).pop(path, None)
                 self._ohc_mark_path(path, 'local_cracked', 'Password already known locally')
@@ -1635,6 +1649,18 @@ class A_pwmenu(plugins.Plugin):
 
         self.ohc_display_status = 'OHC upload'
         paths = self._candidate_ohc_paths(filenames)
+        best_paths = self._best_capture_paths_by_ap(paths)
+        duplicate_paths = set(paths) - set(best_paths)
+        for path in duplicate_paths:
+            self._ohc_mark_path(
+                path,
+                'already_reported',
+                'Better capture selected for the same AP',
+            )
+            self._complete_ohc_path(path)
+        paths = best_paths
+        if duplicate_paths:
+            self._save_data()
 
         with self.data_lock:
             reported = set(self.data.setdefault('ohc_reported', []))
@@ -1688,6 +1714,7 @@ class A_pwmenu(plugins.Plugin):
         failed_extract = 0
         already_reported = 0
         already_exported = 0
+        queued_bssids = set()
         self.ohc_progress_total = len(paths)
         for idx, path in enumerate(paths):
             self.ohc_progress_current = idx + 1
@@ -1705,9 +1732,9 @@ class A_pwmenu(plugins.Plugin):
                 h = h.strip()
                 if not h:
                     continue
-                path_hashes[path].add(h)
                 path_hash_count[path] = path_hash_count.get(path, 0) + 1
                 if self._ohc_hash_in_export(h, export_identities, export_bssids):
+                    path_hashes[path].add(h)
                     already_reported += 1
                     already_exported += 1
                     reported_hashes.add(h)
@@ -1719,14 +1746,21 @@ class A_pwmenu(plugins.Plugin):
                     )
                     continue
                 if h in reported_hashes:
+                    path_hashes[path].add(h)
                     already_reported += 1
                     self._ohc_mark_path(path, 'already_reported', 'Already exists in OHC tasks', path_hash_count.get(path, 0))
                     continue
+                _, hash_bssid = self._ohc_hash_task_identity(h)
+                if hash_bssid and hash_bssid in queued_bssids:
+                    continue
                 if h in hash_sources:
                     continue
+                path_hashes[path].add(h)
                 hash_files[h] = os.path.basename(path)
                 hashes.append(h)
                 hash_sources[h] = path
+                if hash_bssid:
+                    queued_bssids.add(hash_bssid)
 
         for path, extracted in path_hashes.items():
             if extracted and extracted.issubset(reported_hashes):
@@ -3311,6 +3345,7 @@ class A_pwmenu(plugins.Plugin):
     def _process_import(self, content, name):
         self._ensure_file(self.potfile_ohc)
         is_json = name.lower().endswith('.json') or content.strip().startswith('[')
+        is_handshake_lab_export = False
         if is_json:
             parsed = json.loads(content)
             report = self._imp_json(parsed)
@@ -3318,7 +3353,16 @@ class A_pwmenu(plugins.Plugin):
         else:
             report = self._imp_csv(content)
             export_tasks = self._ohc_export_tasks_from_csv(content)
-        report['ohc_tasks'] = self._store_ohc_export_snapshot(export_tasks, name)
+            is_handshake_lab_export = any(
+                self._is_handshake_lab_row(row) for row in export_tasks
+            )
+        # A Handshake Lab result import updates recovered credentials, but it is
+        # not an OHC task inventory. Never let it erase the last real OHC export.
+        report['ohc_tasks'] = (
+            0
+            if is_handshake_lab_export
+            else self._store_ohc_export_snapshot(export_tasks, name)
+        )
         if report['added'] > 0:
             with self.data_lock:
                 self.data['xp'] += report['added'] * 100
@@ -3794,6 +3838,15 @@ class A_pwmenu(plugins.Plugin):
         )
         return passwords, exact_essid
 
+    def _capture_has_known_password(self, path, cracked=None):
+        essid, bssid = self._capture_export_network(path)
+        passwords, _ = self._known_passwords_for_capture(
+            cracked if cracked is not None else self._get_cracked_data(),
+            essid,
+            bssid,
+        )
+        return bool(passwords)
+
     def _capture_is_crackable(self, path):
         name = os.path.basename(path)
         quality = self._quality_file_record(name, path)
@@ -3912,12 +3965,35 @@ class A_pwmenu(plugins.Plugin):
             size,
         )
 
+    def _capture_export_network(self, path):
+        """Resolve the AP identity from capture data when its filename is incomplete."""
+        name = os.path.basename(path)
+        essid, bssid = self._handshake_identity(name)
+        quality = self._quality_file_record(name, path)
+        quality_bssid = self._compact_bssid(quality.get('bssid'))
+        quality_essid = str(quality.get('essid') or '').strip()
+
+        # Older quality records did not persist ESSID/BSSID. Refresh only the
+        # ambiguous filenames so normal exports do not reconvert every PCAP.
+        if not bssid and not quality_bssid:
+            _, refreshed = self._run_capture_analysis(path)
+            if refreshed:
+                quality = refreshed
+                quality_bssid = self._compact_bssid(quality.get('bssid'))
+                quality_essid = str(quality.get('essid') or '').strip()
+
+        if quality_bssid:
+            bssid = quality_bssid
+            if quality_essid:
+                essid = quality_essid
+        elif quality_essid and not essid:
+            essid = quality_essid
+        return essid, bssid
+
     def _uncracked_export_files(self):
         """Export every crackable unresolved AP, using its best remaining capture."""
         cracked = self._get_cracked_data()
-        credential_revision = self._credential_source_revision()
         selected = {}
-        cache_changed = False
         with self.password_verify_lock:
             for directory in self.handshake_dirs:
                 if not os.path.exists(directory):
@@ -3926,31 +4002,24 @@ class A_pwmenu(plugins.Plugin):
                     if not self._capture_is_crackable(path):
                         continue
                     name = os.path.basename(path)
-                    essid, bssid = self._handshake_identity(name)
-                    passwords, exact_essid = self._known_passwords_for_capture(
+                    essid, bssid = self._capture_export_network(path)
+                    passwords, _ = self._known_passwords_for_capture(
                         cracked, essid, bssid
                     )
-                    verified, changed = self._verify_capture_passwords(
-                        path,
-                        exact_essid,
-                        bssid,
-                        passwords,
-                        credential_revision,
-                    )
-                    cache_changed = cache_changed or changed
-                    if verified:
+                    # A recovered credential for this exact BSSID already makes
+                    # the AP resolved for Handshake Lab. Re-exporting another
+                    # capture only creates duplicate Recovered cards there.
+                    if passwords:
                         continue
 
-                    # BSSID is the AP identity even if its ESSID changed. Without a
-                    # valid BSSID, keep files separate rather than merge unrelated APs.
+                    # BSSID is the AP identity even if its ESSID or filename
+                    # changed. Without one, keep files separate conservatively.
                     identity = ('bssid', bssid) if bssid else ('file', name)
                     score = self._capture_export_score(path)
                     current = selected.get(identity)
                     if current is None or score > current[0]:
                         selected[identity] = (score, path, name)
 
-        if cache_changed:
-            self._save_data()
         files = [(item[1], item[2]) for item in selected.values()]
         files.sort(key=lambda item: item[1].casefold())
         return files

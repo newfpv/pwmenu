@@ -89,6 +89,12 @@ class CaptureQualityTests(unittest.TestCase):
         self.assertEqual(partial["grade"], "Partial")
         self.assertEqual(unusable["grade"], "Unusable")
 
+    def test_bssid_only_capture_filename_preserves_ap_identity(self):
+        self.assertEqual(
+            self.plugin._handshake_identity("d0f3f54ab694.pcap"),
+            ("d0f3f54ab694", "d0f3f54ab694"),
+        )
+
     def test_empty_cleanup_requires_current_report_token(self):
         empty_path = os.path.join(self.tempdir.name, "Empty_aabbccddeeff.pcap")
         with open(empty_path, "wb") as handle:
@@ -201,6 +207,10 @@ class CaptureQualityTests(unittest.TestCase):
         self.assertIn("Shared_Network.pcap", selected)
 
     def test_handshake_lab_import_preserves_source_and_matches_sanitized_capture(self):
+        self.plugin._store_ohc_export_snapshot(
+            [{"task": "OHC Network<br>11:22:33:44:55:66"}],
+            "OnlineHashCrack_tasks.csv",
+        )
         output = io.StringIO(newline="")
         writer = csv.DictWriter(
             output,
@@ -230,6 +240,9 @@ class CaptureQualityTests(unittest.TestCase):
         self.assertEqual(first["source"], "Handshake Lab")
         self.assertEqual(second["added"], 0)
         self.assertEqual(second["already"], 1)
+        _, snapshot_bssids, snapshot_info = self.plugin._load_ohc_export_snapshot()
+        self.assertEqual(snapshot_info["source"], "OnlineHashCrack_tasks.csv")
+        self.assertEqual(snapshot_bssids, {"11:22:33:44:55:66"})
 
         capture_path = os.path.join(self.tempdir.name, "TPLink8241Guest_aabbccddeeff.pcap")
         with open(capture_path, "wb") as handle:
@@ -269,7 +282,7 @@ class CaptureQualityTests(unittest.TestCase):
             "local_cracked",
         )
 
-    def test_uncracked_export_keeps_known_bssid_when_password_fails_capture(self):
+    def test_uncracked_export_excludes_known_bssid_without_reverification(self):
         capture_path = os.path.join(
             self.tempdir.name, "ChangedNetwork_aaaaaaaaaaaa.pcap"
         )
@@ -286,13 +299,36 @@ class CaptureQualityTests(unittest.TestCase):
             "hashes": 1,
             "signature": self.plugin._ohc_file_signature(capture_path),
         }
-        self.plugin._verify_capture_passwords = (
-            lambda path, essid, bssid, passwords, revision: (False, False)
+        self.plugin._verify_capture_passwords = mock.Mock(
+            side_effect=AssertionError("known APs must not be re-exported")
         )
 
         selected = [name for _, name in self.plugin._uncracked_export_files()]
 
-        self.assertEqual(selected, [os.path.basename(capture_path)])
+        self.assertEqual(selected, [])
+        self.plugin._verify_capture_passwords.assert_not_called()
+
+    def test_uncracked_export_uses_analyzed_bssid_for_legacy_filename(self):
+        capture_path = os.path.join(self.tempdir.name, "aabbccddeeff.pcap")
+        with open(capture_path, "wb") as handle:
+            handle.write(b"legacy-name")
+        with open(self.plugin.potfile_handshake_lab, "w", encoding="utf-8") as handle:
+            handle.write(
+                "aa:bb:cc:dd:ee:ff:aa:bb:cc:dd:ee:ff:"
+                "Exact_Network:secret123\n"
+            )
+        self.plugin.data["capture_quality"][os.path.basename(capture_path)] = {
+            "grade": "Usable",
+            "rank": 2,
+            "hashes": 1,
+            "essid": "Exact_Network",
+            "bssid": "aabbccddeeff",
+            "signature": self.plugin._ohc_file_signature(capture_path),
+        }
+
+        selected = self.plugin._uncracked_export_files()
+
+        self.assertEqual(selected, [])
 
     def test_uncracked_export_excludes_capture_without_usable_hash(self):
         capture_path = os.path.join(
@@ -482,6 +518,56 @@ class CaptureQualityTests(unittest.TestCase):
         selected = self.plugin._uncracked_export_files()
 
         self.assertEqual([(excellent_path, filename)], selected)
+
+    def test_uncracked_export_keeps_best_differently_named_capture_per_bssid(self):
+        weak_path = os.path.join(self.tempdir.name, "OldName_aabbccddeeff.pcap")
+        excellent_path = os.path.join(self.tempdir.name, "NewName_aabbccddeeff.pcap")
+        with open(weak_path, "wb") as handle:
+            handle.write(b"weak")
+        with open(excellent_path, "wb") as handle:
+            handle.write(b"excellent")
+        self.plugin.data["capture_quality"] = {
+            os.path.basename(weak_path): {
+                "grade": "Partial", "rank": 1, "hashes": 1,
+                "essid": "Exact-Name", "bssid": "aabbccddeeff",
+                "signature": self.plugin._ohc_file_signature(weak_path),
+            },
+            os.path.basename(excellent_path): {
+                "grade": "Excellent", "rank": 3, "hashes": 1, "authorized": 1,
+                "essid": "Exact-Name", "bssid": "aabbccddeeff",
+                "signature": self.plugin._ohc_file_signature(excellent_path),
+            },
+        }
+
+        selected = self.plugin._uncracked_export_files()
+
+        self.assertEqual(
+            [(excellent_path, os.path.basename(excellent_path))],
+            selected,
+        )
+
+    def test_ohc_keeps_best_capture_per_bssid(self):
+        weak_path = os.path.join(self.tempdir.name, "Old_aabbccddeeff.pcap")
+        best_path = os.path.join(self.tempdir.name, "New_aabbccddeeff.pcap")
+        for path in (weak_path, best_path):
+            with open(path, "wb") as handle:
+                handle.write(b"capture")
+        self.plugin.data["capture_quality"] = {
+            os.path.basename(weak_path): {
+                "rank": 1,
+                "hashes": 1,
+                "signature": self.plugin._ohc_file_signature(weak_path),
+            },
+            os.path.basename(best_path): {
+                "rank": 3,
+                "hashes": 2,
+                "signature": self.plugin._ohc_file_signature(best_path),
+            },
+        }
+
+        selected = self.plugin._best_capture_paths_by_ap([weak_path, best_path])
+
+        self.assertEqual(selected, [best_path])
 
     def test_web_template_renders_quality_cleanup_and_branding(self):
         app = Flask(__name__)

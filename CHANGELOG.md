@@ -2,6 +2,14 @@
 
 All notable changes to A_pwmenu are documented here.
 
+## 1.3.6 — 2026-07-26
+
+- Fixed the uncracked ZIP to exclude every AP whose exact BSSID already has an imported password, without re-exporting it when a redundant capture-level aircrack verification fails.
+- Resolved legacy or malformed capture filenames through the analyzed WPA hash identity before filtering and deduplication, including BSSID-only filenames without an underscore.
+- Kept exactly one highest-quality export candidate per resolved BSSID, even when captures use different filenames.
+- Preserved the last real OHC task snapshot when Handshake Lab results are imported, so its BSSID list cannot be replaced by an unrelated results file.
+- Suppressed APs already present in the last OHC export and submitted at most one hash from the best capture for each BSSID per upload run.
+
 ## 1.3.5 — 2026-07-25
 
 - Integrated the standalone `display-password` and `better_quickdic` features into A_pwmenu with independent module switches and detailed display, dictionary, queue, timeout, and Telegram settings.
