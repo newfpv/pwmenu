@@ -228,6 +228,63 @@ class PWMenuFeatureTests(unittest.TestCase):
         self.assertGreater(self.plugin.data["wpa_last_download"], 0)
         self.assertEqual({"key": "secret"}, get.call_args.kwargs["cookies"])
 
+    def test_wpa_compact_potfile_preserves_bssid_and_password_colons(self):
+        target = os.path.join(
+            self.tempdir.name, "wpa-sec.cracked.potfile"
+        )
+        with open(target, "w", encoding="utf-8") as handle:
+            handle.write(
+                "aabbccddeeff:112233445566:Cafe_Network:pass:word\n"
+            )
+
+        cracked = self.plugin._get_cracked_data()
+
+        self.assertEqual(len(cracked), 1)
+        record = next(iter(cracked.values()))
+        self.assertEqual(record["essid"], "Cafe_Network")
+        self.assertEqual(record["bssid"], "aabbccddeeff")
+        self.assertEqual(record["password"], "pass:word")
+        self.assertEqual(record["source"], "WPA-Sec")
+
+    def test_wpa_compact_potfile_keeps_same_name_on_distinct_bssids(self):
+        target = os.path.join(
+            self.tempdir.name, "wpa-sec.cracked.potfile"
+        )
+        with open(target, "w", encoding="utf-8") as handle:
+            handle.write(
+                "aabbccddeeff:112233445566:Shared:password123\n"
+                "ffeeddccbbaa:665544332211:Shared:password123\n"
+            )
+
+        cracked = self.plugin._get_cracked_data()
+
+        self.assertEqual(len(cracked), 2)
+        self.assertEqual(
+            {record["bssid"] for record in cracked.values()},
+            {"aabbccddeeff", "ffeeddccbbaa"},
+        )
+
+    def test_wpa_compact_and_colon_formats_merge_by_exact_bssid(self):
+        target = os.path.join(
+            self.tempdir.name, "wpa-sec.cracked.potfile"
+        )
+        with open(target, "w", encoding="utf-8") as handle:
+            handle.write(
+                "aabbccddeeff:112233445566:Cafe:password123\n"
+            )
+        with open(self.plugin.potfile_ohc, "w", encoding="utf-8") as handle:
+            handle.write(
+                "aa:bb:cc:dd:ee:ff:11:22:33:44:55:66:"
+                "Cafe:password123\n"
+            )
+
+        cracked = self.plugin._get_cracked_data()
+
+        self.assertEqual(len(cracked), 1)
+        record = next(iter(cracked.values()))
+        self.assertEqual(record["bssid"], "aabbccddeeff")
+        self.assertEqual(record["sources"], ["WPA-Sec", "OHC"])
+
 
 if __name__ == "__main__":
     unittest.main()

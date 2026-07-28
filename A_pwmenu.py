@@ -49,7 +49,7 @@ logging.info("[A_pwmenu] Module init.")
 
 class A_pwmenu(plugins.Plugin):
     __author__ = 'NewFPV'
-    __version__ = '1.3.7'
+    __version__ = '1.3.8'
     __license__ = 'GPL3'
     __description__ = 'Ultimate Password Manager'
 
@@ -1327,7 +1327,7 @@ class A_pwmenu(plugins.Plugin):
             response = requests.get(
                 api_url,
                 cookies={'key': str(key)},
-                headers={'User-Agent': 'PWMenu/1.3.7'},
+                headers={'User-Agent': 'PWMenu/1.3.8'},
                 timeout=(10, 30),
             )
             response.raise_for_status()
@@ -2629,7 +2629,7 @@ class A_pwmenu(plugins.Plugin):
                     headers={
                         'User-Agent': (
                             'Mozilla/5.0 (X11; Linux aarch64) '
-                            'PWMenu/1.3.7'
+                            'PWMenu/1.3.8'
                         )
                     },
                     timeout=(10, 30)
@@ -4472,18 +4472,27 @@ class A_pwmenu(plugins.Plugin):
         return None
 
     def _parse_pot_line(self, line):
+        value = line or ''
+        mac = r'(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}'
         match = re.fullmatch(
-            r'((?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}):'
-            r'((?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}):(.*?):(.*)',
-            line or ''
+            rf'({mac}):({mac}):(.*?):(.*)',
+            value,
         )
+        if not match:
+            # WPA-sec's downloadable potfile uses compact 12-hex MAC fields:
+            # BSSID:STATION:ESSID:PASSWORD. Preserve the exact AP identity
+            # instead of falling back to an ESSID-only credential.
+            match = re.fullmatch(
+                r'([0-9A-Fa-f]{12}):([0-9A-Fa-f]{12}):(.*?):(.*)',
+                value,
+            )
         if not match:
             return None
         return {
-            'bssid': match.group(1).lower(),
-            'station': match.group(2).lower(),
+            'bssid': self._colon_bssid(match.group(1)),
+            'station': self._colon_bssid(match.group(2)),
             'essid': match.group(3),
-            'password': match.group(4)
+            'password': match.group(4),
         }
 
     def _pot_line_key(self, line):
