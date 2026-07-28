@@ -2,6 +2,12 @@
 
 All notable changes to A_pwmenu are documented here.
 
+## 1.3.8 — 2026-07-29
+
+- Parsed WPA-sec result files with compact 12-hex BSSID and station fields, preserving exact AP identity instead of creating `Name-only credential` entries.
+- Merged WPA-sec results with OHC, Handshake Lab, Manual, and QuickDic records by exact BSSID and password while retaining separate access points that share the same ESSID and password.
+- Preserved passwords containing colons in the compact WPA-sec result format and added regression coverage for both supported potfile encodings.
+
 ## 1.3.7 — 2026-07-29
 
 - Fully integrated WPA-sec automatic uploads, persistent per-BSSID submission history, migration from the stock plugin report, atomic result downloads, manual synchronization, and status reporting.

@@ -270,7 +270,7 @@ sudo cp /usr/local/share/pwnagotchi/custom-plugins/A_pwmenu.py \
   /root/A_pwmenu.py.backup 2>/dev/null || true
 
 sudo wget -O /usr/local/share/pwnagotchi/custom-plugins/A_pwmenu.py \
-  https://raw.githubusercontent.com/newfpv/pwmenu/v1.3.7/A_pwmenu.py
+  https://raw.githubusercontent.com/newfpv/pwmenu/v1.3.8/A_pwmenu.py
 
 sudo chown root:root /usr/local/share/pwnagotchi/custom-plugins/A_pwmenu.py
 sudo chmod 644 /usr/local/share/pwnagotchi/custom-plugins/A_pwmenu.py
