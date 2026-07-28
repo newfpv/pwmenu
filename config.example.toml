@@ -12,8 +12,14 @@ main.plugins.A_pwmenu.module_time_sync_enabled = true
 main.plugins.A_pwmenu.module_display_password_enabled = true
 main.plugins.A_pwmenu.module_quickdic_enabled = true
 
-# WPA-sec. Leave the key empty when this integration is unused.
+# Fully integrated WPA-sec uploader and result downloader. PWMenu remembers
+# submitted APs, sends only the best unresolved capture, and downloads the
+# account potfile atomically.
 main.plugins.A_pwmenu.wpa_sec_key = ""
+main.plugins.A_pwmenu.wpa_sec_api_url = "https://wpa-sec.stanev.org"
+main.plugins.A_pwmenu.wpa_sec_auto_upload = true
+main.plugins.A_pwmenu.wpa_sec_download_results = true
+main.plugins.A_pwmenu.wpa_sec_sync_interval = 3600
 
 # OnlineHashCrack API v2.
 main.plugins.A_pwmenu.ohc_enabled = false
@@ -22,6 +28,14 @@ main.plugins.A_pwmenu.ohc_auto_upload = true
 main.plugins.A_pwmenu.ohc_sync_interval = 3600
 main.plugins.A_pwmenu.ohc_retry_poll_interval = 60
 main.plugins.A_pwmenu.ohc_reconcile_on_start = false
+# Optional OHC-only VLESS route. Leave empty to connect directly.
+# The link is read from config.toml and is never written to PWMenu state.
+main.plugins.A_pwmenu.ohc_vless_url = ""
+# "auto" uses the flow from the link. Set "" only when the server account
+# is configured without flow even though the shared link contains one.
+main.plugins.A_pwmenu.ohc_vless_flow = "auto"
+main.plugins.A_pwmenu.ohc_xray_binary = "/usr/local/bin/xray"
+main.plugins.A_pwmenu.ohc_proxy_port = 10809
 
 # PwnDroid GPS over the phone's Bluetooth PAN connection.
 main.plugins.A_pwmenu.pwndroid_ws_enabled = true
@@ -86,6 +100,8 @@ main.plugins.A_pwmenu.import_max_bytes = 2097152
 main.plugins.A_pwmenu.archive_memory_limit = 2097152
 
 # After migration, keep the legacy standalone plugins disabled to avoid duplicate
-# screen elements and duplicate dictionary work.
+# screen elements, uploads, downloads, and dictionary work.
+main.plugins.wpa-sec.enabled = false
+main.plugins.wpa-sec-list.enabled = false
 main.plugins.display-password.enabled = false
 main.plugins.better_quickdic.enabled = false

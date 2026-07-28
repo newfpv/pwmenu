@@ -2,6 +2,19 @@
 
 All notable changes to A_pwmenu are documented here.
 
+## 1.3.7 — 2026-07-29
+
+- Fully integrated WPA-sec automatic uploads, persistent per-BSSID submission history, migration from the stock plugin report, atomic result downloads, manual synchronization, and status reporting.
+- Corrected WPA-sec authentication to use the service key cookie and removed the need for the standalone `wpa-sec` and `wpa-sec-list` plugins.
+- Required every manually entered or edited password to pass an `aircrack-ng` check against a matching capture before it can be stored.
+- Added exact handshake placement with a fixed center pin and explicit confirmation: choose **Map/Move**, pan the map, then press the check mark, or add the capture to an existing point/cluster. Manually assigned locations are labeled **Map**, while measured locations remain **GPS**.
+- Changed the TXT password export to sorted UTF-8 TSV with BOM, CRLF lines, explicit ESSID/BSSID/PASSWORD/SOURCE columns, and lossless passwords containing colons.
+- Collapsed whitelist entries only after the list exceeds 15 items: the first 10 remain visible and the rest move under an expandable control.
+- Added clickable OnlineHashCrack and WPA-sec service links and fixed duplicate-filename capture selection across multiple handshake directories.
+- Made the last imported OHC task export and persistent local hash history hard pre-queue filters by BSSID, so already submitted access points never re-enter the queue and only the best unresolved capture per AP is queued.
+- Added an optional OHC-only VLESS route through a loopback Xray HTTP proxy; leaving `ohc_vless_url` empty retains direct access and no other Pwnagotchi traffic is proxied.
+- Added an explicit VLESS flow override for provider links whose advertised flow does not match the server-side account.
+
 ## 1.3.6 — 2026-07-26
 
 - Fixed the uncracked ZIP to exclude every AP whose exact BSSID already has an imported password, without re-exporting it when a redundant capture-level aircrack verification fails.

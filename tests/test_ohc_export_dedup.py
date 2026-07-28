@@ -4,6 +4,7 @@ import sys
 import tempfile
 import types
 import unittest
+from unittest import mock
 
 
 def install_pwnagotchi_stubs():
@@ -40,6 +41,20 @@ class OhcExportDedupTests(unittest.TestCase):
             self.tempdir.name,
             ".a_pwmenu_ohc_export.json",
         )
+        self.plugin.data_file = os.path.join(
+            self.tempdir.name,
+            ".a_pwmenu_data.json",
+        )
+        self.plugin.options = {}
+        self.plugin.data = {
+            "ohc_files": {},
+            "ohc_hash_files": {},
+            "ohc_found_files": {},
+            "ohc_pending_files": {},
+            "ohc_file_signatures": {},
+            "ohc_reported": [],
+            "ohc_reported_hashes": [],
+        }
 
     def test_task_and_hash_match(self):
         task = "Example WiFi<br><span class=\"muted\">aa:bb:cc:dd:ee:ff</span>"
@@ -118,6 +133,95 @@ class OhcExportDedupTests(unittest.TestCase):
         with open(self.plugin.ohc_export_file, "rb") as handle:
             after = handle.read()
         self.assertEqual(before, after)
+
+    def test_imported_export_stops_capture_before_queue(self):
+        path = os.path.join(self.tempdir.name, "Example_aabbccddeeff.pcap")
+        with open(path, "wb") as handle:
+            handle.write(b"pcap")
+        self.plugin._store_ohc_export_snapshot(
+            [{"task": "Example<br>aa:bb:cc:dd:ee:ff"}],
+            "tasks.csv",
+        )
+
+        with (
+            mock.patch.object(self.plugin, "_candidate_ohc_paths", return_value=[path]),
+            mock.patch.object(self.plugin, "_best_capture_paths_by_ap", return_value=[path]),
+            mock.patch.object(
+                self.plugin,
+                "_capture_export_network",
+                return_value=("Example", "aabbccddeeff"),
+            ),
+        ):
+            queued = self.plugin._queue_ohc_files(force=True)
+
+        self.assertEqual(queued, 0)
+        self.assertEqual(self.plugin.data["ohc_pending_files"], {})
+        self.assertEqual(
+            self.plugin.data["ohc_files"][os.path.basename(path)]["status"],
+            "already_reported",
+        )
+
+    def test_local_reported_hash_stops_same_bssid_before_queue(self):
+        path = os.path.join(self.tempdir.name, "Renamed_aabbccddeeff.pcap")
+        with open(path, "wb") as handle:
+            handle.write(b"pcap")
+        self.plugin.data["ohc_reported_hashes"] = [
+            "WPA*02*00*aabbccddeeff*bbbbbbbbbbbb*4f6c64206e616d65"
+        ]
+
+        with (
+            mock.patch.object(self.plugin, "_candidate_ohc_paths", return_value=[path]),
+            mock.patch.object(self.plugin, "_best_capture_paths_by_ap", return_value=[path]),
+            mock.patch.object(
+                self.plugin,
+                "_capture_export_network",
+                return_value=("Renamed", "aabbccddeeff"),
+            ),
+        ):
+            queued = self.plugin._queue_ohc_files(force=True)
+
+        self.assertEqual(queued, 0)
+        self.assertEqual(self.plugin.data["ohc_pending_files"], {})
+
+    def test_vless_config_is_disabled_when_url_is_empty(self):
+        self.plugin.options = {"ohc_vless_url": ""}
+        self.assertIsNone(self.plugin._ohc_vless_config())
+
+    def test_vless_reality_url_builds_loopback_http_proxy(self):
+        self.plugin.options = {
+            "ohc_vless_url": (
+                "vless://11111111-2222-3333-4444-555555555555@vpn.example:443"
+                "?encryption=none&flow=xtls-rprx-vision&type=tcp"
+                "&security=reality&sni=www.example.com&fp=chrome"
+                "&pbk=public-key&sid=a916&spx=%2F"
+            ),
+            "ohc_proxy_port": 10809,
+        }
+
+        config = self.plugin._ohc_vless_config()
+
+        self.assertEqual(config["inbounds"][0]["listen"], "127.0.0.1")
+        self.assertEqual(config["inbounds"][0]["protocol"], "http")
+        self.assertEqual(config["outbounds"][0]["protocol"], "vless")
+        self.assertEqual(
+            config["outbounds"][0]["streamSettings"]["security"],
+            "reality",
+        )
+
+    def test_vless_flow_can_override_incorrect_shared_link(self):
+        self.plugin.options = {
+            "ohc_vless_url": (
+                "vless://11111111-2222-3333-4444-555555555555@vpn.example:443"
+                "?encryption=none&flow=xtls-rprx-vision-udp443&type=tcp"
+                "&security=reality&sni=www.example.com&fp=chrome"
+                "&pbk=public-key&sid=a916&spx=%2F"
+            ),
+            "ohc_vless_flow": "",
+        }
+
+        config = self.plugin._ohc_vless_config()
+
+        self.assertEqual(config["outbounds"][0]["settings"]["flow"], "")
 
 
 if __name__ == "__main__":
