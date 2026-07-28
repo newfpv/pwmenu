@@ -21,6 +21,8 @@ import shutil
 import tempfile
 import ast
 import gzip
+import math
+import urllib.parse
 import pwnagotchi.plugins as plugins
 import pwnagotchi.ui.fonts as fonts
 from flask import render_template_string, send_file, make_response, has_request_context
@@ -47,7 +49,7 @@ logging.info("[A_pwmenu] Module init.")
 
 class A_pwmenu(plugins.Plugin):
     __author__ = 'NewFPV'
-    __version__ = '1.3.6'
+    __version__ = '1.3.7'
     __license__ = 'GPL3'
     __description__ = 'Ultimate Password Manager'
 
@@ -65,8 +67,11 @@ class A_pwmenu(plugins.Plugin):
         self.potfile_lock = threading.RLock()
         self.time_sync_lock = threading.Lock()
         self.wpa_upload_lock = threading.Lock()
+        self.wpa_pending_lock = threading.RLock()
+        self.wpa_pending_files = {}
         self.wpa_upload_thread = None
         self.wpa_last_result = ''
+        self.wpa_force_download = False
         self.gps_indicator_name = 'pwmenu_gps'
         self.pwndroid_running = False
         self.pwndroid_thread = None
@@ -94,6 +99,9 @@ class A_pwmenu(plugins.Plugin):
         self.ohc_scheduler_running = False
         self.ohc_scheduler_thread = None
         self.ohc_scheduler_wakeup = threading.Event()
+        self.ohc_proxy_lock = threading.RLock()
+        self.ohc_proxy_process = None
+        self.ohc_proxy_config_file = '/run/a_pwmenu_ohc_xray.json'
         self.capture_analysis_lock = threading.Lock()
         self.password_verify_lock = threading.Lock()
         self.quality_thread_lock = threading.Lock()
@@ -125,6 +133,7 @@ class A_pwmenu(plugins.Plugin):
         self._normalize_potfile(self.potfile_handshake_lab)
         self._normalize_potfile(self.potfile_manual)
         self._load_data()
+        self._migrate_wpa_sec_state()
         self._repair_whitelist_aliases()
         self.options.setdefault('time_sync_interval', 1800)
         self.options.setdefault('phone_gps_enabled', True)
@@ -144,10 +153,18 @@ class A_pwmenu(plugins.Plugin):
         self.options.setdefault('ohc_api_key', '')
         self.options.setdefault('ohc_auto_upload', True)
         self.options.setdefault('ohc_sync_interval', 3600)
+        self.options.setdefault('ohc_vless_url', '')
+        self.options.setdefault('ohc_vless_flow', 'auto')
+        self.options.setdefault('ohc_xray_binary', '/usr/local/bin/xray')
+        self.options.setdefault('ohc_proxy_port', 10809)
         self.options.setdefault('import_max_bytes', 2097152)
         self.options.setdefault('archive_memory_limit', 2097152)
         self.options.setdefault('hcxpcapngtool_timeout', 90)
         self.options.setdefault('password_verify_timeout', 45)
+        self.options.setdefault('wpa_sec_api_url', 'https://wpa-sec.stanev.org')
+        self.options.setdefault('wpa_sec_auto_upload', True)
+        self.options.setdefault('wpa_sec_download_results', True)
+        self.options.setdefault('wpa_sec_sync_interval', 3600)
         self.options.setdefault('ohc_retry_poll_interval', 60)
         self.options.setdefault('ohc_reconcile_on_start', False)
         self.options.setdefault('quality_auto_scan', True)
@@ -197,6 +214,7 @@ class A_pwmenu(plugins.Plugin):
             and self._option_bool('ohc_enabled', True)
             and self._option_bool('ohc_auto_upload', True)
         ):
+            self._ensure_ohc_proxy()
             reconcile = self._option_bool('ohc_reconcile_on_start', False)
             if reconcile:
                 with self.data_lock:
@@ -282,6 +300,7 @@ class A_pwmenu(plugins.Plugin):
         self.quickdic_running = False
         self.ohc_scheduler_wakeup.set()
         self.quickdic_wakeup.set()
+        self._stop_ohc_proxy()
         try:
             with ui._lock:
                 if self._module_enabled('gps'):
@@ -300,6 +319,16 @@ class A_pwmenu(plugins.Plugin):
         ):
             self._queue_ohc_files(force=False)
             self._start_ohc_upload_thread()
+        if (
+            self.ready
+            and self._module_enabled('wpa_sec')
+            and self.options.get('wpa_sec_key')
+        ):
+            queued = 0
+            if self._option_bool('wpa_sec_auto_upload', True):
+                queued = self._queue_wpa_files(force=False)
+            if queued or self._wpa_download_is_due():
+                self._start_wpa_sync_thread()
 
     def on_handshake(self, agent, filename, access_point, client_station):
         loc = self._fresh_live_gps() if self._module_enabled('gps') else None
@@ -336,6 +365,15 @@ class A_pwmenu(plugins.Plugin):
             self._start_quality_scan_thread([os.path.basename(filename)])
         if self._module_enabled('quickdic'):
             self._queue_quickdic(agent, filename, access_point)
+        if (
+            self._module_enabled('wpa_sec')
+            and self._option_bool('wpa_sec_auto_upload', True)
+            and self.options.get('wpa_sec_key')
+        ):
+            if self._queue_wpa_files(
+                [os.path.basename(filename)], force=False
+            ):
+                self._start_wpa_sync_thread()
 
     def _display_password_position(self, ui):
         if (
@@ -367,10 +405,7 @@ class A_pwmenu(plugins.Plugin):
         sources = []
         potfiles = []
         if self._option_bool('display_password_wpa_sec', True):
-            potfiles.extend([
-                '/root/handshakes/wpa-sec.cracked.potfile',
-                '/home/pi/handshakes/wpa-sec.cracked.potfile',
-            ])
+            potfiles.extend(self._wpa_potfile_paths())
         if self._option_bool('display_password_ohc', True):
             potfiles.append(self.potfile_ohc)
         if self._option_bool('display_password_handshake_lab', True):
@@ -654,19 +689,31 @@ class A_pwmenu(plugins.Plugin):
                     pwd = request.form.get('password')
                     source = request.form.get('source')
                     bssid = request.form.get('bssid')
-                    if self._delete_password(essid, pwd, source, bssid):
-                        return self._render_page(notification="Password deleted", notif_type="success")
-                    else:
-                        return self._render_page(notification="Could not delete password (readonly source?)", notif_type="error")
+                    deleted = self._delete_password(essid, pwd, source, bssid)
+                    message = (
+                        "Password deleted"
+                        if deleted
+                        else "Could not delete password (readonly source?)"
+                    )
+                    return self._password_action_response(
+                        request, deleted, message, essid, bssid, action='delete'
+                    )
 
                 if path == 'update-password':
-                    self._update_password(
+                    ok, message = self._update_password(
                         request.form.get('essid'),
                         request.form.get('password'),
                         request.form.get('bssid'),
                         request.form.get('old_password'),
                     )
-                    return self._render_page(notification="Password updated", notif_type="success")
+                    return self._password_action_response(
+                        request,
+                        ok,
+                        message,
+                        request.form.get('essid'),
+                        request.form.get('bssid'),
+                        action='update',
+                    )
 
                 if path == 'delete-file':
                     fname = request.form.get('filename')
@@ -720,15 +767,36 @@ class A_pwmenu(plugins.Plugin):
 
                 if path == 'wpa-sec-upload':
                     if not self._module_enabled('wpa_sec'):
-                        return self._render_page(notification="WPA-sec module is disabled", notif_type="error")
+                        return self._action_response(
+                            request, "WPA-sec module is disabled", True, 'handshakes'
+                        )
                     res, is_err = self._handle_wpa_upload(request)
-                    return self._render_page(notification=res, notif_type="error" if is_err else "success", active_tab="handshakes")
+                    return self._action_response(request, res, is_err, 'handshakes')
 
                 if path == 'wpa-sec-upload-cluster':
                     if not self._module_enabled('wpa_sec'):
                         return self._action_response(request, "WPA-sec module is disabled", True, 'map')
                     res, is_err = self._handle_wpa_cluster_upload(request)
                     return self._action_response(request, res, is_err, 'map')
+
+                if path == 'wpa-sec-sync':
+                    if not self._module_enabled('wpa_sec'):
+                        return self._action_response(
+                            request, "WPA-sec module is disabled", True, 'other'
+                        )
+                    if not self.options.get('wpa_sec_key'):
+                        return self._action_response(
+                            request, "WPA-sec key is missing", True, 'other'
+                        )
+                    self.wpa_force_download = True
+                    queued = self._queue_wpa_files(force=False)
+                    self._start_wpa_sync_thread()
+                    return self._action_response(
+                        request,
+                        f"WPA-sec sync started; {queued} new capture(s) queued",
+                        False,
+                        'other',
+                    )
 
                 if path == 'ohc-upload-cluster':
                     if not self._module_enabled('ohc'):
@@ -743,8 +811,24 @@ class A_pwmenu(plugins.Plugin):
                     return self._render_page(notification=res, notif_type="error" if is_err else "success", active_tab="handshakes")
 
                 if path == 'add-password':
-                    self._add_manual_password(request.form.get('essid'), request.form.get('bssid'), request.form.get('password'))
-                    return self._render_page(notification="Password added", notif_type="success")
+                    essid = request.form.get('essid')
+                    bssid = request.form.get('bssid')
+                    ok, message = self._add_manual_password(
+                        essid, bssid, request.form.get('password')
+                    )
+                    return self._password_action_response(
+                        request, ok, message, essid, bssid, action='add'
+                    )
+
+                if path == 'capture-map-set':
+                    ok, message, filename = self._set_capture_map_location(
+                        request.form.get('filename'),
+                        request.form.get('lat'),
+                        request.form.get('lon'),
+                    )
+                    return self._map_point_action_response(
+                        request, ok, message, filename
+                    )
 
                 if path == 'phone-gps':
                     if not self._module_enabled('gps'):
@@ -853,6 +937,7 @@ class A_pwmenu(plugins.Plugin):
         no_gps_networks = self._build_no_gps_networks(groups)
         gps_status = self._gps_status()
         ohc_status = self._ohc_status()
+        wpa_status = self._wpa_status()
         pot_health = self._potfile_health(self.potfile_ohc)
         cleanup_report = self._capture_cleanup_report()
         whitelist = self._get_whitelist() if self._module_enabled('whitelist') else []
@@ -882,6 +967,7 @@ class A_pwmenu(plugins.Plugin):
             tab=active_tab, stats=stats, ach=ach['badges'], token=tok,
             show_wpa=show_wpa, map_points=map_points, gps_status=gps_status,
             no_gps_networks=no_gps_networks, ohc_status=ohc_status,
+            wpa_status=wpa_status,
             pot_health=pot_health, cleanup_report=cleanup_report,
             whitelist=whitelist
         )
@@ -940,35 +1026,105 @@ class A_pwmenu(plugins.Plugin):
             active_tab=active_tab,
         )
 
+    def _password_action_response(
+        self, req, ok, message, essid, bssid, action='update'
+    ):
+        if req.headers.get('X-PWMenu-Async') == '1':
+            cracked = self._get_cracked_data()
+            credential = self._find_cracked_record(
+                cracked, str(essid or ''), str(bssid or '')
+            )
+            response = make_response(json.dumps({
+                'ok': bool(ok),
+                'message': str(message or ''),
+                'action': action,
+                'essid': str(essid or ''),
+                'bssid': self._format_bssid(str(bssid or '')),
+                'credential': credential,
+            }))
+            response.headers['Content-Type'] = 'application/json; charset=utf-8'
+            response.headers['Cache-Control'] = 'no-store'
+            return response
+        return self._render_page(
+            notification=message,
+            notif_type='success' if ok else 'error',
+            active_tab='cracked' if action != 'add' else 'handshakes',
+        )
+
+    def _map_point_action_response(self, req, ok, message, point_id=None):
+        if req.headers.get('X-PWMenu-Async') == '1':
+            cracked = self._get_cracked_data()
+            groups = self._scan_and_group_files(cracked)
+            response = make_response(json.dumps({
+                'ok': bool(ok),
+                'message': str(message or ''),
+                'point_id': str(point_id or ''),
+                'map_points': self._build_map_points(groups),
+                'no_gps_networks': self._build_no_gps_networks(groups),
+            }))
+            response.headers['Content-Type'] = 'application/json; charset=utf-8'
+            response.headers['Cache-Control'] = 'no-store'
+            return response
+        return self._render_page(
+            notification=message,
+            notif_type='success' if ok else 'error',
+            active_tab='map',
+        )
+
+    def _wpa_status(self):
+        status = {
+            'configured': bool(self.options.get('wpa_sec_key')),
+            'results_present': False,
+            'results_bytes': 0,
+            'results_updated': '',
+            'last_upload': self.wpa_last_result,
+            'submitted': 0,
+            'pending': 0,
+            'integrated': True,
+        }
+        with self.data_lock:
+            status['submitted'] = len(self.data.get('wpa_networks', {}) or {})
+        with self.wpa_pending_lock:
+            status['pending'] = len(self.wpa_pending_files)
+        newest = None
+        for path in self._wpa_potfile_paths():
+            try:
+                stat = os.stat(path)
+            except OSError:
+                continue
+            if newest is None or stat.st_mtime > newest.st_mtime:
+                newest = stat
+        if newest is not None:
+            status.update({
+                'results_present': True,
+                'results_bytes': int(newest.st_size),
+                'results_updated': get_local_time(
+                    newest.st_mtime, self._option_int('timezone', 0)
+                ),
+            })
+        return status
+
+    def _wpa_potfile_paths(self):
+        return list(dict.fromkeys(
+            os.path.join(directory, 'wpa-sec.cracked.potfile')
+            for directory in self.handshake_dirs
+        ))
+
     def _handle_wpa_upload(self, req):
-        try:
-            with socket.create_connection(("1.1.1.1", 53), timeout=5):
-                pass
-        except OSError:
-            return "No Internet Connection", True
-
         fname = req.form.get('filename')
-        key = self.options.get('wpa_sec_key')
-        if not key:
+        if not self.options.get('wpa_sec_key'):
             return "WPA-Sec Key missing in config", True
-
-        path = self._find_handshake_path(fname)
-        if not path:
+        if not self._find_handshake_path(fname):
             return "File not found", True
-
-        return self._upload_path_to_wpa(path, key)
+        queued = self._queue_wpa_files([fname], force=False)
+        if not queued:
+            return "Capture is already recovered, submitted, or queued", False
+        self._start_wpa_sync_thread()
+        return "WPA-sec upload queued", False
 
     def _handle_wpa_cluster_upload(self, req):
-        try:
-            with socket.create_connection(("1.1.1.1", 53), timeout=5):
-                pass
-        except OSError:
-            return "No Internet Connection", True
-
-        key = self.options.get('wpa_sec_key')
-        if not key:
+        if not self.options.get('wpa_sec_key'):
             return "WPA-Sec Key missing in config", True
-
         names = []
         for raw in (req.form.get('filenames') or '').split(','):
             name = self._safe_handshake_name(raw.strip())
@@ -976,36 +1132,143 @@ class A_pwmenu(plugins.Plugin):
                 names.append(name)
         if not names:
             return "No files selected", True
+        queued = self._queue_wpa_files(names, force=False)
+        if not queued:
+            return "Selected captures are already recovered, submitted, or queued", False
+        self._start_wpa_sync_thread()
+        return f"WPA-sec upload queued for {queued} capture(s)", False
 
-        if self.wpa_upload_thread and self.wpa_upload_thread.is_alive():
-            return "WPA-sec upload is already running", True
+    def _wpa_network_key(self, path):
+        essid, bssid = self._capture_export_network(path)
+        compact_bssid = self._compact_bssid(bssid)
+        if compact_bssid:
+            return f'bssid:{compact_bssid}'
+        normalized = self._normalized_essid_key(essid)
+        return f'essid:{normalized}' if normalized else ''
 
-        self.wpa_upload_thread = threading.Thread(
-            target=self._wpa_cluster_worker,
-            args=(names, key),
-            daemon=True,
-            name='pwmenu-wpa-upload'
+    def _queue_wpa_files(self, filenames=None, force=False):
+        if not self._module_enabled('wpa_sec'):
+            return 0
+        if filenames is None:
+            names = []
+            for directory in self.handshake_dirs:
+                if os.path.isdir(directory):
+                    names.extend(
+                        os.path.basename(path)
+                        for path in glob.glob(os.path.join(directory, '*.pcap'))
+                    )
+        else:
+            names = list(filenames)
+
+        cracked = self._get_cracked_data()
+        selected = {}
+        for raw_name in names:
+            name = self._safe_handshake_name(raw_name)
+            path = self._find_handshake_path(name)
+            if not path or self._capture_has_known_password(path, cracked):
+                continue
+            network_key = self._wpa_network_key(path)
+            if not network_key:
+                continue
+            current = selected.get(network_key)
+            if (
+                current is None
+                or self._capture_export_score(path)
+                > self._capture_export_score(current)
+            ):
+                selected[network_key] = path
+
+        queued = 0
+        with self.data_lock:
+            submitted = dict(self.data.setdefault('wpa_networks', {}))
+        with self.wpa_pending_lock:
+            for network_key, path in selected.items():
+                name = os.path.basename(path)
+                previous = submitted.get(network_key) or {}
+                if (
+                    not force
+                    and previous.get('status') in ('submitted', 'already_submitted')
+                ):
+                    continue
+                was_pending = name in self.wpa_pending_files
+                self.wpa_pending_files[name] = bool(
+                    force or self.wpa_pending_files.get(name)
+                )
+                if not was_pending:
+                    queued += 1
+        return queued
+
+    def _start_wpa_sync_thread(self):
+        with self.wpa_pending_lock:
+            if self.wpa_upload_thread and self.wpa_upload_thread.is_alive():
+                return
+            self.wpa_upload_thread = threading.Thread(
+                target=self._wpa_sync_worker,
+                daemon=True,
+                name='pwmenu-wpa-sync',
+            )
+            self.wpa_upload_thread.start()
+
+    def _wpa_download_is_due(self):
+        if self.wpa_force_download:
+            return True
+        if not self._option_bool('wpa_sec_download_results', True):
+            return False
+        with self.data_lock:
+            last_download = float(
+                self.data.get('wpa_last_download', 0) or 0
+            )
+        return (
+            time.time() - last_download
+            >= self._option_int('wpa_sec_sync_interval', 3600)
         )
-        self.wpa_upload_thread.start()
-        return "WPA-sec upload started", False
 
-    def _wpa_cluster_worker(self, names, key):
+    def _wpa_sync_worker(self):
+        key = str(self.options.get('wpa_sec_key') or '')
+        if not key:
+            return
         with self.wpa_upload_lock:
             uploaded = 0
             already = 0
             failed = []
-            for name in names:
+            while True:
+                with self.wpa_pending_lock:
+                    if not self.wpa_pending_files:
+                        break
+                    name, force = self.wpa_pending_files.popitem()
                 path = self._find_handshake_path(name)
                 if not path:
                     failed.append(name)
                     continue
+                if not force and self._capture_has_known_password(path):
+                    continue
                 msg, is_err = self._upload_path_to_wpa(path, key)
                 if is_err:
                     failed.append(name)
-                elif "Already uploaded" in msg:
-                    already += 1
                 else:
-                    uploaded += 1
+                    status = (
+                        'already_submitted'
+                        if "Already uploaded" in msg
+                        else 'submitted'
+                    )
+                    if status == 'already_submitted':
+                        already += 1
+                    else:
+                        uploaded += 1
+                    network_key = self._wpa_network_key(path)
+                    record = {
+                        'filename': name,
+                        'signature': self._ohc_file_signature(path),
+                        'status': status,
+                        'reported_at': int(time.time()),
+                    }
+                    with self.data_lock:
+                        self.data.setdefault('wpa_files', {})[name] = record
+                        if network_key:
+                            self.data.setdefault('wpa_networks', {})[
+                                network_key
+                            ] = record
+                    self._save_data()
 
             details = []
             if uploaded:
@@ -1014,11 +1277,88 @@ class A_pwmenu(plugins.Plugin):
                 details.append(f"{already} already uploaded")
             if failed:
                 details.append(f"{len(failed)} failed")
-            self.wpa_last_result = "WPA-sec cluster upload: " + ", ".join(details or ["no files processed"])
+            download_due = self._wpa_download_is_due()
+            self.wpa_force_download = False
+            if download_due:
+                message, is_error = self._download_wpa_results(key)
+                details.append(message)
+                if is_error:
+                    failed.append('results download')
+
+            self.wpa_last_result = (
+                "WPA-sec sync: " + ", ".join(details or ["already up to date"])
+            )
             if failed:
                 logging.warning(f"[A_pwmenu] {self.wpa_last_result}")
             else:
                 logging.info(f"[A_pwmenu] {self.wpa_last_result}")
+        with self.wpa_pending_lock:
+            self.wpa_upload_thread = None
+            restart = bool(self.wpa_pending_files)
+        if restart:
+            self._start_wpa_sync_thread()
+
+    def _wpa_results_path(self):
+        try:
+            configured = (
+                self._agent.config().get('bettercap', {}).get('handshakes')
+                if self._agent is not None else ''
+            )
+        except (AttributeError, TypeError):
+            configured = ''
+        directory = str(configured or '').strip()
+        if not directory:
+            directory = next(
+                (
+                    item for item in self.handshake_dirs
+                    if os.path.isdir(item)
+                ),
+                self.handshake_dirs[-1],
+            )
+        os.makedirs(directory, exist_ok=True)
+        return os.path.join(directory, 'wpa-sec.cracked.potfile')
+
+    def _download_wpa_results(self, key):
+        api_url = str(
+            self.options.get('wpa_sec_api_url')
+            or 'https://wpa-sec.stanev.org'
+        ).strip().rstrip('/') + '/?api&dl=1'
+        try:
+            response = requests.get(
+                api_url,
+                cookies={'key': str(key)},
+                headers={'User-Agent': 'PWMenu/1.3.7'},
+                timeout=(10, 30),
+            )
+            response.raise_for_status()
+            payload = bytes(response.content or b'')
+            if (
+                b'<html' in payload[:512].lower()
+                or b'<!doctype html' in payload[:512].lower()
+            ):
+                return 'results rejected by WPA-sec', True
+
+            target = self._wpa_results_path()
+            fd, tmp_path = tempfile.mkstemp(
+                prefix='.pwmenu-wpa-', dir=os.path.dirname(target)
+            )
+            os.close(fd)
+            try:
+                with open(tmp_path, 'wb') as handle:
+                    handle.write(payload)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(tmp_path, target)
+            finally:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            with self.data_lock:
+                self.data['wpa_last_download'] = int(time.time())
+            self._save_data()
+            return f"results downloaded ({len(payload)} bytes)", False
+        except (OSError, requests.RequestException) as error:
+            logging.warning(f"[A_pwmenu] WPA-sec results download failed: {error}")
+            return 'results download failed', True
 
     def _handle_ohc_cluster_upload(self, req):
         names = self._filenames_from_csv(req.form.get('filenames') or '')
@@ -1073,6 +1413,184 @@ class A_pwmenu(plugins.Plugin):
         except OSError as e:
             logging.debug(f"[A_pwmenu] OHC key lookup failed: {e}")
         return ''
+
+    def _ohc_vless_config(self):
+        """Build an Xray client config without persisting the VLESS URL."""
+        value = str(self.options.get('ohc_vless_url') or '').strip()
+        if not value:
+            return None
+        try:
+            parsed = urllib.parse.urlsplit(value)
+            query = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+
+            def option(name, default=''):
+                return str((query.get(name) or [default])[0] or default)
+
+            if parsed.scheme.lower() != 'vless':
+                raise ValueError('unsupported scheme')
+            user_id = urllib.parse.unquote(parsed.username or '').strip()
+            host = parsed.hostname or ''
+            port = int(parsed.port or 443)
+            transport = option('type', 'tcp').lower()
+            security = option('security', '').lower()
+            if not re.fullmatch(
+                r'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-'
+                r'[0-9a-fA-F]{4}-[0-9a-fA-F]{12}',
+                user_id,
+            ):
+                raise ValueError('invalid client id')
+            if not host or transport not in ('tcp', 'raw'):
+                raise ValueError('unsupported transport')
+            if security not in ('reality', 'tls', 'none', ''):
+                raise ValueError('unsupported security')
+
+            stream = {
+                'network': 'tcp',
+                'security': security or 'none',
+            }
+            flow_override = str(
+                self.options.get('ohc_vless_flow', 'auto')
+            ).strip()
+            flow = option('flow') if flow_override.lower() == 'auto' else flow_override
+            if security == 'reality':
+                public_key = option('pbk')
+                server_name = option('sni')
+                if not public_key or not server_name:
+                    raise ValueError('incomplete REALITY settings')
+                stream['realitySettings'] = {
+                    'serverName': server_name,
+                    'fingerprint': option('fp', 'chrome'),
+                    'password': public_key,
+                    'shortId': option('sid'),
+                    'spiderX': urllib.parse.unquote(option('spx', '/')),
+                }
+            elif security == 'tls':
+                stream['tlsSettings'] = {
+                    'serverName': option('sni', host),
+                    'fingerprint': option('fp', 'chrome'),
+                    'allowInsecure': option('allowInsecure', '0') in ('1', 'true'),
+                }
+
+            return {
+                'log': {'loglevel': 'warning'},
+                'inbounds': [{
+                    'tag': 'ohc-http',
+                    'listen': '127.0.0.1',
+                    'port': self._option_int('ohc_proxy_port', 10809),
+                    'protocol': 'http',
+                    'settings': {},
+                }],
+                'outbounds': [{
+                    'tag': 'ohc-vless',
+                    'protocol': 'vless',
+                    'settings': {
+                        'address': host,
+                        'port': port,
+                        'id': user_id,
+                        'encryption': option('encryption', 'none'),
+                        'flow': flow,
+                    },
+                    'streamSettings': stream,
+                }],
+            }
+        except (TypeError, ValueError):
+            logging.error('[A_pwmenu] Invalid ohc_vless_url; OHC proxy was not started')
+            return False
+
+    def _stop_ohc_proxy(self):
+        with self.ohc_proxy_lock:
+            process = self.ohc_proxy_process
+            self.ohc_proxy_process = None
+            if process and process.poll() is None:
+                try:
+                    process.terminate()
+                    process.wait(timeout=3)
+                except (OSError, subprocess.SubprocessError):
+                    try:
+                        process.kill()
+                    except OSError:
+                        pass
+            try:
+                os.remove(self.ohc_proxy_config_file)
+            except FileNotFoundError:
+                pass
+            except OSError as error:
+                logging.debug(f'[A_pwmenu] Could not remove OHC proxy config: {error}')
+
+    def _ensure_ohc_proxy(self):
+        config = self._ohc_vless_config()
+        if config is None:
+            self._stop_ohc_proxy()
+            return True
+        if config is False:
+            self._stop_ohc_proxy()
+            return False
+
+        with self.ohc_proxy_lock:
+            process = self.ohc_proxy_process
+            if process and process.poll() is None:
+                return True
+            self.ohc_proxy_process = None
+            binary = str(self.options.get('ohc_xray_binary') or '/usr/local/bin/xray')
+            if not os.path.isfile(binary) or not os.access(binary, os.X_OK):
+                logging.error('[A_pwmenu] Xray binary is missing or not executable')
+                return False
+            try:
+                fd, tmp_path = tempfile.mkstemp(
+                    prefix='.a_pwmenu-ohc-xray-',
+                    dir=os.path.dirname(self.ohc_proxy_config_file),
+                )
+                try:
+                    os.fchmod(fd, 0o600)
+                    with os.fdopen(fd, 'w', encoding='utf-8') as handle:
+                        fd = None
+                        json.dump(config, handle, ensure_ascii=False)
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                    os.replace(tmp_path, self.ohc_proxy_config_file)
+                finally:
+                    if fd is not None:
+                        os.close(fd)
+                    if os.path.exists(tmp_path):
+                        os.remove(tmp_path)
+                self.ohc_proxy_process = subprocess.Popen(
+                    [binary, 'run', '-c', self.ohc_proxy_config_file],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    close_fds=True,
+                )
+                for _ in range(20):
+                    if self.ohc_proxy_process.poll() is not None:
+                        raise RuntimeError('Xray exited during startup')
+                    try:
+                        with socket.create_connection(
+                            ('127.0.0.1', self._option_int('ohc_proxy_port', 10809)),
+                            timeout=0.1,
+                        ):
+                            logging.info('[A_pwmenu] OHC-only VLESS proxy is ready')
+                            return True
+                    except OSError:
+                        time.sleep(0.1)
+                raise RuntimeError('Xray proxy port did not open')
+            except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+                logging.error(f'[A_pwmenu] OHC VLESS proxy failed: {error}')
+                process = self.ohc_proxy_process
+                self.ohc_proxy_process = None
+                if process and process.poll() is None:
+                    try:
+                        process.terminate()
+                    except OSError:
+                        pass
+                return False
+
+    def _ohc_request_proxies(self):
+        if not str(self.options.get('ohc_vless_url') or '').strip():
+            return None
+        if not self._ensure_ohc_proxy():
+            raise requests.ConnectionError('OHC VLESS proxy unavailable')
+        proxy = f"http://127.0.0.1:{self._option_int('ohc_proxy_port', 10809)}"
+        return {'http': proxy, 'https': proxy}
 
     def _ohc_display_face_values(self):
         if self.ohc_display_faces:
@@ -1494,8 +2012,88 @@ class A_pwmenu(plugins.Plugin):
                 selected[identity] = (score, path)
         return [item[1] for item in selected.values()]
 
+    def _ohc_reported_bssids(self, hashes):
+        bssids = set()
+        for hash_line in hashes:
+            _, bssid = self._ohc_hash_task_identity(hash_line)
+            if bssid:
+                bssids.add(bssid)
+        return bssids
+
+    def _ohc_prequeue_paths(self, paths):
+        """Drop known OHC tasks before they can enter the persistent queue."""
+        paths = list(dict.fromkeys(paths or []))
+        best_paths = self._best_capture_paths_by_ap(paths)
+        duplicate_paths = set(paths) - set(best_paths)
+        changed = False
+        for path in duplicate_paths:
+            self._ohc_mark_path(
+                path,
+                'already_reported',
+                'Better capture selected for the same AP',
+            )
+            self._complete_ohc_path(path)
+            changed = True
+
+        _, export_bssids, _ = self._load_ohc_export_snapshot()
+        with self.data_lock:
+            reported_hashes = set(self.data.setdefault('ohc_reported_hashes', []))
+            reported_paths = set(self.data.setdefault('ohc_reported', []))
+            records = dict(self.data.setdefault('ohc_files', {}))
+            signatures = dict(self.data.setdefault('ohc_file_signatures', {}))
+        reported_realpaths = {
+            os.path.realpath(value) for value in reported_paths if value
+        }
+        reported_bssids = self._ohc_reported_bssids(reported_hashes)
+
+        missing = []
+        for path in best_paths:
+            name = os.path.basename(path)
+            record = dict(records.get(name, {}) or {})
+            status = str(record.get('status') or '')
+            signature = self._ohc_file_signature(path)
+            stop_status = ''
+            stop_message = ''
+
+            if path in reported_paths or os.path.realpath(path) in reported_realpaths:
+                stop_status = 'already_reported'
+                stop_message = 'Already sent to OHC'
+            elif status in ('sent', 'already_reported'):
+                stop_status = 'already_reported'
+                stop_message = record.get('message') or 'Already sent to OHC'
+            elif status == 'found':
+                stop_status = 'found'
+                stop_message = record.get('message') or 'Password available on OHC'
+            elif (
+                status == 'invalid'
+                and signature
+                and signatures.get(path) == signature
+            ):
+                stop_status = 'invalid'
+                stop_message = record.get('message') or 'Unchanged capture has no usable WPA hash'
+            else:
+                _, compact_bssid = self._capture_export_network(path)
+                bssid = self._colon_bssid(compact_bssid)
+                if bssid and bssid in export_bssids:
+                    stop_status = 'already_reported'
+                    stop_message = 'Present in the last imported OHC export'
+                elif bssid and bssid in reported_bssids:
+                    stop_status = 'already_reported'
+                    stop_message = 'Already sent to OHC'
+
+            if stop_status:
+                self._ohc_mark_path(path, stop_status, stop_message)
+                self._complete_ohc_path(path, signature)
+                changed = True
+            else:
+                missing.append(path)
+
+        if changed:
+            self._save_data()
+        return missing
+
     def _queue_ohc_files(self, filenames=None, force=False):
-        paths = self._candidate_ohc_paths(filenames)
+        paths = self._ohc_prequeue_paths(self._candidate_ohc_paths(filenames))
         now = int(time.time())
         queued = 0
         changed = False
@@ -1639,14 +2237,6 @@ class A_pwmenu(plugins.Plugin):
         key = self._ohc_key()
         if not key:
             return "OHC API key missing", True
-        self.ohc_display_status = 'OHC upload'
-        try:
-            with socket.create_connection(("1.1.1.1", 53), timeout=5):
-                pass
-        except OSError:
-            self._set_ohc_backoff(120, 'No Internet Connection')
-            return "No Internet Connection", True
-
         self.ohc_display_status = 'OHC upload'
         paths = self._candidate_ohc_paths(filenames)
         best_paths = self._best_capture_paths_by_ap(paths)
@@ -1927,7 +2517,12 @@ class A_pwmenu(plugins.Plugin):
             'hashes': [h.strip() for h in hashes if h.strip()]
         }
         try:
-            res = requests.post('https://api.onlinehashcrack.com/v2', json=payload, timeout=30)
+            res = requests.post(
+                'https://api.onlinehashcrack.com/v2',
+                json=payload,
+                timeout=30,
+                proxies=self._ohc_request_proxies(),
+            )
             try:
                 data = res.json()
             except ValueError:
@@ -1952,7 +2547,12 @@ class A_pwmenu(plugins.Plugin):
             'action': 'list_tasks'
         }
         try:
-            res = requests.post('https://api.onlinehashcrack.com/v2', json=payload, timeout=30)
+            res = requests.post(
+                'https://api.onlinehashcrack.com/v2',
+                json=payload,
+                timeout=30,
+                proxies=self._ohc_request_proxies(),
+            )
             try:
                 data = res.json()
             except ValueError:
@@ -2017,16 +2617,27 @@ class A_pwmenu(plugins.Plugin):
 
     def _upload_path_to_wpa(self, path, key):
         try:
+            api_url = str(
+                self.options.get('wpa_sec_api_url')
+                or 'https://wpa-sec.stanev.org'
+            ).strip().rstrip('/') + '/'
             with open(path, 'rb') as f:
                 r = requests.post(
-                    'https://wpa-sec.stanev.org/',
-                    params={'api_key': key},
+                    api_url,
+                    cookies={'key': str(key)},
                     files={'file': f},
+                    headers={
+                        'User-Agent': (
+                            'Mozilla/5.0 (X11; Linux aarch64) '
+                            'PWMenu/1.3.7'
+                        )
+                    },
                     timeout=(10, 30)
                 )
 
             if r.status_code == 200:
-                if "already in database" in r.text:
+                body = str(r.text or '').lower()
+                if "already in database" in body or "already submitted" in body:
                     return "Already uploaded", False
                 return "Uploaded successfully", False
             return f"Error {r.status_code}: {r.text}", True
@@ -2117,6 +2728,9 @@ class A_pwmenu(plugins.Plugin):
             'ohc_reconcile_requested': False,
             'capture_quality': {},
             'capture_password_checks': {},
+            'wpa_files': {},
+            'wpa_networks': {},
+            'wpa_last_download': 0,
             'replacement_history': [],
             'empty_cleanup_history': []
         }
@@ -2152,10 +2766,64 @@ class A_pwmenu(plugins.Plugin):
             self.data['capture_quality'] = {}
         if not isinstance(self.data.get('capture_password_checks'), dict):
             self.data['capture_password_checks'] = {}
+        if not isinstance(self.data.get('wpa_files'), dict):
+            self.data['wpa_files'] = {}
+        if not isinstance(self.data.get('wpa_networks'), dict):
+            self.data['wpa_networks'] = {}
+        try:
+            self.data['wpa_last_download'] = int(
+                self.data.get('wpa_last_download', 0) or 0
+            )
+        except (TypeError, ValueError):
+            self.data['wpa_last_download'] = 0
         if not isinstance(self.data.get('replacement_history'), list):
             self.data['replacement_history'] = []
         if not isinstance(self.data.get('empty_cleanup_history'), list):
             self.data['empty_cleanup_history'] = []
+
+    def _migrate_wpa_sec_state(self):
+        """Import the stock plugin report once so PWMenu does not resubmit it."""
+        with self.data_lock:
+            if self.data.setdefault('wpa_files', {}):
+                return
+        report_path = '/home/pi/.wpa_sec_uploads'
+        try:
+            with open(report_path, 'r', encoding='utf-8') as handle:
+                payload = json.load(handle)
+            reported = (
+                payload.get('reported', [])
+                if isinstance(payload, dict) else []
+            )
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            return
+
+        changed = False
+        for old_path in reported:
+            name = self._safe_handshake_name(os.path.basename(str(old_path)))
+            path = self._find_handshake_path(name)
+            if not path:
+                continue
+            record = {
+                'filename': name,
+                'signature': self._ohc_file_signature(path),
+                'status': 'submitted',
+                'reported_at': 0,
+                'migrated': True,
+            }
+            network_key = self._wpa_network_key(path)
+            with self.data_lock:
+                self.data.setdefault('wpa_files', {})[name] = record
+                if network_key:
+                    self.data.setdefault('wpa_networks', {})[
+                        network_key
+                    ] = record
+            changed = True
+        if changed:
+            self._save_data()
+            logging.info(
+                f"[A_pwmenu] Migrated {len(self.data.get('wpa_files', {}))} "
+                "WPA-sec upload records"
+            )
 
     def _save_data(self):
         try:
@@ -2634,6 +3302,54 @@ class A_pwmenu(plugins.Plugin):
             self.data.setdefault('locations', {})[filename] = loc
         return loc, True
 
+    def _set_capture_map_location(self, filename, lat, lon):
+        name = self._safe_handshake_name(filename)
+        path = self._find_handshake_path(name)
+        if not path:
+            return False, 'Handshake file was not found', name or ''
+        try:
+            try:
+                latitude = float(lat)
+                longitude = float(lon)
+            except (TypeError, ValueError):
+                return False, 'Map coordinates are invalid', name or ''
+            if not math.isfinite(latitude) or not math.isfinite(longitude):
+                return False, 'Map coordinates are invalid', name or ''
+            if not -90 <= latitude <= 90:
+                raise ValueError('Latitude must be between -90 and 90')
+            if not -180 <= longitude <= 180:
+                raise ValueError('Longitude must be between -180 and 180')
+            stat = os.stat(path)
+            essid, bssid = self._capture_export_network(path)
+            location = {
+                'lat': latitude,
+                'lon': longitude,
+                'accuracy': 0,
+                'source': 'manual-map',
+                'provider': 'pwmenu-map',
+                # This is an intentional assignment to the capture, not a GPS
+                # sample measured later. Keep it fresh relative to capture time.
+                'ts': float(stat.st_mtime),
+                'manual_assigned_at': int(time.time()),
+                'filename': name,
+                'essid': essid,
+                'bssid': bssid,
+                'capture_ts': float(stat.st_mtime),
+                'date': get_local_time(
+                    stat.st_mtime, self._option_int('timezone', 0)
+                ),
+            }
+            with self.data_lock:
+                self.data.setdefault('locations', {})[name] = location
+            self._save_data()
+            logging.info(
+                "[A_pwmenu] Map location saved for %s at %.7f, %.7f",
+                name, latitude, longitude
+            )
+            return True, f'Placed {name} on the map', name
+        except (OSError, TypeError, ValueError) as error:
+            return False, str(error), name or ''
+
     def _distance_meters(self, a_lat, a_lon, b_lat, b_lon):
         try:
             from math import radians, sin, cos, asin, sqrt
@@ -2661,6 +3377,7 @@ class A_pwmenu(plugins.Plugin):
             'size': f.get('size', ''),
             'is_cracked': g.get('is_cracked', False),
             'password': g.get('pwd', '') if g.get('is_cracked') else '',
+            'credential_source': g.get('src', '') if g.get('is_cracked') else '',
             'source': f.get('gps_source', ''),
             'captures': 1,
             'signal': f.get('signal', '-'),
@@ -2670,7 +3387,7 @@ class A_pwmenu(plugins.Plugin):
             'gps_age_at_capture': int(f.get('gps_age_at_capture', 0) or 0),
             'ohc': self._ohc_file_record(f.get('filename', '')),
             'quality': dict(f.get('quality') or {}),
-            'status': 'cracked' if g.get('is_cracked') else 'handshake'
+            'status': 'cracked' if g.get('is_cracked') else 'handshake',
         }
 
     def _format_bssid(self, bssid):
@@ -2741,7 +3458,13 @@ class A_pwmenu(plugins.Plugin):
         for m in members:
             bucket = None
             for item in network_groups:
-                if item['essid'] == m['essid'] and item['bssid'] == m['bssid'] and self._distance_meters(item['lat'], item['lon'], m['lat'], m['lon']) <= 30:
+                if (
+                    item['essid'] == m['essid']
+                    and item['bssid'] == m['bssid']
+                    and self._distance_meters(
+                        item['lat'], item['lon'], m['lat'], m['lon']
+                    ) <= 30
+                ):
                     bucket = item
                     break
             if bucket:
@@ -2808,6 +3531,7 @@ class A_pwmenu(plugins.Plugin):
                 'count': g.get('count', 0),
                 'is_cracked': g.get('is_cracked', False),
                 'password': g.get('pwd', '') if g.get('is_cracked') else '',
+                'credential_source': g.get('src', '') if g.get('is_cracked') else '',
                 'filename': first.get('filename', ''),
                 'ohc': self._ohc_file_record(first.get('filename', '')),
                 'quality': dict(first.get('quality') or {}),
@@ -2889,14 +3613,153 @@ class A_pwmenu(plugins.Plugin):
 
         return {'level': lvl, 'rank': rank, 'xp': xp, 'next_xp': next_xp, 'lvl_percent': lvl_p, 'badges': my_badges}
 
-    def _add_manual_password(self, essid, bssid, pwd):
-        m = self._colon_bssid(bssid) or "00:00:00:00:00:00"
+    def _validate_manual_password(self, essid, bssid, pwd):
+        name = self._validate_whitelist_name(essid)
+        password = str(pwd or '')
+        if any(char in password for char in ('\x00', '\r', '\n')):
+            raise ValueError('Password contains unsupported control characters')
+        if not 8 <= len(password) <= 63:
+            raise ValueError('WPA password must contain 8 to 63 characters')
+        compact_bssid = self._compact_bssid(bssid)
+        if bssid and not compact_bssid:
+            raise ValueError('BSSID must contain 12 hexadecimal digits')
+        return name, compact_bssid, password
+
+    def _matching_capture_paths(self, essid, bssid):
+        target_bssid = self._compact_bssid(bssid)
+        target_essid = self._normalized_essid_key(essid)
+        matches = []
+        for directory in self.handshake_dirs:
+            if not os.path.isdir(directory):
+                continue
+            for path in glob.glob(os.path.join(directory, '*.pcap')):
+                capture_essid, capture_bssid = self._capture_export_network(path)
+                if target_bssid:
+                    matched = self._compact_bssid(capture_bssid) == target_bssid
+                else:
+                    matched = (
+                        bool(target_essid)
+                        and self._normalized_essid_key(capture_essid)
+                        == target_essid
+                    )
+                if matched and path not in matches:
+                    matches.append(path)
+        return sorted(matches, key=self._capture_export_score, reverse=True)
+
+    def _run_aircrack_password_check(self, path, essid, bssid, passwords):
+        executable = shutil.which('aircrack-ng')
+        if not executable and os.path.isfile('/usr/bin/aircrack-ng'):
+            executable = '/usr/bin/aircrack-ng'
+        if not executable:
+            return False, False, 'aircrack-ng is unavailable'
+
+        candidates = [
+            str(password) for password in passwords
+            if str(password)
+            and not any(char in str(password) for char in ('\x00', '\r', '\n'))
+        ]
+        if not candidates:
+            return False, False, 'No valid password candidate was supplied'
+
+        wordlist_path = None
         try:
+            fd, wordlist_path = tempfile.mkstemp(
+                prefix='pwmenu-verify-', suffix='.txt'
+            )
+            try:
+                os.chmod(wordlist_path, 0o600)
+            except OSError:
+                pass
+            with os.fdopen(fd, 'w', encoding='utf-8', newline='\n') as handle:
+                handle.write('\n'.join(candidates) + '\n')
+                handle.flush()
+                os.fsync(handle.fileno())
+
+            compact_bssid = self._compact_bssid(bssid)
+            selector = (
+                ['-b', self._colon_bssid(compact_bssid)]
+                if compact_bssid
+                else ['-e', str(essid or '')]
+            )
+            result = subprocess.run(
+                [executable, '-q', *selector, '-w', wordlist_path, path],
+                check=False,
+                capture_output=True,
+                text=True,
+                errors='replace',
+                timeout=self._option_int('password_verify_timeout', 45),
+            )
+            output = (result.stdout or '') + '\n' + (result.stderr or '')
+            verified = bool(
+                re.search(
+                    r'\bKEY\s+FOUND!?\s*(?:\[|$)', output, re.IGNORECASE
+                )
+            )
+            conclusive = verified or bool(
+                re.search(r'\bKEY\s+NOT\s+FOUND\b', output, re.IGNORECASE)
+            )
+            return verified, conclusive, output[-1000:]
+        except subprocess.TimeoutExpired:
+            return False, False, 'aircrack-ng verification timed out'
+        except (OSError, subprocess.SubprocessError) as error:
+            return False, False, str(error)
+        finally:
+            if wordlist_path:
+                try:
+                    os.remove(wordlist_path)
+                except FileNotFoundError:
+                    pass
+
+    def _verify_manual_password(self, essid, bssid, password):
+        paths = self._matching_capture_paths(essid, bssid)
+        if not paths:
+            identity = self._format_bssid(bssid) or essid
+            return (
+                False,
+                f'No matching capture is available for {identity}; '
+                'the password was not saved',
+            )
+
+        inconclusive = False
+        for path in paths[:3]:
+            verified, conclusive, detail = self._run_aircrack_password_check(
+                path, essid, bssid, [password]
+            )
+            if verified:
+                return (
+                    True,
+                    f'Password verified against {os.path.basename(path)}',
+                )
+            if not conclusive:
+                inconclusive = True
+                logging.warning(
+                    f"[A_pwmenu] Manual password verification was inconclusive "
+                    f"for {os.path.basename(path)}: {detail}"
+                )
+        if inconclusive:
+            return (
+                False,
+                'The password could not be verified conclusively and was not saved',
+            )
+        return False, 'Password does not match the captured handshake'
+
+    def _add_manual_password(self, essid, bssid, pwd):
+        try:
+            name, compact_bssid, password = self._validate_manual_password(
+                essid, bssid, pwd
+            )
+            verified, message = self._verify_manual_password(
+                name, compact_bssid, password
+            )
+            if not verified:
+                return False, message
+
+            mac = self._colon_bssid(compact_bssid) or "00:00:00:00:00:00"
             with self.potfile_lock:
                 self._normalize_potfile(self.potfile_manual)
                 lines, _ = self._read_pot_lines(self.potfile_manual)
                 lines, keys, _ = self._dedupe_pot_lines(lines)
-                line = f"{m}:{m}:{essid}:{pwd}"
+                line = f"{mac}:{mac}:{name}:{password}"
                 added = self._pot_line_key(line) not in keys
                 if added:
                     self._write_pot_lines(self.potfile_manual, lines + [line])
@@ -2904,8 +3767,11 @@ class A_pwmenu(plugins.Plugin):
                 with self.data_lock:
                     self.data['xp'] += 200
                 self._save_data()
-        except OSError as e:
-            logging.error(f"[A_pwmenu] Could not add manual password: {e}")
+                return True, message + '; password saved'
+            return True, message + '; password was already saved'
+        except (OSError, ValueError) as error:
+            logging.error(f"[A_pwmenu] Could not add manual password: {error}")
+            return False, str(error)
 
     def _delete_password(self, essid, pwd=None, source=None, bssid=None):
         deleted = False
@@ -2933,8 +3799,13 @@ class A_pwmenu(plugins.Plugin):
         return deleted
 
     def _update_password(self, essid, pwd, bssid=None, old_password=None):
+        if not old_password:
+            return False, 'The existing password was not supplied'
+        ok, message = self._add_manual_password(essid, bssid, pwd)
+        if not ok:
+            return False, message
         self._delete_password(essid, old_password, None, bssid)
-        self._add_manual_password(essid, bssid, pwd)
+        return True, message.replace('password saved', 'password updated')
 
     def _delete_specific_file(self, fname):
         name = self._safe_handshake_name(fname)
@@ -3603,7 +4474,7 @@ class A_pwmenu(plugins.Plugin):
     def _parse_pot_line(self, line):
         match = re.fullmatch(
             r'((?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}):'
-            r'((?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}):(.*):(.*)',
+            r'((?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}):(.*?):(.*)',
             line or ''
         )
         if not match:
@@ -3784,9 +4655,7 @@ class A_pwmenu(plugins.Plugin):
             self.potfile_ohc,
             self.potfile_handshake_lab,
             self.potfile_manual,
-            '/root/handshakes/wpa-sec.cracked.potfile',
-            '/home/pi/handshakes/wpa-sec.cracked.potfile',
-        ]
+        ] + self._wpa_potfile_paths()
         for directory in self.handshake_dirs:
             paths.extend(glob.glob(os.path.join(directory, '*.pcap.cracked')))
         metadata = []
@@ -3875,72 +4744,25 @@ class A_pwmenu(plugins.Plugin):
         ):
             return bool(cached.get('verified')), False
 
-        executable = shutil.which('aircrack-ng')
-        if not executable and os.path.isfile('/usr/bin/aircrack-ng'):
-            executable = '/usr/bin/aircrack-ng'
-        if not executable:
+        verified, conclusive, detail = self._run_aircrack_password_check(
+            path, essid, bssid, passwords
+        )
+        if not conclusive:
             logging.warning(
-                f"[A_pwmenu] Cannot verify known password for {name}: aircrack-ng is unavailable"
+                f"[A_pwmenu] aircrack-ng could not conclusively verify "
+                f"{name}; keeping it exportable: {detail}"
             )
             return False, False
-
-        wordlist_path = None
-        try:
-            fd, wordlist_path = tempfile.mkstemp(prefix='pwmenu-known-', suffix='.txt')
-            try:
-                os.chmod(wordlist_path, 0o600)
-            except OSError:
-                pass
-            with os.fdopen(fd, 'w', encoding='utf-8', newline='\n') as handle:
-                handle.write('\n'.join(passwords) + '\n')
-                handle.flush()
-                os.fsync(handle.fileno())
-
-            compact_bssid = self._compact_bssid(bssid)
-            selector = (
-                ['-b', self._colon_bssid(compact_bssid)]
-                if compact_bssid
-                else ['-e', str(essid or '')]
-            )
-            result = subprocess.run(
-                [executable, '-q', *selector, '-w', wordlist_path, path],
-                check=False,
-                capture_output=True,
-                text=True,
-                errors='replace',
-                timeout=self._option_int('password_verify_timeout', 45),
-            )
-            output = (result.stdout or '') + '\n' + (result.stderr or '')
-            verified = bool(re.search(r'\bKEY\s+FOUND!?\s*(?:\[|$)', output, re.IGNORECASE))
-            conclusive = verified or bool(
-                re.search(r'\bKEY\s+NOT\s+FOUND\b', output, re.IGNORECASE)
-            )
-            if not conclusive:
-                logging.warning(
-                    f"[A_pwmenu] aircrack-ng could not conclusively verify {name}; keeping it exportable"
-                )
-                return False, False
-            with self.data_lock:
-                self.data.setdefault('capture_password_checks', {})[name] = {
-                    'capture_signature': capture_signature,
-                    'credential_revision': credential_revision,
-                    'verified': verified,
-                    'candidate_count': len(passwords),
-                    'tool': 'aircrack-ng',
-                    'checked_at': int(time.time()),
-                }
-            return verified, True
-        except (OSError, subprocess.SubprocessError) as error:
-            logging.warning(
-                f"[A_pwmenu] Known-password verification failed for {name}: {error}"
-            )
-            return False, False
-        finally:
-            if wordlist_path:
-                try:
-                    os.remove(wordlist_path)
-                except FileNotFoundError:
-                    pass
+        with self.data_lock:
+            self.data.setdefault('capture_password_checks', {})[name] = {
+                'capture_signature': capture_signature,
+                'credential_revision': credential_revision,
+                'verified': verified,
+                'candidate_count': len(passwords),
+                'tool': 'aircrack-ng',
+                'checked_at': int(time.time()),
+            }
+        return verified, True
 
     def _capture_export_score(self, path):
         name = os.path.basename(path)
@@ -3995,30 +4817,40 @@ class A_pwmenu(plugins.Plugin):
         cracked = self._get_cracked_data()
         selected = {}
         with self.password_verify_lock:
+            paths_by_name = {}
             for directory in self.handshake_dirs:
                 if not os.path.exists(directory):
                     continue
                 for path in glob.glob(os.path.join(directory, '*.pcap')):
-                    if not self._capture_is_crackable(path):
-                        continue
                     name = os.path.basename(path)
-                    essid, bssid = self._capture_export_network(path)
-                    passwords, _ = self._known_passwords_for_capture(
-                        cracked, essid, bssid
-                    )
-                    # A recovered credential for this exact BSSID already makes
-                    # the AP resolved for Handshake Lab. Re-exporting another
-                    # capture only creates duplicate Recovered cards there.
-                    if passwords:
-                        continue
+                    current = paths_by_name.get(name)
+                    if (
+                        current is None
+                        or self._capture_export_score(path)
+                        > self._capture_export_score(current)
+                    ):
+                        paths_by_name[name] = path
 
-                    # BSSID is the AP identity even if its ESSID or filename
-                    # changed. Without one, keep files separate conservatively.
-                    identity = ('bssid', bssid) if bssid else ('file', name)
-                    score = self._capture_export_score(path)
-                    current = selected.get(identity)
-                    if current is None or score > current[0]:
-                        selected[identity] = (score, path, name)
+            for name, path in paths_by_name.items():
+                if not self._capture_is_crackable(path):
+                    continue
+                essid, bssid = self._capture_export_network(path)
+                passwords, _ = self._known_passwords_for_capture(
+                    cracked, essid, bssid
+                )
+                # A recovered credential for this exact BSSID already makes
+                # the AP resolved for Handshake Lab. Re-exporting another
+                # capture only creates duplicate Recovered cards there.
+                if passwords:
+                    continue
+
+                # BSSID is the AP identity even if its ESSID or filename
+                # changed. Without one, keep files separate conservatively.
+                identity = ('bssid', bssid) if bssid else ('file', name)
+                score = self._capture_export_score(path)
+                current = selected.get(identity)
+                if current is None or score > current[0]:
+                    selected[identity] = (score, path, name)
 
         files = [(item[1], item[2]) for item in selected.values()]
         files.sort(key=lambda item: item[1].casefold())
@@ -4050,18 +4882,41 @@ class A_pwmenu(plugins.Plugin):
         return send_file(m, mimetype='application/zip', as_attachment=True, download_name='cluster-handshakes.zip')
 
     def _serve_password_list(self):
-        c = self._get_cracked_data()
+        cracked = self._get_cracked_data()
         seen = set()
-        lines = []
-        for record in c.values():
-            value = (record.get('essid', ''), record.get('password', ''))
-            if not value[0] or not value[1] or value in seen:
+        rows = []
+        for record in cracked.values():
+            value = (
+                str(record.get('essid') or ''),
+                self._format_bssid(str(record.get('bssid') or '')),
+                str(record.get('password') or ''),
+                str(record.get('source') or ''),
+            )
+            identity = value[:3]
+            if not value[0] or not value[2] or identity in seen:
                 continue
-            seen.add(value)
-            lines.append(f"{value[0]}:{value[1]}")
-        t = "\n".join(lines)
-        m = io.BytesIO(t.encode('utf-8'))
-        return send_file(m, mimetype='text/plain', as_attachment=True, download_name='passwords.txt')
+            seen.add(identity)
+            rows.append(value)
+        rows.sort(key=lambda row: (
+            row[0].casefold(), row[1].casefold(), row[2]
+        ))
+
+        output = io.StringIO(newline='')
+        writer = csv.writer(
+            output,
+            dialect='excel-tab',
+            lineterminator='\r\n',
+            quoting=csv.QUOTE_MINIMAL,
+        )
+        writer.writerow(('ESSID', 'BSSID', 'PASSWORD', 'SOURCE'))
+        writer.writerows(rows)
+        payload = b'\xef\xbb\xbf' + output.getvalue().encode('utf-8')
+        return send_file(
+            io.BytesIO(payload),
+            mimetype='text/plain',
+            as_attachment=True,
+            download_name='pwmenu-passwords.txt',
+        )
 
     def _serve_file(self, name):
         safe_name = self._safe_handshake_name(name)
@@ -4183,6 +5038,10 @@ class A_pwmenu(plugins.Plugin):
             g['last_seen'] = g['files'][0]['date']
             g['count'] = len(g['files'])
             g['gps_count'] = len([f for f in g['files'] if f.get('lat') is not None and f.get('lon') is not None])
+            g['map_count'] = len([
+                f for f in g['files']
+                if f.get('gps_source') in ('manual-map', 'map', 'pwmenu-map')
+            ])
             g['cls'] = "st-cracked" if g['is_cracked'] else "st-active"
             g['txt'] = "Cracked" if g['is_cracked'] else "Active"
         res.sort(key=lambda x: x['ts'], reverse=True)
@@ -4219,11 +5078,10 @@ class A_pwmenu(plugins.Plugin):
                 'sources': [source],
             }
 
-        pots = [('/root/handshakes/wpa-sec.cracked.potfile', 'WPA-Sec'),
-                ('/home/pi/handshakes/wpa-sec.cracked.potfile', 'WPA-Sec'),
-                (self.potfile_ohc, 'OHC'),
+        pots = [(path, 'WPA-Sec') for path in self._wpa_potfile_paths()]
+        pots.extend([(self.potfile_ohc, 'OHC'),
                 (self.potfile_handshake_lab, 'Handshake Lab'),
-                (self.potfile_manual, 'Manual')]
+                (self.potfile_manual, 'Manual')])
         for p, s in pots:
             if os.path.exists(p):
                 try:
@@ -4301,6 +5159,7 @@ class A_pwmenu(plugins.Plugin):
 
     def _get_html(self):
         return """
+{% set wpa_status = wpa_status|default({}) %}
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -4459,6 +5318,7 @@ class A_pwmenu(plugins.Plugin):
         .map-action.soft { background: rgba(255,255,255,0.08); color: #dfe6f8; }
         .map-action.cyan { background: rgba(32,228,244,0.10); color: #6ff4ff; }
         .map-action.red { background: rgba(255,69,58,0.12); color: #ff6b62; }
+        .map-action.map-placement-card-action { width:100%;margin-top:12px; }
         .map-action.trash { padding: 0; font-size: 22px; color: #ff6b62; }
         .trash-icon { position: relative; display: inline-block; width: 18px; height: 20px; border: 2px solid currentColor; border-top: none; border-radius: 0 0 4px 4px; box-sizing: border-box; }
         .trash-icon:before { content: ""; position: absolute; left: -3px; right: -3px; top: -6px; height: 2px; background: currentColor; border-radius: 2px; }
@@ -4478,6 +5338,22 @@ class A_pwmenu(plugins.Plugin):
         .whitelist-submit { border:1px solid rgba(32,228,244,.35);border-radius:12px;background:rgba(32,228,244,.08);color:#20e4f4;padding:0 15px;font-weight:850;cursor:pointer; }
         .whitelist-item { display:flex;align-items:center;justify-content:space-between;gap:10px;color:#e4e8ea; }
         .whitelist-remove { flex:0 0 auto;border:0;background:transparent;color:#ff6b62;font-size:12px;font-weight:800;cursor:pointer; }
+        .whitelist-more { margin-top:9px;border:1px solid rgba(255,255,255,.07);border-radius:12px;padding:0 10px 10px; }
+        .whitelist-more summary { padding:10px 0 0;color:var(--accent);font-size:12px;font-weight:850;cursor:pointer; }
+        .external-service-link { color:inherit;text-decoration:none; }
+        .external-service-link:hover { color:var(--accent); }
+        .map-placement-target { position:absolute;z-index:20;left:50%;top:50%;width:58px;height:58px;transform:translate(-50%,-100%);pointer-events:none;filter:drop-shadow(0 14px 18px rgba(0,0,0,.46)); }
+        .map-placement-pin { width:58px;height:58px;display:grid;place-items:center;color:var(--accent); }
+        .map-placement-pin svg { width:58px;height:58px;overflow:visible;fill:#071113;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round; }
+        .map-placement-pin circle { fill:color-mix(in srgb,var(--accent) 18%,#071113); }
+        .map-placement-controls { position:absolute;z-index:21;left:50%;bottom:20px;display:grid;grid-template-columns:repeat(2,46px);gap:9px;transform:translateX(-50%);padding:8px 11px;border:1px solid rgba(255,255,255,.12);border-radius:18px;background:rgba(7,12,14,.94);box-shadow:0 16px 45px rgba(0,0,0,.42);pointer-events:auto; }
+        .map-placement-controls button { display:grid;width:46px;min-width:46px;max-width:46px;height:46px;min-height:46px;max-height:46px;box-sizing:border-box;aspect-ratio:1/1;place-items:center;padding:0;border:0;border-radius:50%;color:#fff;cursor:pointer; }
+        .map-placement-controls svg { width:21px;height:21px;fill:none;stroke:currentColor;stroke-width:2.8;stroke-linecap:round;stroke-linejoin:round; }
+        .map-placement-cancel { background:rgba(255,255,255,.09); }
+        .map-placement-confirm { background:var(--accent);color:var(--accent-contrast)!important;box-shadow:0 0 24px color-mix(in srgb,var(--accent) 34%,transparent); }
+        .map-placement-label { position:absolute;z-index:21;top:78px;left:50%;width:max-content;max-width:min(420px,72vw);transform:translateX(-50%);padding:8px 11px;border:1px solid rgba(255,255,255,.1);border-radius:13px;background:rgba(7,12,14,.92);color:#eafcff;font-size:.64rem;font-weight:800;text-align:center;pointer-events:none; }
+        .map-stage.placing #mapMarkers, .map-stage.placing .ymap-real { cursor:grab!important; }
+        .map-stage.placing .ymap-real:active { cursor:grabbing!important; }
         .newfpv-credit { --credit-accent:#20e4f4;display:flex;min-width:230px;width:max-content;max-width:100%;box-sizing:border-box;align-items:center;justify-content:space-between;gap:18px;margin:24px auto 8px;padding:12px 13px 12px 16px;border:1px solid rgba(255,255,255,.12);border-radius:17px;background:linear-gradient(110deg,rgba(255,255,255,.055),color-mix(in srgb,var(--credit-accent) 4.5%,transparent));color:#f4f6f7;font-family:Inter,ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif;text-decoration:none;transition:border-color .2s,background .2s,transform .2s; }
         .newfpv-credit:hover { border-color:color-mix(in srgb,var(--credit-accent) 45%,transparent);background:linear-gradient(110deg,rgba(255,255,255,.075),color-mix(in srgb,var(--credit-accent) 9%,transparent));transform:translateY(-2px); }
         .newfpv-credit small, .newfpv-credit strong { display:block; }
@@ -4651,10 +5527,15 @@ class A_pwmenu(plugins.Plugin):
         .subs { padding:0 10px 10px;border:0;background:rgba(0,0,0,.18); }
         .sub-row { gap:14px;padding:12px 10px;border-top:1px solid var(--line);border-bottom:0; }
         .capture-row { display:block; }
+        .capture-file-head { display:flex;align-items:flex-start;justify-content:space-between;gap:10px; }
         .capture-file-info { min-width:0; }
+        .capture-file-name { overflow:hidden;color:#eef2f3;font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:.7rem;font-weight:800;text-overflow:ellipsis;white-space:nowrap; }
         .capture-file-bssid { overflow:hidden;color:#dce1e3;font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:.68rem;text-overflow:ellipsis;white-space:nowrap; }
         .capture-file-meta { margin-top:2px;color:#727c81;font-size:.56rem; }
         .capture-file-info .quality-badge { display:inline-flex;margin-top:4px;padding:3px 6px;font-size:.48rem; }
+        .capture-file-delete { display:grid;width:34px;height:34px;flex:0 0 34px;place-items:center;padding:0;border:1px solid rgba(255,69,58,.28);border-radius:10px;background:rgba(255,69,58,.08);color:#ff7169;cursor:pointer; }
+        .capture-file-delete:hover { border-color:rgba(255,69,58,.58);background:rgba(255,69,58,.14); }
+        .capture-file-delete svg { width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:1.9;stroke-linecap:round;stroke-linejoin:round; }
         .network-expanded-tools { display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;padding:10px;border-top:1px solid var(--line); }
         .network-expanded-action { display:flex;min-width:0;min-height:48px;align-items:center;justify-content:center;gap:9px;padding:8px 12px;border:1px solid var(--line);border-radius:13px;background:rgba(255,255,255,.035);color:#dce2e4;font-size:.66rem;font-weight:850;cursor:pointer;transition:border-color .2s,background .2s,color .2s,transform .2s; }
         .network-expanded-action:hover { border-color:color-mix(in srgb,var(--accent) 42%,transparent);background:color-mix(in srgb,var(--accent) 7%,transparent);color:var(--accent);transform:translateY(-1px); }
@@ -4858,6 +5739,8 @@ class A_pwmenu(plugins.Plugin):
             .pw-search .s-box { min-height:41px;font-size:.76rem; }
             .mobile-search-close { display:none; }
             .tabs { position:fixed;left:50%;bottom:max(9px,env(safe-area-inset-bottom));z-index:150;width:min(calc(100% - 20px),430px);grid-template-columns:repeat(4,1fr);gap:4px;padding:5px;border:1px solid var(--line);border-radius:20px;background:rgba(10,13,14,.94);box-shadow:0 20px 60px rgba(0,0,0,.55);transform:translateX(-50%);backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px); }
+            .map-placement-label { top:64px;max-width:calc(100% - 32px); }
+            .map-placement-controls { bottom:calc(76px + env(safe-area-inset-bottom));border-radius:18px; }
             .tab { min-height:51px;flex-direction:column;gap:1px;padding:5px 3px;border-radius:15px;color:#d7dcde;font-size:.69rem; }
             .tab span { font-size:.49rem; }
             .tab-icon { width:17px;height:17px;flex-basis:17px; }
@@ -5037,11 +5920,11 @@ class A_pwmenu(plugins.Plugin):
                 <div class="pw-hero-copy">
                     <p class="pw-eyebrow">NewFPV / Pwnagotchi</p>
                     <h1 id="pwmenuTitle">PWN<span class="pw-hero-outline">MENU</span></h1>
-                    <p class="pw-hero-line">Capture intelligence, passwords and GPS in one field console.</p>
+                    <p class="pw-hero-line">Capture intelligence, passwords and map data in one field console.</p>
                     <div class="pw-hero-chips">
                         <span><i></i>{{ stats.total }} networks</span>
                         <span><i></i>{{ stats.cracked }} cracked</span>
-                        <span><i></i>{{ stats.gps_points }} GPS points</span>
+                        <span><i></i>{{ stats.gps_points }} map points</span>
                     </div>
                 </div>
                 <aside class="pw-hero-proof" aria-label="PWMenu status">
@@ -5075,7 +5958,7 @@ class A_pwmenu(plugins.Plugin):
 
         <div id="v-cracked" class="list hidden">
             {% for credential_id, d in cracked.items() %}
-            <div class="si" data-t="{{ d.essid }} {{ d.bssid }} {{ d.password }}">
+            <div class="si credential-card" data-kind="credential" data-essid="{{ d.essid }}" data-bssid="{{ d.bssid }}" data-t="{{ d.essid }} {{ d.bssid }} {{ d.password }}">
                 <div class="row" onclick="tog('cracked-{{ loop.index }}')">
                     <div style="flex-grow:1;min-width:0">
                         <div class="tit">{{ d.essid }}<span class="badge">{{ d.source }}</span></div>
@@ -5084,7 +5967,7 @@ class A_pwmenu(plugins.Plugin):
                     <span class="arr" title="Open credential"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9 6 6 6-6 6"></path></svg></span>
                 </div>
                 <div id="s-cracked-{{ loop.index }}" class="subs">
-                    <div class="credential-expanded">
+                    <div class="credential-expanded credential-panel">
                         <div class="credential-label">Password</div>
                         <div class="credential-value">{{ d.password }}</div>
                         <div class="credential-actions">
@@ -5102,10 +5985,10 @@ class A_pwmenu(plugins.Plugin):
         <div id="v-handshakes" class="list hidden">
             {% for g in groups %}
             {% set group_index = loop.index %}
-            <div class="si" data-t="{{ g.essid }}">
+            <div class="si handshake-card" data-kind="handshake" data-essid="{{ g.essid }}" data-bssid="{{ g.bssid }}" data-t="{{ g.essid }}">
                 <div class="row">
                     <div style="flex-grow:1;min-width:0" onclick="tog('handshake-{{ loop.index }}')">
-                        <div class="tit {{ g.cls }}">{{ g.essid }} {% if g.count > 1 %}<span class="badge">{{ g.count }}</span>{% endif %}{% if g.gps_count > 0 %}<span class="badge">GPS</span>{% endif %}</div>
+                        <div class="tit {{ g.cls }}">{{ g.essid }} {% if g.count > 1 %}<span class="badge">{{ g.count }}</span>{% endif %}{% if g.map_count > 0 %}<span class="badge">MAP</span>{% elif g.gps_count > 0 %}<span class="badge">GPS</span>{% endif %}</div>
                         <div class="sub">{{ g.last_seen }}</div>
                     </div>
                     <div style="display:flex;align-items:center;">
@@ -5114,7 +5997,7 @@ class A_pwmenu(plugins.Plugin):
                 </div>
                 <div id="s-handshake-{{ loop.index }}" class="subs">
                     {% if g.is_cracked and g.pwd %}
-                    <div class="credential-expanded">
+                    <div class="credential-expanded credential-panel">
                         <div class="credential-label">Recovered password</div>
                         <div class="credential-value">{{ g.pwd }}</div>
                         <div class="credential-actions">
@@ -5125,23 +6008,27 @@ class A_pwmenu(plugins.Plugin):
                     {% endif %}
                     <div class="network-expanded-tools">
                         {% if not g.is_cracked or not g.pwd %}
-                        <button class="network-expanded-action" onclick='add({{ g.essid|tojson }}, {{ g.bssid|tojson }})' title="Add a recovered password"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="8" cy="15" r="4"></circle><path d="m11 12 7-7m-2 0h4m-2-2v4"></path></svg><span>Add password</span></button>
+                        <button class="network-expanded-action password-add-action" onclick='add({{ g.essid|tojson }}, {{ g.bssid|tojson }})' title="Add a recovered password"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="8" cy="15" r="4"></circle><path d="m11 12 7-7m-2 0h4m-2-2v4"></path></svg><span>Add password</span></button>
                         {% endif %}
                         <button class="network-expanded-action" onclick='whitelistAdd({{ g.essid|tojson }}, "handshakes", {{ g.bssid|tojson }})' title="Add this network to the whitelist"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3 5 6v5c0 4.6 2.8 8 7 10 4.2-2 7-5.4 7-10V6l-7-3Z"></path><path d="m9 12 2 2 4-4"></path></svg><span>Whitelist</span></button>
                     </div>
                     {% for f in g.files %}
                     <div class="sub-row capture-row">
-                        <div class="capture-file-info">
-                            <div class="capture-file-bssid">{{ f.bssid or 'Unknown BSSID' }}</div>
-                            <div class="capture-file-meta">{{ f.date }} · {{ f.size }}</div>
-                            {% if f.quality.grade %}<div class="quality-badge {{ f.quality.grade|lower }}" title="{{ f.quality.summary }}">{{ f.quality.grade }}</div>{% else %}<div class="quality-badge">Pending</div>{% endif %}
+                        <div class="capture-file-head">
+                            <div class="capture-file-info">
+                                <div class="capture-file-name" title="{{ f.filename }}">{{ f.filename }}</div>
+                                <div class="capture-file-bssid">{{ f.bssid or 'Unknown BSSID' }}</div>
+                                <div class="capture-file-meta">{{ f.date }} · {{ f.size }}</div>
+                                {% if f.quality.grade %}<div class="quality-badge {{ f.quality.grade|lower }}" title="{{ f.quality.summary }}">{{ f.quality.grade }}</div>{% else %}<div class="quality-badge">Pending</div>{% endif %}
+                            </div>
+                            <button class="capture-file-delete" onclick='rm({{ f.filename|tojson }})' title="Delete {{ f.filename }}"><svg viewBox="0 0 24 24"><path d="M4 7h16M9 7V4h6v3m-9 0 1 14h10l1-14M10 11v6m4-6v6"></path></svg></button>
                         </div>
                         <div class="capture-actions">
+                            <button class="capture-action" onclick='placeHandshakeOnMap({{ f.filename|tojson }}, {{ g.essid|tojson }}, {{ f.bssid|tojson }})'><svg viewBox="0 0 24 24"><path d="M20 10c0 5-8 11-8 11S4 15 4 10a8 8 0 1 1 16 0Z"></path><circle cx="12" cy="10" r="2.5"></circle></svg><span>{{ 'Move' if f.lat is not none and f.lon is not none else 'Map' }}</span></button>
                             {% if show_wpa %}<button class="capture-action" onclick='upl({{ f.filename|tojson }})'><svg viewBox="0 0 24 24"><path d="M12 3 5 6v5c0 4.6 2.8 8 7 10 4.2-2 7-5.4 7-10V6l-7-3Z"></path><path d="M9 12h6"></path></svg><span>WPA</span></button>{% endif %}
                             <button class="capture-action" onclick='sendSingleToOhc({{ f.filename|tojson }})'><svg viewBox="0 0 24 24"><path d="M7 18h10a4 4 0 0 0 .7-7.9A6 6 0 0 0 6.3 8.5 4.8 4.8 0 0 0 7 18Z"></path><path d="m9 13 3-3 3 3m-3-3v6"></path></svg><span>OHC</span></button>
                             <a href="/plugins/A_pwmenu/download-22000/{{ f.filename|urlencode }}" class="capture-action accent"><svg viewBox="0 0 24 24"><path d="M8 3 6 21m10-18-2 18M3 9h18M2 15h18"></path></svg><span>22000</span></a>
                             <a href="/plugins/A_pwmenu/download/{{ f.filename|urlencode }}" class="capture-action accent"><svg viewBox="0 0 24 24"><path d="M12 3v12m-4-4 4 4 4-4"></path><path d="M5 19h14"></path></svg><span>PCAP</span></a>
-                            <button class="capture-action danger" onclick='rm({{ f.filename|tojson }})'><svg viewBox="0 0 24 24"><path d="M4 7h16M9 7V4h6v3m-9 0 1 14h10l1-14M10 11v6m4-6v6"></path></svg><span>Delete</span></button>
                         </div>
                     </div>
                     {% endfor %}
@@ -5162,6 +6049,16 @@ class A_pwmenu(plugins.Plugin):
                         <input type="text" id="mapSearch" class="map-search" oninput="renderMap()" placeholder="Search networks...">
                     </div>
                     <button id="gpsStatusDot" class="map-gps-dot offline hidden" type="button" tabindex="-1" aria-hidden="true"></button>
+                </div>
+                <div id="mapPlacementTarget" class="map-placement-target hidden" hidden>
+                    <div class="map-placement-pin" aria-hidden="true">
+                        <svg viewBox="0 0 64 64"><path d="M32 60S12 43.5 12 25a20 20 0 1 1 40 0C52 43.5 32 60 32 60Z"></path><circle cx="32" cy="25" r="10"></circle><path d="M32 20v10m-5-5h10"></path></svg>
+                    </div>
+                </div>
+                <div id="mapPlacementText" class="map-placement-label hidden" hidden>Move the map, then confirm.</div>
+                <div id="mapPlacementControls" class="map-placement-controls hidden" hidden>
+                    <button class="map-placement-cancel" type="button" onclick="cancelMapPlacement()" title="Cancel"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"></path></svg></button>
+                    <button class="map-placement-confirm" type="button" onclick="confirmMapPlacement()" title="Place here"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12 4 4L19 6"></path></svg></button>
                 </div>
                 <div id="gpsStatusPop" class="map-gps-pop hidden"></div>
                 <div id="mapEmpty" class="map-empty hidden">
@@ -5232,13 +6129,30 @@ class A_pwmenu(plugins.Plugin):
                 <div class="mobile-xp-track" aria-label="Level progress {{ stats.lvl_percent }} percent"><i style="width:{{ stats.lvl_percent }}%"></i></div>
             </section>
             <div class="card" style="padding:15px;text-align:left;">
-                <h3 style="margin-top:0;text-align:center;">OnlineHashCrack</h3>
+                <h3 style="margin-top:0;text-align:center;"><a class="external-service-link" href="https://app.onlinehashcrack.com/" target="_blank" rel="noopener noreferrer">OnlineHashCrack ↗</a></h3>
                 <button class="btn" style="margin-top:0;background:#ff9f0a;" onclick="sendAllMissingToOhc()">Send all missing to OHC</button>
                 <div class="sub" style="margin-top:10px;">
                     Persistent queue: {{ ohc_status.pending }} file(s)
                     {% if ohc_status.retry_in > 0 %} • retry in {{ ohc_status.retry_in }}s{% endif %}
                 </div>
-                <div class="sub" style="margin-top:4px;">Scans every uncracked PCAP, deduplicates locally, and lets OHC safely skip tasks that already exist.</div>
+                <div class="sub" style="margin-top:4px;">Queues one best unresolved PCAP per BSSID. Local history and the last imported OHC export are excluded before upload.</div>
+            </div>
+
+            <div class="card" style="padding:15px;text-align:left;">
+                <h3 style="margin-top:0;text-align:center;"><a class="external-service-link" href="https://wpa-sec.stanev.org/?submit=" target="_blank" rel="noopener noreferrer">WPA-sec ↗</a></h3>
+                <button class="btn" style="margin-top:0;background:#147a45;color:#fff;" onclick="syncWpaSec()">Sync WPA-sec now</button>
+                <div class="sub" style="margin-top:10px;">
+                    Integrated uploader: {{ wpa_status.submitted }} network(s) remembered
+                    {% if wpa_status.pending %} · {{ wpa_status.pending }} queued{% endif %}
+                </div>
+                <div class="sub" style="margin-top:4px;">
+                    {% if wpa_status.results_present %}
+                    Results: {{ wpa_status.results_bytes }} bytes · updated {{ wpa_status.results_updated }}
+                    {% else %}
+                    No downloaded result file yet.
+                    {% endif %}
+                </div>
+                {% if wpa_status.last_upload %}<div class="sub" style="margin-top:4px;">{{ wpa_status.last_upload }}</div>{% endif %}
             </div>
 
             <div class="card" style="padding:15px;text-align:left;">
@@ -5257,14 +6171,15 @@ class A_pwmenu(plugins.Plugin):
             <div class="card" style="padding:15px;text-align:left;">
                 <h3 style="margin-top:0;text-align:center;">Network Whitelist</h3>
                 <div class="sub">Add an exact network name. Changes are written atomically and applied to the running Pwnagotchi session.</div>
-                <form method="POST" action="/plugins/A_pwmenu/whitelist-add" class="whitelist-form">
+                <form method="POST" action="/plugins/A_pwmenu/whitelist-add" class="whitelist-form" onsubmit="return whitelistFormSubmit(event)">
                     <input type="hidden" name="csrf_token" value="{{ token }}">
                     <input type="hidden" name="return_tab" value="other">
                     <input class="whitelist-input" type="text" name="network" maxlength="128" autocomplete="off" placeholder="Network name" required>
                     <button class="whitelist-submit">Add network</button>
                 </form>
+                <div id="whitelistListHost">
                 <ul class="whitelist-list">
-                    {% for network in whitelist %}
+                    {% for network in (whitelist[:10] if whitelist|length > 15 else whitelist) %}
                     <li class="whitelist-item">
                         <span>{{ network }}</span>
                         <button class="whitelist-remove" type="button" onclick='whitelistRemove({{ network|tojson }})'>Remove</button>
@@ -5273,6 +6188,20 @@ class A_pwmenu(plugins.Plugin):
                     <li class="whitelist-item"><span>No active whitelist entries.</span></li>
                     {% endfor %}
                 </ul>
+                {% if whitelist|length > 15 %}
+                <details class="whitelist-more">
+                    <summary>Show {{ whitelist|length - 10 }} more</summary>
+                    <ul class="whitelist-list">
+                        {% for network in whitelist[10:] %}
+                        <li class="whitelist-item">
+                            <span>{{ network }}</span>
+                            <button class="whitelist-remove" type="button" onclick='whitelistRemove({{ network|tojson }})'>Remove</button>
+                        </li>
+                        {% endfor %}
+                    </ul>
+                </details>
+                {% endif %}
+                </div>
             </div>
 
             <div class="card">
@@ -5347,8 +6276,8 @@ class A_pwmenu(plugins.Plugin):
     <script>
         const csrfToken = '{{ token }}';
         const wpaEnabled = {{ 'true' if show_wpa else 'false' }};
-        const mapPoints = {{ map_points|tojson }};
-        const noGpsNetworks = {{ no_gps_networks|tojson }};
+        let mapPoints = {{ map_points|tojson }};
+        let noGpsNetworks = {{ no_gps_networks|tojson }};
         const gpsStatus = {{ gps_status|tojson }};
         const whitelistedNetworks = new Set({{ whitelist|tojson }});
         let gpsWatchId = null;
@@ -5360,6 +6289,8 @@ class A_pwmenu(plugins.Plugin):
         let yandexReady = false;
         let yandexLoader = null;
         let activeMapGroup = null;
+        let mapPlacement = null;
+        let offlinePlacementCenter = null;
         const pendingMapActions = new Set();
         const accentStorageKey = 'a_pwmenu_accent_v1';
 
@@ -5471,6 +6402,7 @@ class A_pwmenu(plugins.Plugin):
                 if(event.key === 'Escape') {
                     closeAccentPanel();
                     closeMobileSearch();
+                    if(mapPlacement) cancelMapPlacement();
                 }
             });
         }
@@ -5512,24 +6444,192 @@ class A_pwmenu(plugins.Plugin):
             }
         }
 
-        function add(e,b) { const p=prompt("Password for "+e+":"); if(p) post('add-password', {essid:e, bssid:b||'', password:p}); }
+        function compactBssid(value) {
+            const clean = String(value || '').toLowerCase().replace(/[^0-9a-f]/g, '');
+            return clean.length === 12 ? clean : '';
+        }
+
+        function normalizedEssid(value) {
+            return String(value || '').normalize().replace(/[^\p{L}\p{N}]+/gu, '').toLowerCase();
+        }
+
+        function sameNetwork(aEssid, aBssid, bEssid, bBssid) {
+            const aMac = compactBssid(aBssid);
+            const bMac = compactBssid(bBssid);
+            if(aMac && bMac) return aMac === bMac;
+            return normalizedEssid(aEssid) === normalizedEssid(bEssid);
+        }
+
+        function passwordPanelHtml(credential) {
+            if(!credential || !credential.password) return '';
+            return `<div class="credential-expanded credential-panel">
+                <div class="credential-label">Recovered password</div>
+                <div class="credential-value">${esc(credential.password)}</div>
+                <div class="credential-actions">
+                    <button class="network-expanded-action" onclick='ed(${jsq(credential.essid)}, ${jsq(credential.password)}, ${jsq(credential.source || '')}, ${jsq(credential.bssid || '')})'>Edit password</button>
+                    <button class="network-expanded-action" style="color:var(--danger)" onclick='del(${jsq(credential.essid)}, ${jsq(credential.password)}, ${jsq(credential.source || '')}, ${jsq(credential.bssid || '')})'>Delete password</button>
+                </div>
+            </div>`;
+        }
+
+        function credentialCardHtml(credential) {
+            const id = 'dynamic-' + Date.now() + '-' + Math.floor(Math.random() * 10000);
+            return `<div class="si credential-card" data-kind="credential" data-essid="${esc(credential.essid)}" data-bssid="${esc(credential.bssid || '')}" data-t="${esc(`${credential.essid} ${credential.bssid || ''} ${credential.password}`)}">
+                <div class="row" onclick="tog('${id}')">
+                    <div style="flex-grow:1;min-width:0">
+                        <div class="tit">${esc(credential.essid)}<span class="badge">${esc(credential.source || 'Manual')}</span></div>
+                        <div class="sub">${esc(credential.bssid || 'Name-only credential')}</div>
+                    </div>
+                    <span class="arr" title="Open credential"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9 6 6 6-6 6"></path></svg></span>
+                </div>
+                <div id="s-${id}" class="subs">${passwordPanelHtml(credential)}</div>
+            </div>`;
+        }
+
+        function updateMapCredential(essid, bssid, credential) {
+            const visit = item => {
+                if(!item) return;
+                if(sameNetwork(item.essid, item.bssid, essid, bssid)) {
+                    item.password = credential ? String(credential.password || '') : '';
+                    item.is_cracked = !!(credential && credential.password);
+                    item.status = item.is_cracked ? 'cracked' : 'handshake';
+                }
+                (item.members || []).forEach(visit);
+                (item.history || []).forEach(visit);
+                if(item.members && item.members.length > 1) {
+                    item.is_cracked = item.members.some(member => member.is_cracked);
+                    item.status = item.is_cracked ? 'cracked' : 'handshake';
+                }
+            };
+            mapPoints.forEach(visit);
+            noGpsNetworks.forEach(visit);
+            renderMap();
+            refreshOpenMapCard();
+        }
+
+        function applyPasswordResult(result) {
+            const credential = result.credential && result.credential.password
+                ? result.credential : null;
+            const cards = Array.from(document.querySelectorAll('.si[data-kind]'));
+            const matching = cards.filter(card => sameNetwork(
+                card.dataset.essid, card.dataset.bssid,
+                result.essid, result.bssid
+            ));
+            const credentialCards = matching.filter(card => card.dataset.kind === 'credential');
+            const handshakeCards = matching.filter(card => card.dataset.kind === 'handshake');
+
+            if(credential) {
+                if(credentialCards.length) {
+                    credentialCards.forEach(card => {
+                        card.dataset.essid = credential.essid || result.essid;
+                        card.dataset.bssid = credential.bssid || result.bssid || '';
+                        card.dataset.t = `${credential.essid} ${credential.bssid || ''} ${credential.password}`;
+                        const title = card.querySelector('.tit');
+                        if(title) title.innerHTML = `${esc(credential.essid)}<span class="badge">${esc(credential.source || 'Manual')}</span>`;
+                        const sub = card.querySelector('.sub');
+                        if(sub) sub.textContent = credential.bssid || 'Name-only credential';
+                        const panel = card.querySelector('.credential-panel');
+                        if(panel) panel.outerHTML = passwordPanelHtml(credential);
+                    });
+                } else {
+                    const list = document.getElementById('v-cracked');
+                    if(list) {
+                        const credit = list.querySelector('.newfpv-credit');
+                        const holder = document.createElement('div');
+                        holder.innerHTML = credentialCardHtml(credential);
+                        list.insertBefore(holder.firstElementChild, credit || null);
+                    }
+                }
+            } else {
+                credentialCards.forEach(card => card.remove());
+            }
+
+            handshakeCards.forEach(card => {
+                const subs = card.querySelector('.subs');
+                if(!subs) return;
+                const panel = subs.querySelector('.credential-panel');
+                if(credential) {
+                    if(panel) panel.outerHTML = passwordPanelHtml(credential);
+                    else subs.insertAdjacentHTML('afterbegin', passwordPanelHtml(credential));
+                } else if(panel) {
+                    panel.remove();
+                }
+                const tools = subs.querySelector('.network-expanded-tools');
+                let addButton = tools && tools.querySelector('.password-add-action');
+                if(credential && addButton) addButton.remove();
+                if(!credential && tools && !addButton) {
+                    tools.insertAdjacentHTML('afterbegin', `<button class="network-expanded-action password-add-action" onclick='add(${jsq(result.essid)}, ${jsq(result.bssid || '')})' title="Add a recovered password">${mapActionIcon('key')}<span>Add password</span></button>`);
+                }
+            });
+            updateMapCredential(result.essid, result.bssid, credential);
+        }
+
+        async function passwordAction(route, payload, pendingMessage) {
+            showToast(pendingMessage || 'Verifying password...');
+            try {
+                const result = await postAsync(route, payload);
+                applyPasswordResult(result);
+                showToast(result.message || (result.ok ? 'Password updated' : 'Password rejected'), !result.ok);
+                return result;
+            } catch(error) {
+                showToast(error.message || 'Password action failed', true);
+                return null;
+            }
+        }
+
+        function add(e,b) {
+            const p = prompt("Password for " + e + ":");
+            if(p !== null && p !== '') passwordAction(
+                'add-password',
+                {essid:e, bssid:b || '', password:p},
+                'Verifying password against the capture...'
+            );
+        }
         function whitelistAdd(network, returnTab, bssid) {
             if(confirm('Add "' + network + '" to the whitelist?')) {
                 const payload = {network:network, bssid:bssid || '', return_tab:returnTab || 'other'};
-                if(returnTab === 'map') updateWhitelistAsync('whitelist-add', payload);
-                else post('whitelist-add', payload);
+                updateWhitelistAsync('whitelist-add', payload);
             }
         }
         function whitelistRemove(network, returnTab) {
             if(confirm('Remove "' + network + '" from the whitelist?')) {
-                if(returnTab === 'map') updateWhitelistAsync('whitelist-remove', {network:network, return_tab:'map'});
-                else post('whitelist-remove', {network:network, return_tab:returnTab || 'other'});
+                updateWhitelistAsync('whitelist-remove', {network:network, return_tab:returnTab || 'other'});
             }
         }
 
         function syncWhitelist(values) {
             whitelistedNetworks.clear();
             (values || []).forEach(name => whitelistedNetworks.add(String(name)));
+        }
+
+        function whitelistItemHtml(network) {
+            return `<li class="whitelist-item"><span>${esc(network)}</span><button class="whitelist-remove" type="button" onclick='whitelistRemove(${jsq(network)})'>Remove</button></li>`;
+        }
+
+        function renderWhitelistList(values) {
+            const host = document.getElementById('whitelistListHost');
+            if(!host) return;
+            const names = (values || []).map(String);
+            if(!names.length) {
+                host.innerHTML = '<ul class="whitelist-list"><li class="whitelist-item"><span>No active whitelist entries.</span></li></ul>';
+                return;
+            }
+            if(names.length <= 15) {
+                host.innerHTML = `<ul class="whitelist-list">${names.map(whitelistItemHtml).join('')}</ul>`;
+                return;
+            }
+            host.innerHTML = `<ul class="whitelist-list">${names.slice(0, 10).map(whitelistItemHtml).join('')}</ul>
+                <details class="whitelist-more"><summary>Show ${names.length - 10} more</summary>
+                <ul class="whitelist-list">${names.slice(10).map(whitelistItemHtml).join('')}</ul></details>`;
+        }
+
+        function whitelistFormSubmit(event) {
+            event.preventDefault();
+            const form = event.currentTarget;
+            const input = form.querySelector('[name="network"]');
+            const name = input ? input.value.trim() : '';
+            if(name) updateWhitelistAsync('whitelist-add', {network:name, return_tab:'other'}).then(() => form.reset());
+            return false;
         }
 
         function refreshOpenMapCard() {
@@ -5542,6 +6642,7 @@ class A_pwmenu(plugins.Plugin):
             try {
                 const result = await postAsync(route, data);
                 syncWhitelist(result.whitelist);
+                renderWhitelistList(result.whitelist);
                 refreshOpenMapCard();
                 showToast(result.message || (result.ok ? 'Whitelist updated' : 'No changes'));
             } catch(error) {
@@ -5569,16 +6670,200 @@ class A_pwmenu(plugins.Plugin):
                 await updateWhitelistAsync('whitelist-add-excellent', {networks:JSON.stringify(names)});
             }
         }
-        function ed(e,o,s,b) { const p=prompt("Edit "+e+":", o); if(p&&p!==o) post('update-password', {essid:e, bssid:b||'', old_password:o, password:p, source:s||''}); }
+        function ed(e,o,s,b) {
+            const p = prompt("Edit " + e + ":", o);
+            if(p !== null && p !== o) passwordAction(
+                'update-password',
+                {essid:e, bssid:b || '', old_password:o, password:p, source:s || ''},
+                'Verifying the new password...'
+            );
+        }
         function del(e, p, s, b) {
             if(confirm("Delete password for "+e+"?")) {
-                post('delete-password', {essid:e, bssid:b||'', password:p, source:s});
+                passwordAction(
+                    'delete-password',
+                    {essid:e, bssid:b || '', password:p, source:s || ''},
+                    'Deleting password...'
+                );
             }
         }
         function rm(f) { if(confirm("Delete file "+f+"?")) post('delete-file', {filename:f}); }
         function upl(f) {
-            const k = '{{ show_wpa }}';
-            if(k) post('wpa-sec-upload', {filename:f});
+            if(wpaEnabled) runMapAction('wpa-sec-upload', {filename:f}, 'Queueing WPA-sec upload...');
+        }
+
+        function syncWpaSec() {
+            runMapAction('wpa-sec-sync', {}, 'Starting WPA-sec synchronization...');
+        }
+
+        function findMapMemberById(pointId) {
+            let found = null;
+            const visit = item => {
+                if(!item || found) return;
+                if(String(item.id || '') === String(pointId || '')) {
+                    found = item;
+                    return;
+                }
+                (item.members || []).forEach(visit);
+                (item.history || []).forEach(visit);
+            };
+            mapPoints.forEach(visit);
+            return found;
+        }
+
+        function placeHandshakeOnMap(filename, essid, bssid) {
+            mapPlacement = {
+                filename:String(filename || ''),
+                essid:String(essid || ''),
+                bssid:String(bssid || ''),
+                saving:false
+            };
+            const label = mapPlacement.essid || mapPlacement.filename;
+            const text = document.getElementById('mapPlacementText');
+            const stage = document.getElementById('mapStage');
+            if(text) text.textContent = `Move the map under the pin, then place ${label}.`;
+            setMapPlacementUiVisible(true);
+            if(stage) stage.classList.add('placing');
+            hideMapPoint();
+            tab('map');
+            setTimeout(focusMapPlacement, 120);
+            showToast('Move the map and press the check mark');
+        }
+
+        function setMapPlacementUiVisible(visible) {
+            ['mapPlacementTarget', 'mapPlacementText', 'mapPlacementControls'].forEach(id => {
+                const element = document.getElementById(id);
+                if(!element) return;
+                element.hidden = !visible;
+                element.classList.toggle('hidden', !visible);
+            });
+        }
+
+        function cancelMapPlacement(showMessage = true) {
+            mapPlacement = null;
+            offlinePlacementCenter = null;
+            const stage = document.getElementById('mapStage');
+            setMapPlacementUiVisible(false);
+            if(stage) stage.classList.remove('placing');
+            if(showMessage) showToast('Handshake placement cancelled');
+            renderMap();
+        }
+
+        function placementInitialPoint() {
+            if(!mapPlacement) return null;
+            const current = findMapMemberById(mapPlacement.filename);
+            if(current && Number.isFinite(Number(current.lat)) && Number.isFinite(Number(current.lon))) {
+                return {lat:Number(current.lat), lon:Number(current.lon)};
+            }
+            if(userLocation) return {lat:Number(userLocation.lat), lon:Number(userLocation.lon)};
+            if(mapPoints.length) return {lat:Number(mapPoints[0].lat), lon:Number(mapPoints[0].lon)};
+            return {lat:55.751244, lon:37.618423};
+        }
+
+        function focusMapPlacement() {
+            if(!mapPlacement) return;
+            const point = placementInitialPoint();
+            if(!point) return;
+            offlinePlacementCenter = point;
+            if(yandexMap) {
+                const zoom = Math.max(Number(yandexMap.getZoom() || 0), 16);
+                yandexMap.setCenter([point.lat, point.lon], zoom, {duration:220});
+            }
+            renderMap();
+        }
+
+        function placementCenter() {
+            if(yandexReady && yandexMap) {
+                const center = yandexMap.getCenter();
+                if(center && center.length === 2) {
+                    return {lat:Number(center[0]), lon:Number(center[1])};
+                }
+            }
+            return offlinePlacementCenter || placementInitialPoint();
+        }
+
+        function confirmMapPlacement() {
+            if(!mapPlacement || mapPlacement.saving) return;
+            const center = placementCenter();
+            if(!center) {
+                showToast('Map center is unavailable', true);
+                return;
+            }
+            saveHandshakeMapPoint(center.lat, center.lon);
+        }
+
+        function mapItemCoordinates(item) {
+            if(!item) return null;
+            const lat = Number(item.lat);
+            const lon = Number(item.lon);
+            const hasDirect = item.lat !== null && item.lat !== undefined && item.lat !== ''
+                && item.lon !== null && item.lon !== undefined && item.lon !== '';
+            if(hasDirect && Number.isFinite(lat) && Number.isFinite(lon) && Math.abs(lat) <= 90 && Math.abs(lon) <= 180) {
+                return {lat, lon};
+            }
+            const coordinates = [];
+            const collect = member => {
+                if(!member) return;
+                const memberLat = Number(member.lat);
+                const memberLon = Number(member.lon);
+                const hasCoordinates = member.lat !== null && member.lat !== undefined && member.lat !== ''
+                    && member.lon !== null && member.lon !== undefined && member.lon !== '';
+                if(hasCoordinates && Number.isFinite(memberLat) && Number.isFinite(memberLon) && Math.abs(memberLat) <= 90 && Math.abs(memberLon) <= 180) {
+                    coordinates.push({lat:memberLat, lon:memberLon});
+                    return;
+                }
+                (member.members || []).forEach(collect);
+                (member.history || []).forEach(collect);
+            };
+            (item.members || []).forEach(collect);
+            (item.history || []).forEach(collect);
+            if(!coordinates.length) return null;
+            return {
+                lat:coordinates.reduce((sum, point) => sum + point.lat, 0) / coordinates.length,
+                lon:coordinates.reduce((sum, point) => sum + point.lon, 0) / coordinates.length
+            };
+        }
+
+        function placeHandshakeInSelectedGroup() {
+            if(!mapPlacement || !selectedMapPoint) return;
+            const coordinates = mapItemCoordinates(selectedMapPoint);
+            if(!coordinates) {
+                showToast('This group has no valid map coordinates', true);
+                return;
+            }
+            saveHandshakeMapPoint(coordinates.lat, coordinates.lon);
+        }
+
+        async function saveHandshakeMapPoint(lat, lon) {
+            if(!mapPlacement || mapPlacement.saving) return;
+            const latitude = Number(lat);
+            const longitude = Number(lon);
+            if(lat === null || lat === undefined || lat === '' || lon === null || lon === undefined || lon === ''
+                || !Number.isFinite(latitude) || !Number.isFinite(longitude) || Math.abs(latitude) > 90 || Math.abs(longitude) > 180) {
+                showToast('Map coordinates are invalid', true);
+                return;
+            }
+            mapPlacement.saving = true;
+            const placement = Object.assign({}, mapPlacement);
+            const placementName = placement.essid || placement.filename;
+            showToast(`Adding ${placementName} to the map...`, false, 6000);
+            try {
+                const result = await postAsync('capture-map-set', {
+                    filename:placement.filename,
+                    lat:String(latitude),
+                    lon:String(longitude)
+                });
+                if(!result.ok) throw new Error(result.message || 'Location was rejected');
+                if(result.map_points) mapPoints = result.map_points;
+                if(result.no_gps_networks) noGpsNetworks = result.no_gps_networks;
+                cancelMapPlacement(false);
+                const point = findMapMemberById(result.point_id || placement.filename);
+                if(point) showMapPoint(point);
+                showToast(`Added ${placementName} to the map`, false, 5000);
+            } catch(error) {
+                if(mapPlacement) mapPlacement.saving = false;
+                showToast(error.message || 'Could not save handshake location', true);
+            }
         }
 
         function esc(v) {
@@ -5586,7 +6871,11 @@ class A_pwmenu(plugins.Plugin):
         }
 
         function jsq(v) {
-            return JSON.stringify(String(v || ''));
+            const slash = String.fromCharCode(92);
+            return JSON.stringify(String(v || ''))
+                .replace(/'/g, slash + 'u0027')
+                .replace(/</g, slash + 'u003c')
+                .replace(/>/g, slash + 'u003e');
         }
 
         function copyText(v) {
@@ -5605,14 +6894,14 @@ class A_pwmenu(plugins.Plugin):
             showToast('Copied');
         }
 
-        function showToast(text, isError) {
+        function showToast(text, isError, duration = 2600) {
             const toast = document.getElementById('mapToast');
             if(!toast) return;
             toast.textContent = text || 'Done';
             toast.classList.toggle('error', !!isError);
             toast.classList.add('show');
             clearTimeout(showToast.t);
-            showToast.t = setTimeout(() => toast.classList.remove('show'), 2600);
+            showToast.t = setTimeout(() => toast.classList.remove('show'), duration);
         }
 
         function setMapPanelOpen(open) {
@@ -5711,6 +7000,10 @@ class A_pwmenu(plugins.Plugin):
 
         function gpsStatusChip(item, missing) {
             if(missing) return '<span class="map-chip gray">GPS Missing</span>';
+            const source = String((item && item.source) || '').toLowerCase();
+            if(source === 'manual-map' || source === 'map' || source === 'pwmenu-map') {
+                return '<span class="map-chip blue">Map</span>';
+            }
             if(item && item.gps_stale) {
                 const mins = Math.max(1, Math.round((Number(item.gps_age_at_capture || 0)) / 60));
                 return `<span class="map-chip yellow">GPS ${mins} min old</span>`;
@@ -5732,6 +7025,7 @@ class A_pwmenu(plugins.Plugin):
                 download: '<svg viewBox="0 0 24 24"><path d="M12 3v12m-4-4 4 4 4-4"></path><path d="M5 19h14"></path></svg>',
                 ohc: '<svg viewBox="0 0 24 24"><path d="M7 18h10a4 4 0 0 0 .7-7.9A6 6 0 0 0 6.3 8.5 4.8 4.8 0 0 0 7 18Z"></path><path d="m9 13 3-3 3 3m-3-3v6"></path></svg>',
                 wpa: '<svg viewBox="0 0 24 24"><path d="M12 3 5 6v5c0 4.6 2.8 8 7 10 4.2-2 7-5.4 7-10V6l-7-3Z"></path><path d="M9 12h6"></path></svg>',
+                key: '<svg viewBox="0 0 24 24"><circle cx="8" cy="15" r="4"></circle><path d="m11 12 8-8m-3 3 2 2m-5 1 2 2"></path></svg>',
                 whitelist: '<svg viewBox="0 0 24 24"><path d="M12 3 5 6v5c0 4.6 2.8 8 7 10 4.2-2 7-5.4 7-10V6l-7-3Z"></path><path d="m9 12 2 2 4-4"></path></svg>',
                 trash: '<svg viewBox="0 0 24 24"><path d="M4 7h16M9 7V4h6v3m-9 0 1 14h10l1-14M10 11v6m4-6v6"></path></svg>'
             };
@@ -5748,14 +7042,20 @@ class A_pwmenu(plugins.Plugin):
             return `<button class="map-icon-action ${allowed ? 'danger' : ''}" onclick='${action}' title="${title}">${mapActionIcon('whitelist')}<span>${label}</span></button>`;
         }
 
-        function networkActions(networkName, bssid, filename, isCracked, ohcExpr, wpaExpr) {
-            const download = `<a class="map-icon-action primary" href="/plugins/A_pwmenu/download/${encodeURIComponent(filename)}" title="Download PCAP">${mapActionIcon('download')}<span>PCAP</span></a>`;
-            const ohc = isCracked ? '' : `<button class="map-icon-action" onclick='${ohcExpr}' title="Send to OHC">${mapActionIcon('ohc')}<span>OHC</span></button>`;
-            const wpa = !isCracked && wpaEnabled ? `<button class="map-icon-action" onclick='${wpaExpr}' title="Send to WPA-sec">${mapActionIcon('wpa')}<span>WPA</span></button>` : '';
+        function networkActions(networkName, bssid, filename, password, credentialSource, ohcExpr, wpaExpr) {
+            const isCracked = !!password;
+            const download = filename ? `<a class="map-icon-action primary" href="/plugins/A_pwmenu/download/${encodeURIComponent(filename)}" title="Download PCAP">${mapActionIcon('download')}<span>PCAP</span></a>` : '';
+            const ohc = !isCracked && filename ? `<button class="map-icon-action" onclick='${ohcExpr}' title="Send to OHC">${mapActionIcon('ohc')}<span>OHC</span></button>` : '';
+            const wpa = !isCracked && filename && wpaEnabled ? `<button class="map-icon-action" onclick='${wpaExpr}' title="Send to WPA-sec">${mapActionIcon('wpa')}<span>WPA</span></button>` : '';
+            const key = isCracked
+                ? `<button class="map-icon-action" onclick='ed(${jsq(networkName)}, ${jsq(password)}, ${jsq(credentialSource || '')}, ${jsq(bssid || '')})' title="Edit password">${mapActionIcon('key')}<span>Edit key</span></button>
+                   <button class="map-icon-action danger" onclick='del(${jsq(networkName)}, ${jsq(password)}, ${jsq(credentialSource || '')}, ${jsq(bssid || '')})' title="Delete password">${mapActionIcon('trash')}<span>Del key</span></button>`
+                : `<button class="map-icon-action" onclick='add(${jsq(networkName)}, ${jsq(bssid || '')})' title="Add and verify password">${mapActionIcon('key')}<span>Add key</span></button>`;
+            const captureDelete = filename ? `<button class="map-icon-action danger" title="Delete capture" onclick='rm(${jsq(filename)})'>${mapActionIcon('trash')}<span>Delete</span></button>` : '';
             return `<div class="map-icon-actions">
-                ${download}${ohc}${wpa}
+                ${download}${ohc}${wpa}${key}
                 ${whitelistAction(networkName, bssid)}
-                <button class="map-icon-action danger" title="Delete capture" onclick='rm(${jsq(filename)})'>${mapActionIcon('trash')}<span>Delete</span></button>
+                ${captureDelete}
             </div>`;
         }
 
@@ -5951,7 +7251,7 @@ class A_pwmenu(plugins.Plugin):
                 ${pointChips(n, true)}
                 ${pass}
                 ${fileRows ? `<details class="map-more"><summary>${n.files.length} capture file${n.files.length === 1 ? '' : 's'}</summary><div class="map-list">${fileRows}</div></details>` : ''}
-                ${n.filename ? networkActions(n.essid, n.bssid, n.filename, !!n.password, `sendNoGpsToOhc(noGpsNetworks[${idx}])`, `sendNoGpsToWpa(noGpsNetworks[${idx}])`) : ''}`;
+                ${n.filename ? networkActions(n.essid, n.bssid, n.filename, n.password || '', n.credential_source || '', `sendNoGpsToOhc(noGpsNetworks[${idx}])`, `sendNoGpsToWpa(noGpsNetworks[${idx}])`) : ''}`;
         }
 
         function mapBounds(points) {
@@ -5965,12 +7265,26 @@ class A_pwmenu(plugins.Plugin):
                 minLon = Math.min(minLon, userLocation.lon); maxLon = Math.max(maxLon, userLocation.lon);
             }
             if(minLat === Infinity) {
-                minLat = userLocation.lat - 0.001; maxLat = userLocation.lat + 0.001;
-                minLon = userLocation.lon - 0.001; maxLon = userLocation.lon + 0.001;
+                const center = userLocation || {lat:55.751244, lon:37.618423};
+                minLat = center.lat - 0.001; maxLat = center.lat + 0.001;
+                minLon = center.lon - 0.001; maxLon = center.lon + 0.001;
             }
             if(minLat === maxLat) { minLat -= 0.001; maxLat += 0.001; }
             if(minLon === maxLon) { minLon -= 0.001; maxLon += 0.001; }
             return {minLat, maxLat, minLon, maxLon};
+        }
+
+        function offlineMapBounds(points) {
+            const bounds = mapBounds(points);
+            if(!mapPlacement || !offlinePlacementCenter) return bounds;
+            const latSpan = Math.max(bounds.maxLat - bounds.minLat, 0.002);
+            const lonSpan = Math.max(bounds.maxLon - bounds.minLon, 0.002);
+            return {
+                minLat:offlinePlacementCenter.lat - latSpan / 2,
+                maxLat:offlinePlacementCenter.lat + latSpan / 2,
+                minLon:offlinePlacementCenter.lon - lonSpan / 2,
+                maxLon:offlinePlacementCenter.lon + lonSpan / 2
+            };
         }
 
         function pointPos(p, b) {
@@ -6088,10 +7402,13 @@ class A_pwmenu(plugins.Plugin):
                     if(points.length > 1) {
                         const members = [];
                         points.forEach(p => (p.members && p.members.length ? p.members : [p]).forEach(m => members.push(m)));
+                        const coordinates = mapItemCoordinates({members:points});
                         showMapGroup({
                             id: 'cluster-' + ids.join('-'),
                             essid: points.length + ' points',
                             count: points.reduce((sum, p) => sum + (parseInt(p.count || 1, 10) || 1), 0),
+                            lat: coordinates ? coordinates.lat : null,
+                            lon: coordinates ? coordinates.lon : null,
                             members: members
                         });
                     }
@@ -6099,6 +7416,7 @@ class A_pwmenu(plugins.Plugin):
                 yandexReady = true;
                 document.getElementById('yandexMap').classList.add('ready');
                 setTimeout(() => yandexMap.container.fitToViewport(), 50);
+                if(mapPlacement) setTimeout(focusMapPlacement, 80);
                 renderMap();
                 } catch(e) {
                     yandexMap = null;
@@ -6148,16 +7466,32 @@ class A_pwmenu(plugins.Plugin):
 
         function renderMap() {
             const box = document.getElementById('mapMarkers');
+            const stage = document.getElementById('mapStage');
             if(!box) return;
             const pts = filteredMapPoints();
             const empty = document.getElementById('mapEmpty');
             box.innerHTML = '';
-            empty.classList.toggle('hidden', pts.length > 0 || !!userLocation);
-            if(pts.length === 0 && !userLocation) return;
+            empty.classList.toggle('hidden', pts.length > 0 || !!userLocation || !!mapPlacement);
+            if(stage) {
+                stage.onclick = event => {
+                    if(!mapPlacement || yandexReady) return;
+                    if(event.target.closest('button, input, a, .map-sheet, .map-placement-target, .map-placement-controls, .map-placement-label')) return;
+                    const rect = stage.getBoundingClientRect();
+                    if(!rect.width || !rect.height) return;
+                    const bounds = offlineMapBounds(pts);
+                    const x = Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width));
+                    const y = Math.max(0, Math.min(1, (event.clientY - rect.top) / rect.height));
+                    const lon = bounds.minLon + x * (bounds.maxLon - bounds.minLon);
+                    const lat = bounds.maxLat - y * (bounds.maxLat - bounds.minLat);
+                    offlinePlacementCenter = {lat, lon};
+                    renderMap();
+                };
+            }
+            if(pts.length === 0 && !userLocation && !mapPlacement) return;
 
             if(renderYandexMap(pts)) return;
 
-            const b = mapBounds(pts);
+            const b = offlineMapBounds(pts);
             if(userLocation) {
                 const mePos = pointPos(userLocation, b);
                 const me = document.createElement('button');
@@ -6195,6 +7529,9 @@ class A_pwmenu(plugins.Plugin):
             const d = document.getElementById('mapDetails');
             d.classList.remove('hidden');
             const backButton = activeMapGroup ? '<button class="map-back" onclick="showMapGroup(activeMapGroup)">Back</button>' : '<button class="map-back" onclick="hideMapPoint()">Back</button>';
+            const placementAction = mapPlacement
+                ? `<button class="map-action cyan map-placement-card-action" onclick="placeHandshakeInSelectedGroup()">Add ${esc(mapPlacement.essid || mapPlacement.filename)} here</button>`
+                : '';
             const pass = p.password ? `
                 <div class="map-secret">
                     <div class="map-secret-row">
@@ -6226,9 +7563,10 @@ class A_pwmenu(plugins.Plugin):
                     <span>${esc(p.vendor || 'Unknown vendor')}</span>
                 </div>
                 ${pointChips(p, false)}
+                ${placementAction}
                 ${pass}
                 ${history ? `<details class="map-more"><summary>${p.history.length} nearby captures</summary><div class="map-list">${history}</div></details>` : ''}
-                ${networkActions(p.essid, p.bssid, p.filename, !!p.password, `sendSingleToOhc(${jsq(p.filename)})`, `sendSingleToWpa(${jsq(p.filename)})`)}`;
+                ${networkActions(p.essid, p.bssid, p.filename, p.password || '', p.credential_source || '', `sendSingleToOhc(${jsq(p.filename)})`, `sendSingleToWpa(${jsq(p.filename)})`)}`;
         }
 
         function showMapGroup(p) {
@@ -6254,6 +7592,9 @@ class A_pwmenu(plugins.Plugin):
             const whitelistGroupAction = excellentPending.length
                 ? `<button class="map-icon-action" onclick="whitelistExcellentGroup(activeMapGroup)" title="Add ${excellentPending.length} Excellent-quality network(s) to the whitelist">${mapActionIcon('whitelist')}<span>Allow ${excellentPending.length}</span></button>`
                 : `<button class="map-icon-action" disabled title="${excellentNames.length ? 'All Excellent-quality networks are already whitelisted' : 'No Excellent-quality networks in this group'}">${mapActionIcon('whitelist')}<span>${excellentNames.length ? 'Allowed' : 'No Excellent'}</span></button>`;
+            const placementAction = mapPlacement
+                ? `<button class="map-action cyan map-placement-card-action" onclick="placeHandshakeInSelectedGroup()">Add ${esc(mapPlacement.essid || mapPlacement.filename)} to this group</button>`
+                : '';
             p.visibleMembers = visibleMembers;
             d.innerHTML = `
                 <div class="map-title-row">
@@ -6269,6 +7610,7 @@ class A_pwmenu(plugins.Plugin):
                     ${wpaEnabled ? `<button class="map-icon-action" onclick="sendClusterToWpa(activeMapGroup)" title="Send cluster to WPA-sec">${mapActionIcon('wpa')}<span>WPA</span></button>` : ''}
                     ${whitelistGroupAction}
                 </div>
+                ${placementAction}
                 <div class="map-list map-cluster-list">${rows || '<div class="map-status">No networks here.</div>'}</div>`;
         }
 
