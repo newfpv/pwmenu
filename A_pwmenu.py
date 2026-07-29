@@ -4005,8 +4005,9 @@ class A_pwmenu(plugins.Plugin):
             ):
                 return (
                     False,
-                    'Password cannot be verified: the capture contains no '
-                    'usable PMKID/EAPOL exchange; recapture this access point',
+                    'Password cannot be verified because this capture '
+                    'contains no usable WPA/PMKID hash. Recapture the '
+                    'access point',
                 )
             return (
                 False,

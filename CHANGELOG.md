@@ -22,6 +22,9 @@ All notable changes to A_pwmenu are documented here.
   hash can be extracted, with a direct pointer to Capture Cleanup.
 - Made the per-capture OHC action return the stored exclusion reason instead of
   reporting a misleading upload start when zero files were queued.
+- Clarified manual-password rejection for incomplete captures: the UI now says
+  explicitly that verification is impossible because no usable WPA/PMKID hash
+  exists and asks the owner to recapture the access point.
 
 ## 1.3.8 — 2026-07-29
 

@@ -140,6 +140,45 @@ class PWMenuFeatureTests(unittest.TestCase):
             ["correcthorse"],
         )
 
+    def test_manual_password_explains_when_capture_has_no_hash(self):
+        capture = os.path.join(
+            self.tempdir.name, "Cafe_aabbccddeeff.pcap"
+        )
+        with open(capture, "wb") as handle:
+            handle.write(b"incomplete capture")
+
+        with (
+            mock.patch.object(
+                self.plugin, "_matching_capture_paths", return_value=[capture]
+            ),
+            mock.patch.object(
+                self.plugin,
+                "_run_aircrack_password_check",
+                return_value=(False, False, "Packets contained no EAPOL data"),
+            ),
+            mock.patch.object(
+                self.plugin,
+                "_run_hcxpmk_password_check",
+                return_value=(
+                    False,
+                    False,
+                    "No matching PMKID/EAPOL hash was extracted",
+                ),
+            ),
+        ):
+            verified, message = self.plugin._verify_manual_password(
+                "Cafe",
+                "aabbccddeeff",
+                "correcthorse",
+            )
+
+        self.assertFalse(verified)
+        self.assertEqual(
+            message,
+            "Password cannot be verified because this capture contains no "
+            "usable WPA/PMKID hash. Recapture the access point",
+        )
+
     def test_pmkid_verification_is_local_and_password_not_in_subprocess(self):
         capture = os.path.join(
             self.tempdir.name, "Cafe_aabbccddeeff.pcap"
