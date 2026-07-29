@@ -50,6 +50,26 @@ Bluetooth PAN connection.
 - Places the Delete action beside the exact PCAP filename so the selected file
   is unambiguous.
 
+### Quality meanings
+
+| Grade | Local result | Hashcat suitability |
+|---|---|---|
+| **Excellent** | A usable hash plus an authorized EAPOL exchange or written PMKID | Ready |
+| **Usable** | At least one valid WPA/PMKID mode 22000 hash | Ready |
+| **Partial** | EAPOL material exists, but no usable hash was extracted | Uncrackable as captured |
+| **Unusable** | No WPA/PMKID material, or only an empty PCAP header | Uncrackable |
+
+Raw M1/M2/M3/M4 counts are diagnostic. Frames can belong to incompatible
+association attempts or carry mismatched nonces and replay counters. PWMenu uses
+successful mode 22000 extraction—not the number of EAPOL frames—as the final
+Hashcat suitability test.
+
+`Partial` captures with zero hashes are excluded from Hashcat and cloud work and
+listed as **uncrackable** in Capture Cleanup. The owner sees the exact filename
+and reason, confirms the complete candidate count, and the plugin rechecks the
+report token, file signature, and current quality before deletion. Cleanup is
+never automatic.
+
 ### Uncracked export
 
 `Download All Uncracked APs` does not trust an ESSID or filename match alone.
@@ -82,6 +102,12 @@ captures. An incorrect password, verification timeout, or missing matching
 capture is rejected.
 Successful add, update, and delete actions refresh the affected UI without
 reloading the page.
+
+If no usable hash exists, PWMenu does not guess or blindly store the value. It
+returns:
+
+> Password cannot be verified because this capture contains no usable
+> WPA/PMKID hash. Recapture the access point.
 
 The TXT export is sorted UTF-8 TSV with a byte-order mark and Windows-compatible
 CRLF lines. It contains the columns `ESSID`, `BSSID`, `PASSWORD`, and `SOURCE`;
@@ -140,8 +166,11 @@ main.plugins.wpa-sec-list.enabled = false
 
 ## OnlineHashCrack
 
-PWMenu converts captures to mode 22000, maintains a durable upload queue, submits
-in batches, downloads results, and preserves server backoff across restarts.
+PWMenu first converts each capture locally to mode 22000. A PCAP that produces
+zero hashes is not sent to OHC: it is marked with the extraction reason, counted
+as uncrackable, and exposed to confirmation-bound Capture Cleanup. Valid hashes
+enter the durable upload queue, are submitted in batches, and retain server
+backoff across restarts.
 
 Before work enters the queue, it is compared with:
 
@@ -151,7 +180,9 @@ Before work enters the queue, it is compared with:
 
 Already known tasks are recorded instead of submitted again. `Send all missing
 to OHC` scans unresolved captures, selects one best PCAP per BSSID, and queues
-only work that is absent from all three sources.
+only locally extractable work that is absent from all three sources. A
+per-capture action that queues zero files now returns its stored exclusion
+reason instead of reporting a misleading upload start.
 
 ```toml
 main.plugins.A_pwmenu.module_ohc_enabled = true
