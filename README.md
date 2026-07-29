@@ -1,6 +1,14 @@
 # PWMenu for Pwnagotchi
 
-[![Open the complete PWMenu Wiki](https://img.shields.io/badge/OPEN%20THE%20COMPLETE%20PWMENU%20WIKI-20E4F4?style=for-the-badge&logo=readthedocs&logoColor=071012)](https://neewfpv.com/wiki/pwmenu)
+<p align="center">
+  <a href="https://neewfpv.com/wiki/pwmenu">
+    <img
+      src="https://img.shields.io/badge/OPEN%20THE%20COMPLETE%20PWMENU%20WIKI-20E4F4?style=for-the-badge&amp;logo=readthedocs&amp;logoColor=20E4F4&amp;labelColor=071012"
+      height="52"
+      alt="Open the complete PWMenu Wiki"
+    >
+  </a>
+</p>
 
 **One fast, mobile-first field console for captures, verified credentials,
 Hashcat preparation, map intelligence, WPA-sec, OnlineHashCrack, QuickDic,
