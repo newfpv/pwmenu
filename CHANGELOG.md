@@ -2,6 +2,27 @@
 
 All notable changes to A_pwmenu are documented here.
 
+## 1.3.9 — 2026-07-29
+
+- Reduced Web UI response time by caching the compiled Jinja template, avoiding
+  unchanged state-file rewrites during page rendering, using Raspberry-friendly
+  gzip level 1 by default, and removing duplicate singleton map payloads.
+- Added `web_gzip_level` and `web_notification_duration_ms` configuration
+  options; the latter controls both server notifications and transient UI
+  toasts.
+- Added PMKID-only manual password verification through `hcxpcapngtool` and an
+  internal constant-time cryptographic check, while continuing to use
+  `aircrack-ng` for EAPOL captures.
+- Updated the Handshakes card immediately after manual map placement so the
+  **MAP** badge and **Move** action appear without a page reload.
+- Listed incomplete `Partial` captures with zero extractable WPA/PMKID hashes as
+  explicit uncrackable cleanup candidates, matching the same condition that
+  prevents OHC submission.
+- Exposed the current count of captures excluded from OHC because no WPA/PMKID
+  hash can be extracted, with a direct pointer to Capture Cleanup.
+- Made the per-capture OHC action return the stored exclusion reason instead of
+  reporting a misleading upload start when zero files were queued.
+
 ## 1.3.8 — 2026-07-29
 
 - Parsed WPA-sec result files with compact 12-hex BSSID and station fields, preserving exact AP identity instead of creating `Name-only credential` entries.

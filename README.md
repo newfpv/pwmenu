@@ -75,10 +75,13 @@ PWMenu combines credentials from:
 - integrated QuickDic `.cracked` files;
 - manually entered passwords.
 
-Manual add and edit actions are verified with `aircrack-ng` against a matching
-capture before anything is written. An incorrect password, verification timeout,
-or missing matching capture is rejected. Successful add, update, and delete
-actions refresh the affected UI without reloading the page.
+Manual add and edit actions are verified against a matching capture before
+anything is written. PWMenu uses `aircrack-ng` for EAPOL handshakes and falls
+back to `hcxpcapngtool` plus an internal cryptographic verifier for PMKID-only
+captures. An incorrect password, verification timeout, or missing matching
+capture is rejected.
+Successful add, update, and delete actions refresh the affected UI without
+reloading the page.
 
 The TXT export is sorted UTF-8 TSV with a byte-order mark and Windows-compatible
 CRLF lines. It contains the columns `ESSID`, `BSSID`, `PASSWORD`, and `SOURCE`;
@@ -96,7 +99,9 @@ Location can come from:
 Choose **Map** or **Move** beside a concrete handshake to place it manually.
 PWMenu opens the Map workspace with a fixed pin in the center: move the map
 under the pin, then confirm or cancel using the bottom controls. A capture can
-also be attached directly to an existing point or cluster.
+also be attached directly to an existing point or cluster. The Handshakes card
+changes to **MAP**, and its action changes to **Move**, immediately after the
+server confirms the new coordinates; a page reload is not required.
 
 Coordinates set by the user are labeled **Map**. Coordinates measured through
 PwnDroid, browser geolocation, or GPSD are labeled **GPS**. Manual placement,
@@ -270,7 +275,7 @@ sudo cp /usr/local/share/pwnagotchi/custom-plugins/A_pwmenu.py \
   /root/A_pwmenu.py.backup 2>/dev/null || true
 
 sudo wget -O /usr/local/share/pwnagotchi/custom-plugins/A_pwmenu.py \
-  https://raw.githubusercontent.com/newfpv/pwmenu/v1.3.8/A_pwmenu.py
+  https://raw.githubusercontent.com/newfpv/pwmenu/v1.3.9/A_pwmenu.py
 
 sudo chown root:root /usr/local/share/pwnagotchi/custom-plugins/A_pwmenu.py
 sudo chmod 644 /usr/local/share/pwnagotchi/custom-plugins/A_pwmenu.py
@@ -301,6 +306,16 @@ http://<pwnagotchi-ip>:8080/plugins/A_pwmenu/
 See [`config.example.toml`](./config.example.toml) for every module switch and
 configuration option.
 
+Web UI timing and compression can be adjusted independently:
+
+```toml
+# 1 is the recommended fast setting for Raspberry Pi; allowed range is 1-9.
+main.plugins.A_pwmenu.web_gzip_level = 1
+
+# How long server messages and toast notifications remain visible.
+main.plugins.A_pwmenu.web_notification_duration_ms = 2600
+```
+
 ## Independent module switches
 
 Each subsystem can be disabled without disabling the complete plugin:
@@ -323,7 +338,8 @@ main.plugins.A_pwmenu.module_quickdic_enabled = true
 - The Python 3.11 environment used by Pwnagotchi.
 - `requests`.
 - `websockets` when PwnDroid is enabled.
-- `hcxpcapngtool` for quality analysis and mode 22000 conversion.
+- `hcxpcapngtool` for quality analysis, mode 22000 conversion, and PMKID
+  extraction for password verification.
 - `aircrack-ng` for manual password verification and integrated QuickDic.
 - Xray only when OHC VLESS routing is enabled.
 

@@ -111,6 +111,35 @@ class CaptureQualityTests(unittest.TestCase):
         self.assertEqual((deleted, total), (1, 1))
         self.assertFalse(os.path.exists(empty_path))
 
+    def test_partial_capture_without_hash_is_cleanup_candidate(self):
+        path = os.path.join(
+            self.tempdir.name, "Partial_aabbccddeeff.pcap"
+        )
+        with open(path, "wb") as handle:
+            handle.write(b"partial capture frames")
+        name = os.path.basename(path)
+        self.plugin.data["capture_quality"][name] = {
+            "grade": "Partial",
+            "hashes": 0,
+            "summary": "Incomplete EAPOL exchange (M1/M2/M3/M4: 4/0/0/0)",
+            "signature": self.plugin._ohc_file_signature(path),
+        }
+
+        report = self.plugin._capture_cleanup_report()
+
+        self.assertEqual(report["count"], 1)
+        self.assertEqual(report["uncrackable_count"], 1)
+        self.assertEqual(
+            report["entries"][0]["category"],
+            "uncrackable",
+        )
+
+        deleted, total, _ = self.plugin._clean_capture_candidates(
+            report["token"]
+        )
+        self.assertEqual((deleted, total), (1, 1))
+        self.assertFalse(os.path.exists(path))
+
     def test_later_usable_capture_archives_weak_capture_for_same_bssid(self):
         old_path = os.path.join(self.tempdir.name, "Old_aabbccddeeff.pcap")
         new_path = os.path.join(self.tempdir.name, "New_aabbccddeeff.pcap")
@@ -607,7 +636,11 @@ class CaptureQualityTests(unittest.TestCase):
                     "detail": "",
                 },
                 no_gps_networks=[],
-                ohc_status={"pending": 0, "retry_in": 0},
+                ohc_status={
+                    "pending": 0,
+                    "retry_in": 0,
+                    "uncrackable": 0,
+                },
                 pot_health={
                     "ok": True,
                     "credentials": 0,
@@ -619,12 +652,14 @@ class CaptureQualityTests(unittest.TestCase):
                 cleanup_report={
                     "count": 0,
                     "empty_count": 0,
+                    "uncrackable_count": 0,
                     "unusable_count": 0,
                     "display_files": [],
                     "more": 0,
                     "token": "0" * 64,
                 },
                 whitelist=[],
+                notification_duration_ms=2600,
             )
 
         self.assertIn("function qualityStatusBlock", page)
@@ -639,12 +674,14 @@ class CaptureQualityTests(unittest.TestCase):
         self.assertIn("async function updateWhitelistAsync", page)
         self.assertIn("async function runMapAction", page)
         self.assertIn("function placeHandshakeOnMap", page)
+        self.assertIn("function applyMapPlacementToHandshake", page)
         self.assertIn("function confirmMapPlacement", page)
         self.assertIn("function mapItemCoordinates", page)
         self.assertIn('id="mapPlacementTarget"', page)
         self.assertNotIn('id="mapPlacementBanner"', page)
         self.assertIn("capture-file-delete", page)
         self.assertIn("capture-file-name", page)
+        self.assertIn("const notificationDurationMs = 2600", page)
         self.assertIn("Map</span>", page)
         self.assertIn("capture-map-set", page)
         self.assertNotIn("map-point-add", page)

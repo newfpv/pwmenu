@@ -17,6 +17,7 @@ import asyncio
 import email.utils
 import html
 import hashlib
+import hmac
 import shutil
 import tempfile
 import ast
@@ -25,7 +26,7 @@ import math
 import urllib.parse
 import pwnagotchi.plugins as plugins
 import pwnagotchi.ui.fonts as fonts
-from flask import render_template_string, send_file, make_response, has_request_context
+from flask import current_app, send_file, make_response, has_request_context
 from flask import request as flask_request
 from pwnagotchi.ui.components import LabeledValue
 from pwnagotchi.ui.view import BLACK
@@ -49,7 +50,7 @@ logging.info("[A_pwmenu] Module init.")
 
 class A_pwmenu(plugins.Plugin):
     __author__ = 'NewFPV'
-    __version__ = '1.3.8'
+    __version__ = '1.3.9'
     __license__ = 'GPL3'
     __description__ = 'Ultimate Password Manager'
 
@@ -120,6 +121,9 @@ class A_pwmenu(plugins.Plugin):
         self.quickdic_thread = None
         self.quickdic_display_status = ''
         self.quickdic_display_until = 0
+        self.web_template_lock = threading.Lock()
+        self.web_template = None
+        self.web_template_environment = None
 
     def _module_enabled(self, name, default=True):
         return self._option_bool(f'module_{name}_enabled', default)
@@ -159,6 +163,8 @@ class A_pwmenu(plugins.Plugin):
         self.options.setdefault('ohc_proxy_port', 10809)
         self.options.setdefault('import_max_bytes', 2097152)
         self.options.setdefault('archive_memory_limit', 2097152)
+        self.options.setdefault('web_gzip_level', 1)
+        self.options.setdefault('web_notification_duration_ms', 2600)
         self.options.setdefault('hcxpcapngtool_timeout', 90)
         self.options.setdefault('password_verify_timeout', 45)
         self.options.setdefault('wpa_sec_api_url', 'https://wpa-sec.stanev.org')
@@ -962,17 +968,40 @@ class A_pwmenu(plugins.Plugin):
             self._module_enabled('wpa_sec') and self.options.get('wpa_sec_key')
         )
 
-        html = render_template_string(self._get_html(),
+        notification_duration_ms = max(
+            250,
+            min(
+                self._option_int('web_notification_duration_ms', 2600),
+                60000,
+            ),
+        )
+        html = self._render_cached_template(
             groups=groups, cracked=cracked, notif=notification, ntype=notif_type,
             tab=active_tab, stats=stats, ach=ach['badges'], token=tok,
             show_wpa=show_wpa, map_points=map_points, gps_status=gps_status,
             no_gps_networks=no_gps_networks, ohc_status=ohc_status,
             wpa_status=wpa_status,
             pot_health=pot_health, cleanup_report=cleanup_report,
-            whitelist=whitelist
+            whitelist=whitelist,
+            notification_duration_ms=notification_duration_ms,
         )
 
         return self._html_response(html)
+
+    def _render_cached_template(self, **context):
+        """Compile the large Jinja template once per Flask environment."""
+        app = current_app._get_current_object()
+        app.update_template_context(context)
+        environment = app.jinja_env
+        with self.web_template_lock:
+            if (
+                self.web_template is None
+                or self.web_template_environment is not environment
+            ):
+                self.web_template = environment.from_string(self._get_html())
+                self.web_template_environment = environment
+            template = self.web_template
+        return template.render(context)
 
     def _html_response(self, html):
         """Return the UI efficiently, especially over low-bandwidth Bluetooth PAN."""
@@ -987,7 +1016,11 @@ class A_pwmenu(plugins.Plugin):
             and flask_request.accept_encodings['gzip'] > 0
         )
         if accepts_gzip and len(body) >= 1024:
-            compressed = gzip.compress(body, compresslevel=6)
+            gzip_level = max(
+                1,
+                min(self._option_int('web_gzip_level', 1), 9),
+            )
+            compressed = gzip.compress(body, compresslevel=gzip_level)
             if len(compressed) < len(body):
                 r.set_data(compressed)
                 r.headers["Content-Encoding"] = "gzip"
@@ -1327,7 +1360,7 @@ class A_pwmenu(plugins.Plugin):
             response = requests.get(
                 api_url,
                 cookies={'key': str(key)},
-                headers={'User-Agent': 'PWMenu/1.3.8'},
+                headers={'User-Agent': 'PWMenu/1.3.9'},
                 timeout=(10, 30),
             )
             response.raise_for_status()
@@ -1365,6 +1398,16 @@ class A_pwmenu(plugins.Plugin):
         if not names:
             return "No files selected", True
         queued = self._queue_ohc_files(names, force=True)
+        if not queued:
+            reasons = []
+            for name in names:
+                record = self._ohc_file_record(name)
+                message = str(record.get('message') or '').strip()
+                if message and message not in reasons:
+                    reasons.append(message)
+            if reasons:
+                return "Nothing queued: " + "; ".join(reasons[:3]), True
+            return "Nothing queued: no unresolved usable capture was selected", True
         self._start_ohc_upload_thread()
         if time.time() < self._ohc_retry_at():
             return f"Queued {queued} file(s). {self._ohc_backoff_message()}", False
@@ -2629,7 +2672,7 @@ class A_pwmenu(plugins.Plugin):
                     headers={
                         'User-Agent': (
                             'Mozilla/5.0 (X11; Linux aarch64) '
-                            'PWMenu/1.3.8'
+                            'PWMenu/1.3.9'
                         )
                     },
                     timeout=(10, 30)
@@ -2858,14 +2901,14 @@ class A_pwmenu(plugins.Plugin):
                     pass
 
     def _option_bool(self, key, default=True):
-        v = self.options.get(key, default)
+        v = getattr(self, 'options', {}).get(key, default)
         if isinstance(v, str):
             return v.strip().lower() not in ('0', 'false', 'no', 'off')
         return bool(v)
 
     def _option_int(self, key, default):
         try:
-            return int(self.options.get(key, default))
+            return int(getattr(self, 'options', {}).get(key, default))
         except (TypeError, ValueError):
             return default
 
@@ -3146,6 +3189,19 @@ class A_pwmenu(plugins.Plugin):
     def _ohc_status(self):
         with self.data_lock:
             pending = len(self.data.get('ohc_pending_files', {}) or {})
+            records = dict(self.data.get('ohc_files', {}) or {})
+        uncrackable = 0
+        for name, record in records.items():
+            try:
+                hash_count = int((record or {}).get('hashes', 0) or 0)
+            except (TypeError, ValueError):
+                hash_count = 0
+            if (
+                str((record or {}).get('status') or '') == 'invalid'
+                and hash_count <= 0
+                and self._find_handshake_path(name)
+            ):
+                uncrackable += 1
         retry_in = max(0, int(self._ohc_retry_at() - time.time()))
         return {
             'enabled': (
@@ -3156,6 +3212,7 @@ class A_pwmenu(plugins.Plugin):
             'face': self.ohc_upload_face if self.ohc_uploading else '0__0',
             'last': self.ohc_last_result,
             'pending': pending,
+            'uncrackable': uncrackable,
             'retry_in': retry_in
         }
 
@@ -3494,17 +3551,36 @@ class A_pwmenu(plugins.Plugin):
                 bucket['count'] = sum(max(1, int(x.get('captures', 1) or 1)) for x in bucket['members'])
                 bucket['essid'] = f"{bucket['count']} networks"
             else:
-                c = m.copy()
-                c['id'] = m.get('id') or f"{m['essid']}-{m['lat']}-{m['lon']}"
-                c['members'] = [m]
-                c['count'] = max(1, int(m.get('captures', 1) or 1))
+                c = {
+                    'id': m.get('id') or f"{m['essid']}-{m['lat']}-{m['lon']}",
+                    'essid': m.get('essid', ''),
+                    'bssid': '',
+                    'lat': m.get('lat'),
+                    'lon': m.get('lon'),
+                    'is_cracked': bool(m.get('is_cracked')),
+                    'gps_stale': bool(m.get('gps_stale')),
+                    'status': m.get('status', 'handshake'),
+                    'count': max(1, int(m.get('captures', 1) or 1)),
+                    'members': [m],
+                }
                 clusters.append(c)
 
-        for c in clusters:
-            if c.get('count', 1) == 1:
-                c.update(c['members'][0])
-                c['count'] = max(1, int(c.get('captures', 1) or 1))
-        return clusters
+        compact_clusters = []
+        for cluster in clusters:
+            members = cluster.get('members', [])
+            if len(members) == 1:
+                # A singleton already carries all display fields. Do not send
+                # a second complete copy of it in `members` on every page load.
+                single = members[0].copy()
+                single['members'] = []
+                single['count'] = max(
+                    1,
+                    int(single.get('captures', 1) or 1),
+                )
+                compact_clusters.append(single)
+            else:
+                compact_clusters.append(cluster)
+        return compact_clusters
 
     def _build_no_gps_networks(self, groups):
         items = []
@@ -3546,16 +3622,19 @@ class A_pwmenu(plugins.Plugin):
     def _update_achievements_locked(self, groups, cracked):
         curr_cracked = len(cracked)
         curr_captured = sum(len(g['files']) for g in groups)
+        changed = False
 
         if curr_cracked > self.data['history_cracked']:
             diff = curr_cracked - self.data['history_cracked']
             self.data['xp'] += diff * 500
             self.data['history_cracked'] = curr_cracked
+            changed = True
 
         if curr_captured > self.data['history_captured']:
             diff = curr_captured - self.data['history_captured']
             self.data['xp'] += diff * 50
             self.data['history_captured'] = curr_captured
+            changed = True
 
         lvl_map = [
             (0, 'Script Kiddie'), (1000, 'Neophyte'), (2500, 'Hacker'),
@@ -3599,13 +3678,15 @@ class A_pwmenu(plugins.Plugin):
                 self.data['xp'] += 1000
                 ul = True
                 pct = 100
+                changed = True
 
             badge_info = b.copy()
             badge_info['unlocked'] = ul
             badge_info['progress'] = pct
             my_badges.append(badge_info)
 
-        self._save_data()
+        if changed:
+            self._save_data()
 
         lvl_p = 100
         if next_xp > prev_xp:
@@ -3710,6 +3791,162 @@ class A_pwmenu(plugins.Plugin):
                 except FileNotFoundError:
                     pass
 
+    def _verify_pmkid_hash_password(self, hash_line, password):
+        """Verify one WPA*01 PMKID record locally without spawning a process."""
+        parts = str(hash_line or '').strip().lstrip('$').split('*')
+        if len(parts) < 6 or parts[0] != 'WPA' or parts[1] != '01':
+            return None
+        try:
+            expected_pmkid = bytes.fromhex(parts[2])
+            ap_mac = bytes.fromhex(parts[3])
+            station_mac = bytes.fromhex(parts[4])
+            essid_bytes = bytes.fromhex(parts[5])
+        except (TypeError, ValueError):
+            return None
+        if (
+            len(expected_pmkid) != 16
+            or len(ap_mac) != 6
+            or len(station_mac) != 6
+            or not essid_bytes
+        ):
+            return None
+        try:
+            password_bytes = str(password).encode('utf-8')
+            pmk = hashlib.pbkdf2_hmac(
+                'sha1',
+                password_bytes,
+                essid_bytes,
+                4096,
+                dklen=32,
+            )
+            calculated = hmac.new(
+                pmk,
+                b'PMK Name' + ap_mac + station_mac,
+                hashlib.sha1,
+            ).digest()[:16]
+            return hmac.compare_digest(calculated, expected_pmkid)
+        except (TypeError, ValueError, UnicodeError):
+            return None
+
+    def _run_hcxpmk_password_check(self, path, essid, bssid, passwords):
+        """Extract and verify PMKID hashes without exposing passwords in argv."""
+        converter = (
+            shutil.which('hcxpcapngtool')
+            or (
+                '/usr/bin/hcxpcapngtool'
+                if os.path.isfile('/usr/bin/hcxpcapngtool')
+                else ''
+            )
+        )
+        if not converter:
+            return False, False, 'PMKID extraction is unavailable'
+
+        candidates = [
+            str(password) for password in passwords
+            if str(password)
+            and not any(
+                char in str(password) for char in ('\x00', '\r', '\n')
+            )
+        ]
+        if not candidates:
+            return False, False, 'No valid password candidate was supplied'
+
+        output_path = None
+        try:
+            fd, output_path = tempfile.mkstemp(
+                prefix='pwmenu-verify-', suffix='.22000'
+            )
+            os.close(fd)
+            os.remove(output_path)
+            hashes = []
+            conversion = None
+            conversion_commands = (
+                [converter, '-o', output_path, path],
+                [converter, '--all', '-o', output_path, path],
+            )
+            for conversion_command in conversion_commands:
+                try:
+                    os.remove(output_path)
+                except FileNotFoundError:
+                    pass
+                with self.capture_analysis_lock:
+                    conversion = subprocess.run(
+                        conversion_command,
+                        check=False,
+                        capture_output=True,
+                        text=True,
+                        errors='replace',
+                        timeout=self._option_int(
+                            'hcxpcapngtool_timeout', 90
+                        ),
+                    )
+                if os.path.isfile(output_path):
+                    with open(
+                        output_path,
+                        'r',
+                        encoding='utf-8',
+                        errors='ignore',
+                    ) as handle:
+                        hashes = list(dict.fromkeys(
+                            line.strip() for line in handle if line.strip()
+                        ))
+                if hashes:
+                    break
+
+            compact_bssid = self._compact_bssid(bssid)
+            normalized_essid = self._normalized_essid_key(essid)
+            matching_hashes = []
+            for hash_line in hashes:
+                hash_essid, hash_bssid = self._wpa_hash_network(hash_line)
+                if compact_bssid:
+                    matched = hash_bssid == compact_bssid
+                else:
+                    matched = (
+                        bool(normalized_essid)
+                        and self._normalized_essid_key(hash_essid)
+                        == normalized_essid
+                    )
+                if matched:
+                    matching_hashes.append(hash_line)
+
+            if not matching_hashes:
+                detail = (
+                    (conversion.stdout or '') + '\n'
+                    + (conversion.stderr or '')
+                ).strip()
+                return (
+                    False,
+                    False,
+                    'No matching PMKID/EAPOL hash was extracted'
+                    + (f": {detail[-300:]}" if detail else ''),
+                )
+
+            tested = False
+            for hash_line in matching_hashes:
+                for password in candidates:
+                    confirmed = self._verify_pmkid_hash_password(
+                        hash_line, password
+                    )
+                    if confirmed is True:
+                        return (
+                            True,
+                            True,
+                            'Password confirmed against PMKID',
+                        )
+                    if confirmed is False:
+                        tested = True
+            if tested:
+                return False, True, 'Password was not confirmed by PMKID'
+            return False, False, 'No verifiable PMKID hash was extracted'
+        except (OSError, subprocess.SubprocessError) as error:
+            return False, False, str(error)
+        finally:
+            if output_path:
+                try:
+                    os.remove(output_path)
+                except FileNotFoundError:
+                    pass
+
     def _verify_manual_password(self, essid, bssid, password):
         paths = self._matching_capture_paths(essid, bssid)
         if not paths:
@@ -3720,23 +3957,57 @@ class A_pwmenu(plugins.Plugin):
                 'the password was not saved',
             )
 
-        inconclusive = False
+        conclusive_failure = False
+        inconclusive_details = []
         for path in paths[:3]:
-            verified, conclusive, detail = self._run_aircrack_password_check(
-                path, essid, bssid, [password]
+            verified, aircrack_conclusive, aircrack_detail = (
+                self._run_aircrack_password_check(
+                    path, essid, bssid, [password]
+                )
             )
             if verified:
                 return (
                     True,
                     f'Password verified against {os.path.basename(path)}',
                 )
-            if not conclusive:
-                inconclusive = True
-                logging.warning(
-                    f"[A_pwmenu] Manual password verification was inconclusive "
-                    f"for {os.path.basename(path)}: {detail}"
+
+            verified, hcx_conclusive, hcx_detail = (
+                self._run_hcxpmk_password_check(
+                    path, essid, bssid, [password]
                 )
-        if inconclusive:
+            )
+            if verified:
+                return (
+                    True,
+                    f'Password verified against {os.path.basename(path)}',
+                )
+
+            if aircrack_conclusive or hcx_conclusive:
+                conclusive_failure = True
+                continue
+            detail = '; '.join(
+                value for value in (aircrack_detail, hcx_detail) if value
+            )
+            inconclusive_details.append(detail)
+            logging.warning(
+                f"[A_pwmenu] Manual password verification was inconclusive "
+                f"for {os.path.basename(path)}: {detail}"
+            )
+
+        if conclusive_failure:
+            return False, 'Password does not match the captured handshake'
+        if inconclusive_details:
+            combined = ' '.join(inconclusive_details)
+            if re.search(
+                r'no matching pmkid|no hashes|no eapol|contained no eapol',
+                combined,
+                re.IGNORECASE,
+            ):
+                return (
+                    False,
+                    'Password cannot be verified: the capture contains no '
+                    'usable PMKID/EAPOL exchange; recapture this access point',
+                )
             return (
                 False,
                 'The password could not be verified conclusively and was not saved',
@@ -3752,6 +4023,11 @@ class A_pwmenu(plugins.Plugin):
                 name, compact_bssid, password
             )
             if not verified:
+                logging.warning(
+                    "[A_pwmenu] Manual password rejected for %s: %s",
+                    self._format_bssid(compact_bssid) or name,
+                    message,
+                )
                 return False, message
 
             mac = self._colon_bssid(compact_bssid) or "00:00:00:00:00:00"
@@ -3767,7 +4043,15 @@ class A_pwmenu(plugins.Plugin):
                 with self.data_lock:
                     self.data['xp'] += 200
                 self._save_data()
+                logging.info(
+                    "[A_pwmenu] Manual password saved for %s",
+                    self._format_bssid(compact_bssid) or name,
+                )
                 return True, message + '; password saved'
+            logging.info(
+                "[A_pwmenu] Manual password was already saved for %s",
+                self._format_bssid(compact_bssid) or name,
+            )
             return True, message + '; password was already saved'
         except (OSError, ValueError) as error:
             logging.error(f"[A_pwmenu] Could not add manual password: {error}")
@@ -4137,6 +4421,14 @@ class A_pwmenu(plugins.Plugin):
         except OSError:
             return False
 
+    def _quality_is_uncrackable(self, quality):
+        if not isinstance(quality, dict) or quality.get('grade') != 'Partial':
+            return False
+        try:
+            return int(quality.get('hashes', 0) or 0) <= 0
+        except (TypeError, ValueError):
+            return True
+
     def _capture_cleanup_report(self):
         entries = []
         for directory in self.handshake_dirs:
@@ -4147,15 +4439,31 @@ class A_pwmenu(plugins.Plugin):
                 empty = self._is_empty_pcap(path)
                 quality = self._quality_file_record(name, path)
                 unusable = quality.get('grade') == 'Unusable'
-                if not empty and not unusable:
+                uncrackable = self._quality_is_uncrackable(quality)
+                if not empty and not unusable and not uncrackable:
                     continue
-                reason = 'Empty PCAP header' if empty else (quality.get('summary') or 'No usable WPA/PMKID material')
+                if empty:
+                    reason = 'Empty PCAP header'
+                    category = 'empty'
+                elif uncrackable:
+                    reason = (
+                        quality.get('summary')
+                        or 'Incomplete exchange; no usable WPA/PMKID hash'
+                    )
+                    category = 'uncrackable'
+                else:
+                    reason = (
+                        quality.get('summary')
+                        or 'No usable WPA/PMKID material'
+                    )
+                    category = 'unusable'
                 entries.append({
                     'name': name,
                     'path': path,
                     'signature': self._ohc_file_signature(path),
                     'reason': reason,
                     'empty': empty,
+                    'category': category,
                 })
         fingerprint = json.dumps(
             [(entry['path'], entry['signature'], entry['reason']) for entry in entries],
@@ -4165,7 +4473,14 @@ class A_pwmenu(plugins.Plugin):
         return {
             'count': len(entries),
             'empty_count': len([entry for entry in entries if entry['empty']]),
-            'unusable_count': len([entry for entry in entries if not entry['empty']]),
+            'uncrackable_count': len([
+                entry for entry in entries
+                if entry['category'] == 'uncrackable'
+            ]),
+            'unusable_count': len([
+                entry for entry in entries
+                if entry['category'] == 'unusable'
+            ]),
             'display_files': entries[:12],
             'more': max(0, len(entries) - 12),
             'token': hashlib.sha256(fingerprint).hexdigest(),
@@ -4176,7 +4491,11 @@ class A_pwmenu(plugins.Plugin):
         report = self._capture_cleanup_report()
         total = report['count']
         if not total:
-            return 0, total, 'No empty or unusable capture files to remove'
+            return (
+                0,
+                total,
+                'No empty, uncrackable, or unusable capture files to remove',
+            )
         if not report_token:
             return 0, total, 'Review the current cleanup report and confirm again.'
         if not re.fullmatch(r'[0-9a-f]{64}', report_token) or report_token != report['token']:
@@ -4188,7 +4507,12 @@ class A_pwmenu(plugins.Plugin):
             if self._ohc_file_signature(path) != entry['signature']:
                 continue
             quality = self._quality_file_record(entry['name'], path)
-            if not self._is_empty_pcap(path) and quality.get('grade') != 'Unusable':
+            still_uncrackable = self._quality_is_uncrackable(quality)
+            if (
+                not self._is_empty_pcap(path)
+                and quality.get('grade') != 'Unusable'
+                and not still_uncrackable
+            ):
                 continue
             try:
                 os.remove(path)
@@ -4211,7 +4535,11 @@ class A_pwmenu(plugins.Plugin):
             except OSError as error:
                 logging.warning(f"[A_pwmenu] Could not remove capture {path}: {error}")
         logging.info(f"[A_pwmenu] Capture cleanup removed {deleted}/{total} file(s)")
-        return deleted, total, f"Removed {deleted}/{total} empty or unusable capture files"
+        return (
+            deleted,
+            total,
+            f"Removed {deleted}/{total} empty, uncrackable, or unusable capture files",
+        )
 
     def _process_import(self, content, name):
         self._ensure_file(self.potfile_ohc)
@@ -5997,7 +6325,7 @@ class A_pwmenu(plugins.Plugin):
             <div class="si handshake-card" data-kind="handshake" data-essid="{{ g.essid }}" data-bssid="{{ g.bssid }}" data-t="{{ g.essid }}">
                 <div class="row">
                     <div style="flex-grow:1;min-width:0" onclick="tog('handshake-{{ loop.index }}')">
-                        <div class="tit {{ g.cls }}">{{ g.essid }} {% if g.count > 1 %}<span class="badge">{{ g.count }}</span>{% endif %}{% if g.map_count > 0 %}<span class="badge">MAP</span>{% elif g.gps_count > 0 %}<span class="badge">GPS</span>{% endif %}</div>
+                        <div class="tit {{ g.cls }}">{{ g.essid }} {% if g.count > 1 %}<span class="badge">{{ g.count }}</span>{% endif %}{% if g.map_count > 0 %}<span class="badge location-badge" data-location-badge>MAP</span>{% elif g.gps_count > 0 %}<span class="badge location-badge" data-location-badge>GPS</span>{% endif %}</div>
                         <div class="sub">{{ g.last_seen }}</div>
                     </div>
                     <div style="display:flex;align-items:center;">
@@ -6022,7 +6350,7 @@ class A_pwmenu(plugins.Plugin):
                         <button class="network-expanded-action" onclick='whitelistAdd({{ g.essid|tojson }}, "handshakes", {{ g.bssid|tojson }})' title="Add this network to the whitelist"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3 5 6v5c0 4.6 2.8 8 7 10 4.2-2 7-5.4 7-10V6l-7-3Z"></path><path d="m9 12 2 2 4-4"></path></svg><span>Whitelist</span></button>
                     </div>
                     {% for f in g.files %}
-                    <div class="sub-row capture-row">
+                    <div class="sub-row capture-row" data-filename="{{ f.filename }}">
                         <div class="capture-file-head">
                             <div class="capture-file-info">
                                 <div class="capture-file-name" title="{{ f.filename }}">{{ f.filename }}</div>
@@ -6033,7 +6361,7 @@ class A_pwmenu(plugins.Plugin):
                             <button class="capture-file-delete" onclick='rm({{ f.filename|tojson }})' title="Delete {{ f.filename }}"><svg viewBox="0 0 24 24"><path d="M4 7h16M9 7V4h6v3m-9 0 1 14h10l1-14M10 11v6m4-6v6"></path></svg></button>
                         </div>
                         <div class="capture-actions">
-                            <button class="capture-action" onclick='placeHandshakeOnMap({{ f.filename|tojson }}, {{ g.essid|tojson }}, {{ f.bssid|tojson }})'><svg viewBox="0 0 24 24"><path d="M20 10c0 5-8 11-8 11S4 15 4 10a8 8 0 1 1 16 0Z"></path><circle cx="12" cy="10" r="2.5"></circle></svg><span>{{ 'Move' if f.lat is not none and f.lon is not none else 'Map' }}</span></button>
+                            <button class="capture-action map-capture-action" onclick='placeHandshakeOnMap({{ f.filename|tojson }}, {{ g.essid|tojson }}, {{ f.bssid|tojson }})'><svg viewBox="0 0 24 24"><path d="M20 10c0 5-8 11-8 11S4 15 4 10a8 8 0 1 1 16 0Z"></path><circle cx="12" cy="10" r="2.5"></circle></svg><span>{{ 'Move' if f.lat is not none and f.lon is not none else 'Map' }}</span></button>
                             {% if show_wpa %}<button class="capture-action" onclick='upl({{ f.filename|tojson }})'><svg viewBox="0 0 24 24"><path d="M12 3 5 6v5c0 4.6 2.8 8 7 10 4.2-2 7-5.4 7-10V6l-7-3Z"></path><path d="M9 12h6"></path></svg><span>WPA</span></button>{% endif %}
                             <button class="capture-action" onclick='sendSingleToOhc({{ f.filename|tojson }})'><svg viewBox="0 0 24 24"><path d="M7 18h10a4 4 0 0 0 .7-7.9A6 6 0 0 0 6.3 8.5 4.8 4.8 0 0 0 7 18Z"></path><path d="m9 13 3-3 3 3m-3-3v6"></path></svg><span>OHC</span></button>
                             <a href="/plugins/A_pwmenu/download-22000/{{ f.filename|urlencode }}" class="capture-action accent"><svg viewBox="0 0 24 24"><path d="M8 3 6 21m10-18-2 18M3 9h18M2 15h18"></path></svg><span>22000</span></a>
@@ -6144,6 +6472,9 @@ class A_pwmenu(plugins.Plugin):
                     Persistent queue: {{ ohc_status.pending }} file(s)
                     {% if ohc_status.retry_in > 0 %} • retry in {{ ohc_status.retry_in }}s{% endif %}
                 </div>
+                {% if ohc_status.uncrackable %}
+                <div class="sub" style="margin-top:4px;color:var(--danger);">{{ ohc_status.uncrackable }} capture(s) cannot be sent because they contain no extractable WPA/PMKID hash. Review Capture Cleanup below.</div>
+                {% endif %}
                 <div class="sub" style="margin-top:4px;">Queues one best unresolved PCAP per BSSID. Local history and the last imported OHC export are excluded before upload.</div>
             </div>
 
@@ -6262,13 +6593,13 @@ class A_pwmenu(plugins.Plugin):
                 <div style="font-weight:800;color:{{ 'var(--danger)' if cleanup_report.count else 'var(--green)' }};">
                     {{ cleanup_report.count }} cleanup candidate(s)
                 </div>
-                <div class="sub" style="margin-top:6px;">{{ cleanup_report.empty_count }} empty header(s) and {{ cleanup_report.unusable_count }} analyzed unusable capture(s). Every file and signature is checked again immediately before deletion.</div>
+                <div class="sub" style="margin-top:6px;">{{ cleanup_report.empty_count }} empty header(s), {{ cleanup_report.uncrackable_count }} incomplete capture(s) without a usable WPA/PMKID hash, and {{ cleanup_report.unusable_count }} analyzed unusable capture(s). Every file and signature is checked again immediately before deletion.</div>
                 {% if cleanup_report.display_files %}
                 <ul class="cleanup-file-list">
                     {% for item in cleanup_report.display_files %}<li><strong>{{ item.name }}</strong><span>{{ item.reason }}</span></li>{% endfor %}
                     {% if cleanup_report.more %}<li><strong>+ {{ cleanup_report.more }} more file(s)</strong></li>{% endif %}
                 </ul>
-                <form method="POST" action="/plugins/A_pwmenu/clean-captures" onsubmit="return confirm('Permanently remove {{ cleanup_report.count }} reviewed empty or unusable capture file(s) and their companion metadata?')">
+                <form method="POST" action="/plugins/A_pwmenu/clean-captures" onsubmit="return confirm('Permanently remove {{ cleanup_report.count }} reviewed empty, uncrackable, or unusable capture file(s) and their companion metadata?')">
                     <input type="hidden" name="csrf_token" value="{{ token }}">
                     <input type="hidden" name="report_token" value="{{ cleanup_report.token }}">
                     <button class="btn red">Clean Reviewed Captures</button>
@@ -6289,6 +6620,7 @@ class A_pwmenu(plugins.Plugin):
         let noGpsNetworks = {{ no_gps_networks|tojson }};
         const gpsStatus = {{ gps_status|tojson }};
         const whitelistedNetworks = new Set({{ whitelist|tojson }});
+        const notificationDurationMs = {{ notification_duration_ms }};
         let gpsWatchId = null;
         let selectedMapPoint = null;
         let userLocation = null;
@@ -6309,7 +6641,7 @@ class A_pwmenu(plugins.Plugin):
         startPhoneGps(false);
         updateGpsStatusDot();
         renderMap();
-        if(document.getElementById('nt')) setTimeout(() => document.getElementById('nt').style.display='none', 3000);
+        if(document.getElementById('nt')) setTimeout(() => document.getElementById('nt').style.display='none', notificationDurationMs);
 
         function post(u, d) {
             const f = document.createElement('form'); f.method='POST'; f.action='/plugins/A_pwmenu/'+u;
@@ -6843,6 +7175,37 @@ class A_pwmenu(plugins.Plugin):
             saveHandshakeMapPoint(coordinates.lat, coordinates.lon);
         }
 
+        function applyMapPlacementToHandshake(placement) {
+            if(!placement) return;
+            document.querySelectorAll('#v-handshakes .handshake-card').forEach(card => {
+                const cardBssid = String(card.dataset.bssid || '').replace(/[^0-9a-f]/gi, '').toLowerCase();
+                const placedBssid = String(placement.bssid || '').replace(/[^0-9a-f]/gi, '').toLowerCase();
+                const sameNetwork = cardBssid && placedBssid
+                    ? cardBssid === placedBssid
+                    : String(card.dataset.essid || '') === String(placement.essid || '');
+                if(!sameNetwork) return;
+
+                const title = card.querySelector('.tit');
+                if(title) {
+                    let badge = title.querySelector('[data-location-badge]');
+                    if(!badge) {
+                        badge = document.createElement('span');
+                        badge.className = 'badge location-badge';
+                        badge.dataset.locationBadge = '';
+                        title.appendChild(document.createTextNode(' '));
+                        title.appendChild(badge);
+                    }
+                    badge.textContent = 'MAP';
+                }
+
+                card.querySelectorAll('.capture-row[data-filename]').forEach(row => {
+                    if(String(row.dataset.filename || '') !== String(placement.filename || '')) return;
+                    const label = row.querySelector('.map-capture-action span');
+                    if(label) label.textContent = 'Move';
+                });
+            });
+        }
+
         async function saveHandshakeMapPoint(lat, lon) {
             if(!mapPlacement || mapPlacement.saving) return;
             const latitude = Number(lat);
@@ -6855,7 +7218,7 @@ class A_pwmenu(plugins.Plugin):
             mapPlacement.saving = true;
             const placement = Object.assign({}, mapPlacement);
             const placementName = placement.essid || placement.filename;
-            showToast(`Adding ${placementName} to the map...`, false, 6000);
+            showToast(`Adding ${placementName} to the map...`);
             try {
                 const result = await postAsync('capture-map-set', {
                     filename:placement.filename,
@@ -6865,10 +7228,11 @@ class A_pwmenu(plugins.Plugin):
                 if(!result.ok) throw new Error(result.message || 'Location was rejected');
                 if(result.map_points) mapPoints = result.map_points;
                 if(result.no_gps_networks) noGpsNetworks = result.no_gps_networks;
+                applyMapPlacementToHandshake(placement);
                 cancelMapPlacement(false);
                 const point = findMapMemberById(result.point_id || placement.filename);
                 if(point) showMapPoint(point);
-                showToast(`Added ${placementName} to the map`, false, 5000);
+                showToast(`Added ${placementName} to the map`);
             } catch(error) {
                 if(mapPlacement) mapPlacement.saving = false;
                 showToast(error.message || 'Could not save handshake location', true);
@@ -6903,7 +7267,7 @@ class A_pwmenu(plugins.Plugin):
             showToast('Copied');
         }
 
-        function showToast(text, isError, duration = 2600) {
+        function showToast(text, isError, duration = notificationDurationMs) {
             const toast = document.getElementById('mapToast');
             if(!toast) return;
             toast.textContent = text || 'Done';
