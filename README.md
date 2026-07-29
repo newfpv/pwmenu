@@ -50,6 +50,26 @@ Bluetooth PAN connection.
 - Places the Delete action beside the exact PCAP filename so the selected file
   is unambiguous.
 
+### Quality meanings
+
+| Grade | Local result | Hashcat suitability |
+|---|---|---|
+| **Excellent** | A usable hash plus an authorized EAPOL exchange or written PMKID | Ready |
+| **Usable** | At least one valid WPA/PMKID mode 22000 hash | Ready |
+| **Partial** | EAPOL material exists, but no usable hash was extracted | Uncrackable as captured |
+| **Unusable** | No WPA/PMKID material, or only an empty PCAP header | Uncrackable |
+
+Raw M1/M2/M3/M4 counts are diagnostic. Frames can belong to incompatible
+association attempts or carry mismatched nonces and replay counters. PWMenu uses
+successful mode 22000 extraction—not the number of EAPOL frames—as the final
+Hashcat suitability test.
+
+`Partial` captures with zero hashes are excluded from Hashcat and cloud work and
+listed as **uncrackable** in Capture Cleanup. The owner sees the exact filename
+and reason, confirms the complete candidate count, and the plugin rechecks the
+report token, file signature, and current quality before deletion. Cleanup is
+never automatic.
+
 ### Uncracked export
 
 `Download All Uncracked APs` does not trust an ESSID or filename match alone.
@@ -75,10 +95,19 @@ PWMenu combines credentials from:
 - integrated QuickDic `.cracked` files;
 - manually entered passwords.
 
-Manual add and edit actions are verified with `aircrack-ng` against a matching
-capture before anything is written. An incorrect password, verification timeout,
-or missing matching capture is rejected. Successful add, update, and delete
-actions refresh the affected UI without reloading the page.
+Manual add and edit actions are verified against a matching capture before
+anything is written. PWMenu uses `aircrack-ng` for EAPOL handshakes and falls
+back to `hcxpcapngtool` plus an internal cryptographic verifier for PMKID-only
+captures. An incorrect password, verification timeout, or missing matching
+capture is rejected.
+Successful add, update, and delete actions refresh the affected UI without
+reloading the page.
+
+If no usable hash exists, PWMenu does not guess or blindly store the value. It
+returns:
+
+> Password cannot be verified because this capture contains no usable
+> WPA/PMKID hash. Recapture the access point.
 
 The TXT export is sorted UTF-8 TSV with a byte-order mark and Windows-compatible
 CRLF lines. It contains the columns `ESSID`, `BSSID`, `PASSWORD`, and `SOURCE`;
@@ -96,7 +125,9 @@ Location can come from:
 Choose **Map** or **Move** beside a concrete handshake to place it manually.
 PWMenu opens the Map workspace with a fixed pin in the center: move the map
 under the pin, then confirm or cancel using the bottom controls. A capture can
-also be attached directly to an existing point or cluster.
+also be attached directly to an existing point or cluster. The Handshakes card
+changes to **MAP**, and its action changes to **Move**, immediately after the
+server confirms the new coordinates; a page reload is not required.
 
 Coordinates set by the user are labeled **Map**. Coordinates measured through
 PwnDroid, browser geolocation, or GPSD are labeled **GPS**. Manual placement,
@@ -135,8 +166,11 @@ main.plugins.wpa-sec-list.enabled = false
 
 ## OnlineHashCrack
 
-PWMenu converts captures to mode 22000, maintains a durable upload queue, submits
-in batches, downloads results, and preserves server backoff across restarts.
+PWMenu first converts each capture locally to mode 22000. A PCAP that produces
+zero hashes is not sent to OHC: it is marked with the extraction reason, counted
+as uncrackable, and exposed to confirmation-bound Capture Cleanup. Valid hashes
+enter the durable upload queue, are submitted in batches, and retain server
+backoff across restarts.
 
 Before work enters the queue, it is compared with:
 
@@ -146,7 +180,9 @@ Before work enters the queue, it is compared with:
 
 Already known tasks are recorded instead of submitted again. `Send all missing
 to OHC` scans unresolved captures, selects one best PCAP per BSSID, and queues
-only work that is absent from all three sources.
+only locally extractable work that is absent from all three sources. A
+per-capture action that queues zero files now returns its stored exclusion
+reason instead of reporting a misleading upload start.
 
 ```toml
 main.plugins.A_pwmenu.module_ohc_enabled = true
@@ -270,7 +306,7 @@ sudo cp /usr/local/share/pwnagotchi/custom-plugins/A_pwmenu.py \
   /root/A_pwmenu.py.backup 2>/dev/null || true
 
 sudo wget -O /usr/local/share/pwnagotchi/custom-plugins/A_pwmenu.py \
-  https://raw.githubusercontent.com/newfpv/pwmenu/v1.3.8/A_pwmenu.py
+  https://raw.githubusercontent.com/newfpv/pwmenu/v1.3.9/A_pwmenu.py
 
 sudo chown root:root /usr/local/share/pwnagotchi/custom-plugins/A_pwmenu.py
 sudo chmod 644 /usr/local/share/pwnagotchi/custom-plugins/A_pwmenu.py
@@ -301,6 +337,16 @@ http://<pwnagotchi-ip>:8080/plugins/A_pwmenu/
 See [`config.example.toml`](./config.example.toml) for every module switch and
 configuration option.
 
+Web UI timing and compression can be adjusted independently:
+
+```toml
+# 1 is the recommended fast setting for Raspberry Pi; allowed range is 1-9.
+main.plugins.A_pwmenu.web_gzip_level = 1
+
+# How long server messages and toast notifications remain visible.
+main.plugins.A_pwmenu.web_notification_duration_ms = 2600
+```
+
 ## Independent module switches
 
 Each subsystem can be disabled without disabling the complete plugin:
@@ -323,7 +369,8 @@ main.plugins.A_pwmenu.module_quickdic_enabled = true
 - The Python 3.11 environment used by Pwnagotchi.
 - `requests`.
 - `websockets` when PwnDroid is enabled.
-- `hcxpcapngtool` for quality analysis and mode 22000 conversion.
+- `hcxpcapngtool` for quality analysis, mode 22000 conversion, and PMKID
+  extraction for password verification.
 - `aircrack-ng` for manual password verification and integrated QuickDic.
 - Xray only when OHC VLESS routing is enabled.
 

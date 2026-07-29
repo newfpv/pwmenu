@@ -2,6 +2,71 @@
 
 All notable changes to A_pwmenu are documented here.
 
+## 1.3.9 — 2026-07-29
+
+### Web UI performance and behavior
+
+- Cached the compiled Jinja template per Flask environment instead of parsing
+  and compiling the approximately 400 KB source template on every request.
+- Stopped rewriting `.a_pwmenu_data.json` and its backup during ordinary page
+  views when achievement state did not change.
+- Changed the default HTML compression level from gzip 6 to gzip 1 to avoid
+  multi-second compression stalls on Raspberry Pi while retaining a compressed
+  response. Added `web_gzip_level` with a validated range of 1–9.
+- Removed the duplicated nested copy of every singleton map point from the page
+  payload. Cluster members remain complete when a real multi-network cluster
+  exists.
+- Added `web_notification_duration_ms`, clamped to 250–60000 milliseconds, and
+  applied it consistently to server notifications and transient Web UI toasts.
+- Confirmed on the development Pwnagotchi that repeated compressed page
+  responses dropped from roughly six seconds to approximately 1.3–1.6 seconds;
+  actual results depend on capture count, storage, and transport.
+
+### Manual password verification
+
+- Kept `aircrack-ng` verification for captures containing a usable EAPOL
+  exchange.
+- Added PMKID-only verification: `hcxpcapngtool` extracts the exact WPA*01
+  record, then PWMenu derives the PMK with PBKDF2-HMAC-SHA1, calculates the
+  PMKID, and compares it in constant time inside the plugin.
+- Avoided placing manually entered passwords in a spawned verifier command
+  line. Incorrect candidates remain rejected and are never written to a
+  potfile.
+- Added a precise rejection for incomplete PCAPs:
+  `Password cannot be verified because this capture contains no usable
+  WPA/PMKID hash. Recapture the access point.`
+- Added success, duplicate, rejection, and inconclusive verification logging
+  without logging the submitted password.
+
+### Capture quality, Cleanup, and OHC
+
+- Kept the diagnostic quality distinction between `Partial` (EAPOL material
+  exists) and `Unusable` (no WPA/PMKID material), while making Hashcat
+  suitability explicit: only captures that produce a mode 22000 hash are
+  crackable.
+- Listed `Partial` captures with zero extractable WPA/PMKID hashes as
+  **uncrackable** Capture Cleanup candidates. Deletion still requires the
+  owner's browser confirmation and revalidates the report token, file signature,
+  and current quality immediately before removing anything.
+- Required local WPA/PMKID extraction before OHC submission. Zero-hash PCAPs are
+  not sent to the API, are marked with `No usable WPA or PMKID hash found`, and
+  are counted in the OHC status panel with a pointer to Capture Cleanup.
+- Made per-capture OHC actions return the stored exclusion reason when nothing
+  can be queued instead of reporting a misleading upload start for zero files.
+- Preserved the existing BSSID-first deduplication, last imported OHC export,
+  live task reconciliation, one-best-capture selection, and persistent retry
+  queue for captures that pass the local suitability gate.
+
+### Map consistency and validation
+
+- Updated the matching Handshakes card immediately after successful manual map
+  placement: the location badge becomes **MAP** and the action becomes **Move**
+  without a full page reload.
+- Added regression coverage for template caching, gzip configuration, compact
+  map payloads, immediate map DOM updates, PMKID success and mismatch, missing
+  hash errors, uncrackable cleanup, and zero-queue OHC reasons. The v1.3.9 suite
+  contains 59 passing tests.
+
 ## 1.3.8 — 2026-07-29
 
 - Parsed WPA-sec result files with compact 12-hex BSSID and station fields, preserving exact AP identity instead of creating `Name-only credential` entries.

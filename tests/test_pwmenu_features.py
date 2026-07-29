@@ -1,3 +1,5 @@
+import hashlib
+import hmac
 import os
 import sys
 import tempfile
@@ -103,6 +105,140 @@ class PWMenuFeatureTests(unittest.TestCase):
         self.assertIn("No matching capture", message)
         self.assertFalse(os.path.exists(self.plugin.potfile_manual))
 
+    def test_manual_password_falls_back_to_hcxtools_for_pmkid(self):
+        capture = os.path.join(
+            self.tempdir.name, "Cafe_aabbccddeeff.pcap"
+        )
+        with open(capture, "wb") as handle:
+            handle.write(b"pmkid capture")
+
+        with (
+            mock.patch.object(
+                self.plugin, "_matching_capture_paths", return_value=[capture]
+            ),
+            mock.patch.object(
+                self.plugin,
+                "_run_aircrack_password_check",
+                return_value=(False, False, "no EAPOL data"),
+            ),
+            mock.patch.object(
+                self.plugin,
+                "_run_hcxpmk_password_check",
+                return_value=(True, True, "PMKID confirmed"),
+            ) as hcx_check,
+        ):
+            ok, message = self.plugin._add_manual_password(
+                "Cafe", "aa:bb:cc:dd:ee:ff", "correcthorse"
+            )
+
+        self.assertTrue(ok)
+        self.assertIn("verified", message)
+        hcx_check.assert_called_once_with(
+            capture,
+            "Cafe",
+            "aabbccddeeff",
+            ["correcthorse"],
+        )
+
+    def test_manual_password_explains_when_capture_has_no_hash(self):
+        capture = os.path.join(
+            self.tempdir.name, "Cafe_aabbccddeeff.pcap"
+        )
+        with open(capture, "wb") as handle:
+            handle.write(b"incomplete capture")
+
+        with (
+            mock.patch.object(
+                self.plugin, "_matching_capture_paths", return_value=[capture]
+            ),
+            mock.patch.object(
+                self.plugin,
+                "_run_aircrack_password_check",
+                return_value=(False, False, "Packets contained no EAPOL data"),
+            ),
+            mock.patch.object(
+                self.plugin,
+                "_run_hcxpmk_password_check",
+                return_value=(
+                    False,
+                    False,
+                    "No matching PMKID/EAPOL hash was extracted",
+                ),
+            ),
+        ):
+            verified, message = self.plugin._verify_manual_password(
+                "Cafe",
+                "aabbccddeeff",
+                "correcthorse",
+            )
+
+        self.assertFalse(verified)
+        self.assertEqual(
+            message,
+            "Password cannot be verified because this capture contains no "
+            "usable WPA/PMKID hash. Recapture the access point",
+        )
+
+    def test_pmkid_verification_is_local_and_password_not_in_subprocess(self):
+        capture = os.path.join(
+            self.tempdir.name, "Cafe_aabbccddeeff.pcap"
+        )
+        with open(capture, "wb") as handle:
+            handle.write(b"pmkid capture")
+
+        tool_calls = []
+        ap_mac = bytes.fromhex("aabbccddeeff")
+        station_mac = bytes.fromhex("112233445566")
+        essid_bytes = b"Cafe"
+        pmk = hashlib.pbkdf2_hmac(
+            "sha1",
+            b"correcthorse",
+            essid_bytes,
+            4096,
+            dklen=32,
+        )
+        pmkid = hmac.new(
+            pmk,
+            b"PMK Name" + ap_mac + station_mac,
+            hashlib.sha1,
+        ).digest()[:16].hex()
+        hash_line = (
+            f"WPA*01*{pmkid}*"
+            "aabbccddeeff*112233445566*43616665"
+        )
+
+        def run_tool(args, **kwargs):
+            tool_calls.append((args, kwargs))
+            with open(args[2], "w", encoding="utf-8") as handle:
+                handle.write(hash_line + "\n")
+            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with (
+            mock.patch(
+                "A_pwmenu.shutil.which",
+                side_effect=lambda name: f"/fake/{name}",
+            ),
+            mock.patch("A_pwmenu.subprocess.run", side_effect=run_tool),
+        ):
+            verified, conclusive, _ = self.plugin._run_hcxpmk_password_check(
+                capture,
+                "Cafe",
+                "aa:bb:cc:dd:ee:ff",
+                ["correcthorse"],
+            )
+
+        self.assertTrue(verified)
+        self.assertTrue(conclusive)
+        self.assertEqual(len(tool_calls), 1)
+        argv, call_options = tool_calls[0]
+        self.assertNotIn("correcthorse", argv)
+        self.assertNotIn("input", call_options)
+        self.assertFalse(
+            self.plugin._verify_pmkid_hash_password(
+                hash_line, "definitelywrong"
+            )
+        )
+
     def test_capture_map_location_is_persisted_for_exact_handshake(self):
         filename = "Cafe_aabbccddeeff.pcap"
         capture = os.path.join(self.tempdir.name, filename)
@@ -130,6 +266,26 @@ class PWMenuFeatureTests(unittest.TestCase):
         )
         self.assertFalse(changed)
         self.assertEqual(53.9, resolved["lat"])
+
+    def test_single_map_point_does_not_duplicate_member_payload(self):
+        points = self.plugin._build_map_points([
+            {
+                "essid": "Cafe",
+                "is_cracked": False,
+                "files": [{
+                    "filename": "Cafe_aabbccddeeff.pcap",
+                    "bssid": "aa:bb:cc:dd:ee:ff",
+                    "lat": 53.9,
+                    "lon": 27.56,
+                    "gps_source": "manual-map",
+                    "quality": {},
+                }],
+            }
+        ])
+
+        self.assertEqual(len(points), 1)
+        self.assertEqual(points[0]["source"], "manual-map")
+        self.assertEqual(points[0]["members"], [])
 
     def test_capture_map_location_rejects_invalid_target_or_coordinates(self):
         filename = "Cafe_aabbccddeeff.pcap"
@@ -170,6 +326,35 @@ class PWMenuFeatureTests(unittest.TestCase):
         text = payload.decode("utf-8-sig")
         self.assertTrue(text.startswith("ESSID\tBSSID\tPASSWORD\tSOURCE\r\n"))
         self.assertIn("Cafe\tAA:BB:CC:DD:EE:FF\tpass:word\tManual", text)
+
+    def test_single_ohc_action_reports_why_nothing_was_queued(self):
+        request = types.SimpleNamespace(
+            form={"filenames": "Partial_aabbccddeeff.pcap"}
+        )
+        with (
+            mock.patch.object(
+                self.plugin,
+                "_queue_ohc_files",
+                return_value=0,
+            ),
+            mock.patch.object(
+                self.plugin,
+                "_ohc_file_record",
+                return_value={
+                    "status": "invalid",
+                    "message": "No usable WPA or PMKID hash found",
+                },
+            ),
+        ):
+            message, is_error = self.plugin._handle_ohc_cluster_upload(
+                request
+            )
+
+        self.assertTrue(is_error)
+        self.assertEqual(
+            message,
+            "Nothing queued: No usable WPA or PMKID hash found",
+        )
 
     def test_wpa_upload_uses_service_cookie(self):
         capture = os.path.join(
