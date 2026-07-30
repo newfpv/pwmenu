@@ -2,6 +2,163 @@
 
 All notable changes to A_pwmenu are documented here.
 
+## 1.4.0 — 2026-07-30
+
+### Pwnagotchi-native storage discovery
+
+- Replaced hardcoded capture directories with the active Pwnagotchi
+  `bettercap.handshakes` setting supplied by the agent. PWMenu now derives its
+  PCAP, sidecar, credential, OHC snapshot and persistent-state locations from
+  that configured directory.
+- Deferred all storage access, capture analysis, QuickDic, quality scanning and
+  cloud queues until `on_ready(agent)` supplies the complete Pwnagotchi
+  configuration. A dynamic user-home fallback is used only when older forks do
+  not expose the setting; the filesystem root is rejected.
+- Added a non-destructive compatibility migration that merges legacy
+  credentials, map/history/state records and the OHC submission snapshot from
+  the previous runtime-home capture folder into the configured directory.
+  Existing configured data is preserved in the merge and in a one-time
+  pre-migration backup.
+- Legacy locations are discovered from system account home directories rather
+  than a list of device-specific paths, covering forks that run Pwnagotchi
+  under different users. Per-source completion markers make this migration
+  idempotent and prevent older state from being reapplied on later starts.
+
+### Bluetooth-first Web UI transport
+
+- Rebuilt the Web UI response as a thin, immediately renderable shell instead
+  of retransmitting the complete interface, every tab, every expanded capture,
+  all map records, CSS, JavaScript, and repeated inline SVG paths in one large
+  HTML document.
+- The selected tab now loads first through a compact JSON fragment. Remaining
+  tabs preload sequentially during browser idle time, so switching later still
+  feels instant without competing with the first useful screen over Bluetooth
+  PAN. Background preloading can be disabled with
+  `web_background_preload = false`.
+- Replaced the generic rectangular list skeleton on Map with a dedicated
+  full-map loading state, animated location indicator, and clear map-loading
+  copy.
+- Added true server-side pagination for Cracked and Handshakes. The first 24
+  cards arrive immediately; lightweight full-height placeholders reserve the
+  final scroll length and are replaced in small background batches with a
+  fade-in. The current scroll position is never reset, and server-side search
+  remains complete across records not yet transferred to the browser.
+- Moved expanded credential and handshake contents out of the initial response.
+  After each list arrives, its details preload as one compressed background
+  batch, keeping the first screen small while making card expansion immediate;
+  an individual on-demand endpoint remains as a race-safe fallback. A card
+  opens its loading surface immediately even if tapped before that preload
+  finishes.
+- Added revision-bound snapshot identifiers and a small bounded snapshot
+  history. Background pages remain pinned to the snapshot that created their
+  placeholders even if a new handshake arrives, preventing list replacement
+  and the resulting jump back up the page.
+- Split the monolithic inline styling and behavior into cacheable `app.css` and
+  `app.js` resources and consolidated repeated icons into one SVG sprite.
+  Content-hashed resource URLs, strong ETags, precompressed gzip responses, and
+  immutable browser caching keep repeat visits small without leaving a phone
+  stuck on stale code after an update.
+- Added a short-lived pre-rendered page snapshot and debounced background model
+  warmup after data changes. File actions remain immediately consistent while
+  the next expensive rebuild happens outside the HTTP request whenever
+  possible.
+- Preserved the existing compact desktop and mobile interface: no new permanent
+  panels, controls, or visual clutter were added for this performance work.
+- Added complete portable backup/restore for every PCAP handshake, GPS/MAP
+  point, PWMenu configuration/state/activity record, submission memory and
+  credential potfile. Creation and restoration stream through bounded
+  disk-backed temporary storage instead of placing the capture collection in
+  RAM. The intentionally unencrypted archive contains a versioned manifest and
+  SHA-256 for every entry; restore accepts only known destinations, verifies all
+  content before writing, writes atomically, and restarts only the Pwnagotchi
+  service.
+- Added automatic best-capture presentation. One strongest capture receives
+  PCAP/22000 and cloud actions; weaker or repeated captures remain accessible
+  under **Other captures**. Direct and ZIP download routes also resolve to one
+  best capture per AP.
+- Added a conditional conflict center for BSSIDs with multiple ESSIDs or
+  recovered passwords, name-only credentials, and repeated captures. Harmless
+  punctuation-only ESSID aliases and uniquely matched legacy zero-BSSID
+  records are reconciled automatically. A password conflict has an explicit
+  local verify-and-fix action that rejects candidates only when exactly one
+  password is cryptographically confirmed; missing hashes never alter data.
+- Added a bounded activity history for important Pwnagotchi lifecycle,
+  connectivity, peer and handshake events plus PWMenu password, map,
+  whitelist, cleanup, import, backup and cloud-sync actions. It now shows only
+  the newest 24 hours or 200 records and needs no Load more control.
+- Added one-click, message-ready text exports for every Conflict Center item
+  and the complete retained Activity History.
+- Reordered Other by operational priority. Conditional capture cleanup comes
+  first, Level expands its achievements in place, transfer/import/backup
+  actions share one compact results card, OHC owns its password-storage warning,
+  and Activity History is immediately followed by Conflict Center. Healthy
+  storage or empty cleanup no longer creates a card.
+- Rebuilt the whitelist with the same compact card, counter, bounded list and
+  status rows used by Conflict Center and Activity History. Add/remove updates
+  the component in place without a page reload, and every entry is present in
+  the swipeable list without a Show more control.
+- Shortened the whitelist, Activity History and Conflict Center list viewports
+  by approximately one row to leave more room for page scrolling. Reordered
+  transfer actions into three exact two-button rows; one Import picker now
+  accepts both result files and complete PWMenu backups.
+- Made password-conflict verification a persistent background job with visible
+  per-candidate progress, polling and retry feedback. The button changes to
+  **Checking...** immediately and the row remains informative during slow
+  local aircrack/hcxtools work. Moved toast notifications out of the lazily
+  loaded Map fragment so actions on every tab always show feedback.
+- Fixed the rendered **Verify & fix** inline handler: JSON string quoting could
+  terminate its HTML attribute before JavaScript ran, making the button appear
+  clickable while producing no request or status change.
+- Handshake placeholders now backfill even while the tab is hidden. An active
+  list switches to larger, faster batches, while inactive work stays gentler;
+  defaults remain configurable. Detail preloading for later cards waits until
+  their placeholders are filled, so it cannot compete with the visible list.
+  The Map fragment is prioritized and the Yandex Maps library warms in the
+  background before Map is opened.
+- Added a conditional **System attention** panel for low available memory, low
+  system storage, GPS outages beyond a grace period, delayed OHC work, and a
+  stopped WPA-sec queue. The panel is absent when the system is healthy.
+- Added a one-time UI revision cookie and cache-clear response in addition to
+  content-hashed assets, forcing browsers that retained an early 1.4.0 shell to
+  replace it while preserving normal long-lived asset caching afterwards.
+- Added lazy-transport, stable snapshot, placeholder backfill, best-capture,
+  conflict, activity history, full-capture backup/restore, health-state, and
+  configured-storage migration regression coverage. The suite now contains
+  89 passing tests.
+
+## 1.3.10 — 2026-07-30
+
+### Web UI hot-path acceleration
+
+- Added an incremental page-model cache for parsed credentials, grouped
+  captures, map clusters, no-GPS entries, cleanup candidates, achievements,
+  and aggregate counters. Repeated requests reuse the model until an input
+  actually changes.
+- Added metadata-only source fingerprints and explicit invalidation after
+  state, password, QuickDic, WPA-sec, OHC, map, and capture changes. Passwords
+  are never placed in a cache key or persisted by the cache.
+- Added short inventory and credential-metadata verification windows,
+  configurable with `web_inventory_cache_seconds` and
+  `web_credential_cache_seconds`. PWMenu actions invalidate them immediately;
+  external filesystem changes are periodically rechecked.
+- Replaced repeated capture and QuickDic globs with `os.scandir`, indexed
+  cracked credentials once per scan instead of searching every credential for
+  every PCAP, and reused scan metadata in Capture Cleanup.
+- Removed blocking GPSD socket polling from HTTP page assembly. Live GPSD
+  polling remains in the display/capture path, while the Web UI consumes its
+  current cached fix.
+- Added browser `content-visibility` containment to long credential and
+  handshake lists so off-screen cards do not delay the first usable frame.
+- Removed the redundant self-copy from map history for networks that have only
+  one capture, reducing JSON parsing and memory on the common mobile view.
+- On the 179-PCAP development dataset, a repeated gzip page response dropped
+  from roughly 285 ms to about 27 ms in the local benchmark. The expensive data
+  model itself dropped from roughly 540 ms cold to about 27 ms before the
+  metadata hot-path cache, with exact results depending on storage and
+  transport.
+- Added five cache/invalidation regression tests; the suite now contains 64
+  passing tests.
+
 ## 1.3.9 — 2026-07-29
 
 ### Web UI performance and behavior

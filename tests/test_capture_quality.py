@@ -658,13 +658,43 @@ class CaptureQualityTests(unittest.TestCase):
                     "more": 0,
                     "token": "0" * 64,
                 },
+                conflicts=[{
+                    "kind": "password",
+                    "title": "4C:5E:0C:F8:B3:33",
+                    "detail": (
+                        "2 different recovered passwords are attached "
+                        "to this BSSID"
+                    ),
+                    "bssid": "4C:5E:0C:F8:B3:33",
+                    "repairable": True,
+                }],
+                activity_history={
+                    "items": [],
+                    "total": 0,
+                    "nextOffset": 0,
+                    "hasMore": False,
+                },
                 whitelist=[],
                 notification_duration_ms=2600,
             )
 
         self.assertIn("function qualityStatusBlock", page)
-        self.assertIn("Capture Cleanup", page)
-        self.assertIn("Download All Uncracked APs", page)
+        self.assertNotIn("Capture Cleanup", page)
+        self.assertIn("Download Uncracked", page)
+        self.assertIn("Results &amp; transfer", page)
+        self.assertIn("identityAchievements", page)
+        self.assertIn("copyConflictCenter", page)
+        self.assertIn("copyAllActivityHistory", page)
+        self.assertIn(
+            "onclick='repairPasswordConflict(this, "
+            '"4C:5E:0C:F8:B3:33")\'',
+            page,
+        )
+        self.assertNotIn(
+            'onclick="repairPasswordConflict(this, "',
+            page,
+        )
+        self.assertNotIn("OHC Password Storage", page)
         self.assertIn("Made by", page)
         self.assertIn("function loadYandexMaps", page)
         self.assertIn("function whitelistAction", page)

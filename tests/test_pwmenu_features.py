@@ -286,6 +286,7 @@ class PWMenuFeatureTests(unittest.TestCase):
         self.assertEqual(len(points), 1)
         self.assertEqual(points[0]["source"], "manual-map")
         self.assertEqual(points[0]["members"], [])
+        self.assertEqual(points[0]["history"], [])
 
     def test_capture_map_location_rejects_invalid_target_or_coordinates(self):
         filename = "Cafe_aabbccddeeff.pcap"

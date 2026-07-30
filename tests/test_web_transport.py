@@ -87,6 +87,34 @@ class WebTransportTests(unittest.TestCase):
 
         get_html.assert_called_once_with()
 
+    def test_new_ui_revision_forces_one_cache_refresh(self):
+        with self.app.test_request_context(
+            "/plugins/A_pwmenu/"
+        ):
+            response = self.plugin._html_response("<html>PWMenu</html>")
+            self.assertEqual(
+                response.headers["X-PWMenu-UI-Revision"],
+                self.plugin.__ui_revision__,
+            )
+            self.assertEqual(
+                response.headers["Clear-Site-Data"], '"cache"'
+            )
+            self.assertIn(
+                "pwmenu_ui_revision=", response.headers["Set-Cookie"]
+            )
+
+        with self.app.test_request_context(
+            "/plugins/A_pwmenu/",
+            headers={
+                "Cookie": (
+                    "pwmenu_ui_revision="
+                    + self.plugin.__ui_revision__
+                )
+            },
+        ):
+            response = self.plugin._html_response("<html>PWMenu</html>")
+            self.assertNotIn("Clear-Site-Data", response.headers)
+
 
 if __name__ == "__main__":
     unittest.main()
