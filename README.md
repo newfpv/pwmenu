@@ -20,6 +20,9 @@ PWMenu turns the Pwnagotchi capture folder into an organized audit workspace.
 It keeps exact access-point identity, explains whether a capture is actually
 usable, prevents repeated cloud submissions, verifies passwords before saving
 them, and keeps the same workflow comfortable on a desktop or phone.
+The folder is resolved from the active Pwnagotchi
+`bettercap.handshakes` setting before any scanner or cloud worker starts;
+PWMenu does not hardcode a device-specific capture location.
 
 | Capture intelligence | Credential control | Field map |
 |---|---|---|
@@ -96,8 +99,8 @@ them, and keeps the same workflow comfortable on a desktop or phone.
 
 - Enable or disable Web UI, GPS, quality, whitelist, WPA-sec, OHC, time sync,
   display-password, and QuickDic modules independently.
-- Add exact SSIDs to the whitelist without losing punctuation; large lists stay
-  compact behind an expander.
+- Add exact SSIDs to the whitelist without losing punctuation; every entry
+  remains visible inside one bounded, swipeable list.
 - Add only server-verified **Excellent** networks from a selected map group.
 - Preview empty, incomplete zero-hash, and analyzed unusable cleanup candidates.
 - Delete cleanup candidates only after explicit confirmation, report-token
@@ -105,9 +108,49 @@ them, and keeps the same workflow comfortable on a desktop or phone.
 - Keep OHC/WPA-sec queues and recovery state across service restarts.
 - Use atomic state and potfile replacement, locks around shared workers, bounded
   temporary archives, strict filenames, and path-traversal rejection.
-- Tune Web gzip and notification duration for slow Bluetooth PAN links.
+- Reuse an automatically invalidated page model instead of reparsing every
+  potfile, PCAP, map cluster, and cleanup candidate on each request.
+- Open a thin first screen while the active tab loads independently; remaining
+  tabs, card details, and the map library warm progressively in the background.
+- Load the first 24 Cracked and Handshake cards immediately, reserve the final
+  list height with lightweight card placeholders, and replace them in small
+  background batches with a fade-in. Hidden Handshakes continue filling before
+  the tab is opened; active lists automatically switch to larger fast batches.
+  New captures cannot reset the active scroll position, while server-side
+  search still covers the complete list.
+- Select one strongest capture per exact AP for PCAP/22000 downloads and cloud
+  actions. Additional captures stay available under a compact **Other
+  captures** disclosure instead of crowding every card.
+- Reuse browser-cached CSS, JavaScript, and one SVG icon sprite instead of
+  retransmitting the complete interface on every visit.
+- Tune Web gzip, snapshots, background preload, source-verification windows,
+  model warmup, and notification duration for slow Raspberry Pi storage and
+  Bluetooth PAN links.
 - Change the interface accent while retaining the same dark field-console
   design.
+- Download and restore a complete portable PWMenu backup containing every PCAP,
+  GPS/MAP point, configuration file, activity record, submission state and
+  credential potfile. Large collections stream through disk-backed temporary
+  storage instead of Raspberry RAM. Backups are not encrypted, so they must be
+  protected like the original device.
+- Review a conditional conflict center for multiple identities/passwords,
+  name-only credentials and repeated captures. Punctuation-only ESSID aliases
+  reconcile automatically; a real password conflict can be repaired only
+  after local cryptographic verification. Verification runs in the background
+  with visible candidate progress, so closing the tab does not cancel it. The
+  complete safe summary copies as one message-ready block without exposing
+  passwords.
+- Keep the newest 24 hours or 200 important Pwnagotchi and PWMenu events in a
+  bounded, swipeable **Other** list without turning the main interface into a
+  log viewer. One action copies the complete visible history.
+- Use the priority-sorted **Other** workspace: conditional problems first,
+  expandable Level achievements, one compact results/export/import/backup
+  block, OHC and WPA-sec, whitelist, Activity History, and then Conflict Center.
+  Healthy OHC password storage and an empty cleanup report do not consume
+  separate cards.
+- Show a compact **System attention** panel only when memory or storage is low,
+  GPS remains unavailable beyond its grace period, or an OHC/WPA-sec queue
+  appears stalled.
 
 ## Quick install
 
@@ -115,7 +158,7 @@ Install the current tested release:
 
 ```bash
 sudo wget -O /usr/local/share/pwnagotchi/custom-plugins/A_pwmenu.py \
-  https://raw.githubusercontent.com/newfpv/pwmenu/v1.3.9/A_pwmenu.py
+  https://raw.githubusercontent.com/newfpv/pwmenu/v1.4.0/A_pwmenu.py
 ```
 
 Enable it in `/etc/pwnagotchi/config.toml`:

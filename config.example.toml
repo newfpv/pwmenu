@@ -1,6 +1,10 @@
 # Master switch.
 main.plugins.A_pwmenu.enabled = true
 
+# PWMenu automatically uses the core Pwnagotchi `bettercap.handshakes` value
+# for captures, sidecars, credentials and persistent state. Do not duplicate
+# the directory in the plugin configuration.
+
 # Independent feature modules. Disable anything you do not use.
 main.plugins.A_pwmenu.module_web_enabled = true
 main.plugins.A_pwmenu.module_gps_enabled = true
@@ -100,9 +104,55 @@ main.plugins.A_pwmenu.import_max_bytes = 2097152
 main.plugins.A_pwmenu.archive_memory_limit = 2097152
 
 # Web UI behavior. Level 1 compression is much faster on a Raspberry Pi while
-# still reducing the page size. Notification duration is in milliseconds.
+# still reducing the page size. The inventory cache avoids rescanning every PCAP
+# on each page request and fully verifies external file changes every 30 seconds.
+# Credential metadata is rechecked every 10 seconds; changes made through
+# PWMenu invalidate both caches immediately.
+# The first response is a thin shell. Its active section loads immediately;
+# other sections preload one by one while the browser is idle. Handshake cards
+# continue replacing their reserved slots even while their tab is hidden, and
+# the Yandex Maps library is warmed before Map is opened. CSS, JavaScript, and
+# the SVG icon sprite are immutable browser-cached resources.
+# Notification duration is in milliseconds.
 main.plugins.A_pwmenu.web_gzip_level = 1
+main.plugins.A_pwmenu.web_inventory_cache_seconds = 30
+main.plugins.A_pwmenu.web_credential_cache_seconds = 10
+main.plugins.A_pwmenu.web_snapshot_seconds = 5
+main.plugins.A_pwmenu.web_background_preload = true
+main.plugins.A_pwmenu.web_model_warmup = true
+main.plugins.A_pwmenu.web_page_size = 24
+# After the first page, empty full-height card slots reserve the final scroll
+# length. Small batches replace those slots with a fade-in without moving the
+# user's scroll position.
+main.plugins.A_pwmenu.web_background_batch_size = 12
+main.plugins.A_pwmenu.web_background_batch_delay_ms = 120
+# If the user is actively viewing the list, use larger/faster batches so the
+# remaining placeholders disappear quickly without changing scroll position.
+main.plugins.A_pwmenu.web_foreground_batch_size = 24
+main.plugins.A_pwmenu.web_foreground_batch_delay_ms = 50
 main.plugins.A_pwmenu.web_notification_duration_ms = 2600
+
+# Backup/restore. The portable archive is intentionally not encrypted and may
+# contain API keys, recovered passwords, network identifiers, and coordinates.
+# Every PCAP and every GPS/MAP point is included. Large archives use disk-backed
+# streaming instead of holding the capture collection in Raspberry RAM.
+# Restore validates every SHA-256 manifest entry, writes atomically, and
+# restarts only the Pwnagotchi service by default. This limit is 2 GiB.
+main.plugins.A_pwmenu.backup_max_bytes = 2147483648
+main.plugins.A_pwmenu.backup_restart_after_restore = true
+
+# Bounded event history shown in Other. It includes important Pwnagotchi
+# lifecycle, handshake, peer, map, password, cleanup and cloud-sync events.
+# Only the newest 24 hours and at most 200 events are retained and displayed.
+main.plugins.A_pwmenu.activity_history_max = 200
+main.plugins.A_pwmenu.activity_history_hours = 24
+
+# The compact System attention panel exists only while at least one configured
+# threshold is violated.
+main.plugins.A_pwmenu.health_memory_warning_mb = 64
+main.plugins.A_pwmenu.health_disk_warning_percent = 10
+main.plugins.A_pwmenu.health_gps_grace_seconds = 900
+main.plugins.A_pwmenu.health_queue_stuck_seconds = 3600
 
 # After migration, keep the legacy standalone plugins disabled to avoid duplicate
 # screen elements, uploads, downloads, and dictionary work.

@@ -50,18 +50,22 @@ logging.info("[A_pwmenu] Module init.")
 
 class A_pwmenu(plugins.Plugin):
     __author__ = 'NewFPV'
-    __version__ = '1.3.9'
+    __version__ = '1.4.0'
+    __ui_revision__ = '20260730-14'
     __license__ = 'GPL3'
     __description__ = 'Ultimate Password Manager'
 
     def __init__(self):
         self.ready = False
-        self.handshake_dirs = ['/root/handshakes/', '/home/pi/handshakes/']
-        self.potfile_ohc = '/root/handshakes/onlinehashcrack.cracked.potfile'
-        self.potfile_handshake_lab = '/root/handshakes/handshake-lab.cracked.potfile'
-        self.potfile_manual = '/root/handshakes/manual.potfile'
-        self.data_file = '/root/handshakes/.a_pwmenu_data.json'
-        self.ohc_export_file = '/root/handshakes/.a_pwmenu_ohc_export.json'
+        self.storage_ready = False
+        self.storage_lock = threading.RLock()
+        self.storage_dir = ''
+        self.handshake_dirs = []
+        self.potfile_ohc = ''
+        self.potfile_handshake_lab = ''
+        self.potfile_manual = ''
+        self.data_file = ''
+        self.ohc_export_file = ''
         self.last_sync = 0
         self.data_lock = threading.RLock()
         self.save_lock = threading.Lock()
@@ -105,6 +109,8 @@ class A_pwmenu(plugins.Plugin):
         self.ohc_proxy_config_file = '/run/a_pwmenu_ohc_xray.json'
         self.capture_analysis_lock = threading.Lock()
         self.password_verify_lock = threading.Lock()
+        self.conflict_repair_lock = threading.RLock()
+        self.conflict_repair_jobs = {}
         self.quality_thread_lock = threading.Lock()
         self.quality_scan_thread = None
         self.quality_pending = set()
@@ -124,21 +130,436 @@ class A_pwmenu(plugins.Plugin):
         self.web_template_lock = threading.Lock()
         self.web_template = None
         self.web_template_environment = None
+        self.web_data_cache_lock = threading.RLock()
+        self.web_data_cache_revision = 0
+        self.web_data_cache_key = None
+        self.web_data_cache = None
+        self.credential_cache_lock = threading.RLock()
+        self.credential_cache_revision = None
+        self.credential_cache = None
+        self.credential_revision_value = None
+        self.credential_revision_checked_at = 0
+        self.source_inventory_cache_lock = threading.RLock()
+        self.source_inventory_cache = {}
+        self.web_resource_lock = threading.RLock()
+        self.web_resource_cache = None
+        self.web_snapshot_lock = threading.RLock()
+        self.web_snapshot_cache = None
+        self.web_snapshot_history = {}
+        self.web_model_warm_lock = threading.Lock()
+        self.web_model_warm_thread = None
+        self.backup_lock = threading.Lock()
+        self.loaded_at = time.time()
 
     def _module_enabled(self, name, default=True):
         return self._option_bool(f'module_{name}_enabled', default)
 
+    def _active_agent_config(self, agent):
+        if agent is None:
+            return {}
+        try:
+            config_method = getattr(agent, 'config', None)
+            config = config_method() if callable(config_method) else None
+            if isinstance(config, dict):
+                return config
+        except (AttributeError, TypeError):
+            pass
+        config = getattr(agent, '_config', None)
+        return config if isinstance(config, dict) else {}
+
+    def _configured_handshake_directory(self, agent):
+        config = self._active_agent_config(agent)
+        bettercap = config.get('bettercap', {})
+        configured = (
+            bettercap.get('handshakes')
+            if isinstance(bettercap, dict)
+            else ''
+        )
+        raw_path = str(configured or '').strip()
+        source = 'bettercap.handshakes'
+        if not raw_path:
+            raw_path = os.path.join(os.path.expanduser('~'), 'handshakes')
+            source = 'user-home compatibility fallback'
+        directory = os.path.realpath(
+            os.path.abspath(
+                os.path.expandvars(os.path.expanduser(raw_path))
+            )
+        )
+        if directory == os.path.abspath(os.sep):
+            raise ValueError('Handshake directory cannot be the filesystem root')
+        return directory, source
+
+    def _configure_storage_paths(self, agent):
+        directory, source = self._configured_handshake_directory(agent)
+        os.makedirs(directory, exist_ok=True)
+        self.storage_dir = directory
+        self.handshake_dirs = [directory]
+        self.potfile_ohc = os.path.join(
+            directory,
+            'onlinehashcrack.cracked.potfile',
+        )
+        self.potfile_handshake_lab = os.path.join(
+            directory,
+            'handshake-lab.cracked.potfile',
+        )
+        self.potfile_manual = os.path.join(directory, 'manual.potfile')
+        self.data_file = os.path.join(directory, '.a_pwmenu_data.json')
+        self.ohc_export_file = os.path.join(
+            directory,
+            '.a_pwmenu_ohc_export.json',
+        )
+        logging.info(
+            '[A_pwmenu] Handshake storage from %s: %s',
+            source,
+            directory,
+        )
+
+    def _read_newest_json_object(self, paths):
+        candidates = [
+            path for path in paths
+            if path and os.path.isfile(path)
+        ]
+        candidates.sort(key=os.path.getmtime, reverse=True)
+        for path in candidates:
+            try:
+                with open(path, 'r', encoding='utf-8') as handle:
+                    payload = json.load(handle)
+                if isinstance(payload, dict):
+                    return payload, path
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                continue
+        return None, ''
+
+    def _write_json_object_atomic(self, path, payload):
+        directory = os.path.dirname(path)
+        os.makedirs(directory, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(
+            prefix='.a_pwmenu-storage-',
+            dir=directory,
+        )
+        try:
+            try:
+                os.chmod(tmp_path, 0o600)
+            except OSError:
+                pass
+            with os.fdopen(fd, 'w', encoding='utf-8') as handle:
+                fd = None
+                json.dump(
+                    payload,
+                    handle,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp_path, path)
+        finally:
+            if fd is not None:
+                os.close(fd)
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+
+    def _merge_legacy_state_value(
+        self,
+        configured,
+        legacy,
+        prefer_legacy=True,
+    ):
+        if isinstance(configured, dict) and isinstance(legacy, dict):
+            merged = copy.deepcopy(configured)
+            for key, value in legacy.items():
+                if key in merged:
+                    merged[key] = self._merge_legacy_state_value(
+                        merged[key],
+                        value,
+                        prefer_legacy=prefer_legacy,
+                    )
+                else:
+                    merged[key] = copy.deepcopy(value)
+            return merged
+        if isinstance(configured, list) and isinstance(legacy, list):
+            older = configured if prefer_legacy else legacy
+            newer = legacy if prefer_legacy else configured
+            merged = copy.deepcopy(older)
+            fingerprints = set()
+            for item in merged:
+                try:
+                    fingerprints.add(json.dumps(item, sort_keys=True))
+                except (TypeError, ValueError):
+                    fingerprints.add(repr(item))
+            for item in newer:
+                try:
+                    fingerprint = json.dumps(item, sort_keys=True)
+                except (TypeError, ValueError):
+                    fingerprint = repr(item)
+                if fingerprint not in fingerprints:
+                    merged.append(copy.deepcopy(item))
+                    fingerprints.add(fingerprint)
+            return merged
+        preferred = legacy if prefer_legacy else configured
+        fallback = configured if prefer_legacy else legacy
+        if preferred is None or preferred == '':
+            return copy.deepcopy(fallback)
+        return copy.deepcopy(preferred)
+
+    def _migrate_legacy_state(self, legacy_directory):
+        legacy_state, legacy_source = self._read_newest_json_object((
+            os.path.join(legacy_directory, '.a_pwmenu_data.json'),
+            os.path.join(legacy_directory, '.a_pwmenu_data.json.bak'),
+        ))
+        if legacy_state is None:
+            return False
+
+        configured_state, configured_source = self._read_newest_json_object((
+            self.data_file,
+            self.data_file + '.bak',
+        ))
+        if configured_state is None:
+            configured_state = {}
+        else:
+            preservation = self.data_file + '.pre-config-path-migration'
+            if configured_source and not os.path.exists(preservation):
+                shutil.copy2(configured_source, preservation)
+
+        prefer_legacy = bool(
+            legacy_source
+            and (
+                not configured_source
+                or os.path.getmtime(legacy_source)
+                >= os.path.getmtime(configured_source)
+            )
+        )
+        merged = self._merge_legacy_state_value(
+            configured_state,
+            legacy_state,
+            prefer_legacy=prefer_legacy,
+        )
+        needs_write = (
+            merged != configured_state
+            or not os.path.isfile(self.data_file)
+            or not os.path.isfile(self.data_file + '.bak')
+        )
+        if not needs_write:
+            return False
+        self._write_json_object_atomic(self.data_file, merged)
+        self._write_json_object_atomic(self.data_file + '.bak', merged)
+        return True
+
+    def _migrate_legacy_ohc_snapshot(self, legacy_directory):
+        source = os.path.join(
+            legacy_directory,
+            os.path.basename(self.ohc_export_file),
+        )
+        legacy, _ = self._read_newest_json_object((source,))
+        if legacy is None:
+            return False
+        configured, _ = self._read_newest_json_object(
+            (self.ohc_export_file,)
+        )
+        if configured is None:
+            configured = {}
+
+        identities = {
+            str(value) for value in (
+                list(configured.get('identities', []) or [])
+                + list(legacy.get('identities', []) or [])
+            )
+            if isinstance(value, str) and value
+        }
+        bssids = {
+            str(value).lower() for value in (
+                list(configured.get('bssids', []) or [])
+                + list(legacy.get('bssids', []) or [])
+            )
+            if isinstance(value, str) and value
+        }
+        merged = {
+            'version': 1,
+            'source': 'configured-path migration',
+            'imported_at': max(
+                int(configured.get('imported_at', 0) or 0),
+                int(legacy.get('imported_at', 0) or 0),
+            ),
+            'tasks': len(identities),
+            'identities': sorted(identities),
+            'bssids': sorted(bssids),
+        }
+        if merged == configured and os.path.isfile(self.ohc_export_file):
+            return False
+        self._write_json_object_atomic(self.ohc_export_file, merged)
+        return True
+
+    def _legacy_storage_directories(self):
+        home_directories = {os.path.expanduser('~')}
+        try:
+            import pwd
+            home_directories.update(
+                entry.pw_dir for entry in pwd.getpwall()
+                if str(entry.pw_dir or '').strip()
+            )
+        except (ImportError, AttributeError, OSError):
+            pass
+
+        marker_names = {
+            'onlinehashcrack.cracked.potfile',
+            'handshake-lab.cracked.potfile',
+            'manual.potfile',
+            '.a_pwmenu_data.json',
+            '.a_pwmenu_data.json.bak',
+            '.a_pwmenu_ohc_export.json',
+        }
+        directories = []
+        for home in home_directories:
+            directory = os.path.realpath(
+                os.path.join(str(home), 'handshakes')
+            )
+            if (
+                directory == self.storage_dir
+                or not os.path.isdir(directory)
+            ):
+                continue
+            try:
+                present = set(os.listdir(directory))
+            except OSError:
+                continue
+            if present.intersection(marker_names):
+                directories.append(directory)
+        return sorted(set(directories))
+
+    def _legacy_migration_marker(self, legacy_directory):
+        fingerprint = hashlib.sha256(
+            os.path.realpath(legacy_directory).encode('utf-8')
+        ).hexdigest()[:16]
+        return os.path.join(
+            self.storage_dir,
+            f'.a_pwmenu_migration_{fingerprint}.json',
+        )
+
+    def _migrate_legacy_directory(self, legacy_directory):
+        marker = self._legacy_migration_marker(legacy_directory)
+        if os.path.isfile(marker):
+            return 0
+        migrated = 0
+        credential_destinations = (
+            self.potfile_ohc,
+            self.potfile_handshake_lab,
+            self.potfile_manual,
+        )
+        for destination in credential_destinations:
+            source = os.path.join(
+                legacy_directory,
+                os.path.basename(destination),
+            )
+            if not os.path.isfile(source):
+                continue
+            source_lines, _ = self._read_pot_lines(source)
+            destination_lines, _ = self._read_pot_lines(destination)
+            merged, _, _ = self._dedupe_pot_lines(
+                destination_lines + source_lines
+            )
+            if merged != destination_lines:
+                self._write_pot_lines(destination, merged)
+                migrated += 1
+
+        if self._migrate_legacy_state(legacy_directory):
+            migrated += 1
+        if self._migrate_legacy_ohc_snapshot(legacy_directory):
+            migrated += 1
+
+        self._write_json_object_atomic(marker, {
+            'version': 1,
+            'completed_at': int(time.time()),
+            'source_id': os.path.basename(marker).split('_')[-1][:-5],
+            'items_changed': migrated,
+        })
+        return migrated
+
+    def _migrate_legacy_storage(self):
+        migrated = 0
+        sources = self._legacy_storage_directories()
+        for legacy_directory in sources:
+            migrated += self._migrate_legacy_directory(legacy_directory)
+        if sources:
+            logging.info(
+                '[A_pwmenu] Checked %d legacy storage location(s); '
+                'migrated %d PWMenu data group(s) into configured '
+                'handshake directory',
+                len(sources),
+                migrated,
+            )
+        return migrated
+
+    def _initialize_from_agent(self, agent):
+        with self.storage_lock:
+            if self.storage_ready:
+                return True
+            try:
+                self._configure_storage_paths(agent)
+                self._migrate_legacy_storage()
+                self._ensure_file(self.potfile_ohc)
+                self._ensure_file(self.potfile_handshake_lab)
+                self._ensure_file(self.potfile_manual)
+                self._normalize_potfile(self.potfile_ohc)
+                self._normalize_potfile(self.potfile_handshake_lab)
+                self._normalize_potfile(self.potfile_manual)
+                self._load_data()
+                self._migrate_wpa_sec_state()
+                self._repair_whitelist_aliases()
+                self.storage_ready = True
+                self.ready = True
+
+                if (
+                    self._module_enabled('gps')
+                    and self._option_bool('pwndroid_ws_enabled', True)
+                ):
+                    self._start_pwndroid_ws()
+                self.quality_scan_running = self._module_enabled('quality')
+                if (
+                    self.quality_scan_running
+                    and self._option_bool('quality_auto_scan', True)
+                ):
+                    self._start_quality_scan_thread(scan_all=True)
+                if (
+                    self._module_enabled('ohc')
+                    and self._option_bool('ohc_enabled', True)
+                    and self._option_bool('ohc_auto_upload', True)
+                ):
+                    self._ensure_ohc_proxy()
+                    reconcile = self._option_bool(
+                        'ohc_reconcile_on_start',
+                        False,
+                    )
+                    if reconcile:
+                        with self.data_lock:
+                            self.data['ohc_reconcile_requested'] = True
+                    self._queue_ohc_files(force=reconcile)
+                    self._start_ohc_scheduler()
+                if self._module_enabled('quickdic'):
+                    self._start_quickdic_worker()
+                self._record_action(
+                    'system',
+                    'PWMenu started',
+                    (
+                        'Plugin modules and background workers are ready; '
+                        f'captures: {self.storage_dir}'
+                    ),
+                    source='Pwnagotchi',
+                    dedupe_key='pwmenu-started',
+                    dedupe_window=30,
+                )
+                return True
+            except Exception as error:
+                self.ready = False
+                self.storage_ready = False
+                logging.exception(
+                    '[A_pwmenu] Could not initialize configured handshake '
+                    'storage: %s',
+                    error,
+                )
+                return False
+
     def on_loaded(self):
         logging.info("[A_pwmenu] Loaded.")
-        self._ensure_file(self.potfile_ohc)
-        self._ensure_file(self.potfile_handshake_lab)
-        self._ensure_file(self.potfile_manual)
-        self._normalize_potfile(self.potfile_ohc)
-        self._normalize_potfile(self.potfile_handshake_lab)
-        self._normalize_potfile(self.potfile_manual)
-        self._load_data()
-        self._migrate_wpa_sec_state()
-        self._repair_whitelist_aliases()
         self.options.setdefault('time_sync_interval', 1800)
         self.options.setdefault('phone_gps_enabled', True)
         self.options.setdefault('phone_gps_max_age', 600)
@@ -165,6 +586,24 @@ class A_pwmenu(plugins.Plugin):
         self.options.setdefault('archive_memory_limit', 2097152)
         self.options.setdefault('web_gzip_level', 1)
         self.options.setdefault('web_notification_duration_ms', 2600)
+        self.options.setdefault('web_inventory_cache_seconds', 30)
+        self.options.setdefault('web_credential_cache_seconds', 10)
+        self.options.setdefault('web_snapshot_seconds', 5)
+        self.options.setdefault('web_background_preload', True)
+        self.options.setdefault('web_model_warmup', True)
+        self.options.setdefault('web_page_size', 24)
+        self.options.setdefault('web_background_batch_size', 12)
+        self.options.setdefault('web_background_batch_delay_ms', 120)
+        self.options.setdefault('web_foreground_batch_size', 24)
+        self.options.setdefault('web_foreground_batch_delay_ms', 50)
+        self.options.setdefault('activity_history_max', 200)
+        self.options.setdefault('activity_history_hours', 24)
+        self.options.setdefault('backup_max_bytes', 2147483648)
+        self.options.setdefault('backup_restart_after_restore', True)
+        self.options.setdefault('health_memory_warning_mb', 64)
+        self.options.setdefault('health_disk_warning_percent', 10)
+        self.options.setdefault('health_gps_grace_seconds', 900)
+        self.options.setdefault('health_queue_stuck_seconds', 3600)
         self.options.setdefault('hcxpcapngtool_timeout', 90)
         self.options.setdefault('password_verify_timeout', 45)
         self.options.setdefault('wpa_sec_api_url', 'https://wpa-sec.stanev.org')
@@ -209,26 +648,6 @@ class A_pwmenu(plugins.Plugin):
         self.options.setdefault('quickdic_telegram_bot_token', '')
         self.options.setdefault('quickdic_telegram_chat_id', '')
         self.options.setdefault('quickdic_telegram_timeout', 15)
-        if self._module_enabled('gps') and self._option_bool('pwndroid_ws_enabled', True):
-            self._start_pwndroid_ws()
-        self.ready = True
-        self.quality_scan_running = self._module_enabled('quality')
-        if self.quality_scan_running and self._option_bool('quality_auto_scan', True):
-            self._start_quality_scan_thread(scan_all=True)
-        if (
-            self._module_enabled('ohc')
-            and self._option_bool('ohc_enabled', True)
-            and self._option_bool('ohc_auto_upload', True)
-        ):
-            self._ensure_ohc_proxy()
-            reconcile = self._option_bool('ohc_reconcile_on_start', False)
-            if reconcile:
-                with self.data_lock:
-                    self.data['ohc_reconcile_requested'] = True
-            self._queue_ohc_files(force=reconcile)
-            self._start_ohc_scheduler()
-        if self._module_enabled('quickdic'):
-            self._start_quickdic_worker()
 
     def on_ui_setup(self, ui):
         with ui._lock:
@@ -253,6 +672,17 @@ class A_pwmenu(plugins.Plugin):
 
     def on_ready(self, agent):
         self._agent = agent
+        self._initialize_from_agent(agent)
+        if not self.ready:
+            return
+        self._record_action(
+            'system',
+            'Pwnagotchi ready',
+            'Agent and Web UI are available',
+            source='Pwnagotchi',
+            dedupe_key='pwnagotchi-ready',
+            dedupe_window=30,
+        )
 
     def on_ui_update(self, ui):
         if not self.ready:
@@ -300,6 +730,15 @@ class A_pwmenu(plugins.Plugin):
             self._start_time_sync_thread()
 
     def on_unload(self, ui):
+        self.ready = False
+        self._record_action(
+            'system',
+            'PWMenu stopped',
+            'Plugin unload requested',
+            source='Pwnagotchi',
+            dedupe_key='pwmenu-stopped',
+            dedupe_window=30,
+        )
         self.pwndroid_running = False
         self.ohc_scheduler_running = False
         self.quality_scan_running = False
@@ -307,6 +746,7 @@ class A_pwmenu(plugins.Plugin):
         self.ohc_scheduler_wakeup.set()
         self.quickdic_wakeup.set()
         self._stop_ohc_proxy()
+        self.storage_ready = False
         try:
             with ui._lock:
                 if self._module_enabled('gps'):
@@ -317,6 +757,17 @@ class A_pwmenu(plugins.Plugin):
             pass
 
     def on_internet_available(self, agent):
+        self._agent = agent
+        if not self.storage_ready and not self._initialize_from_agent(agent):
+            return
+        self._record_action(
+            'network',
+            'Internet connection available',
+            'Cloud synchronization can run',
+            source='Pwnagotchi',
+            dedupe_key='internet-available',
+            dedupe_window=1800,
+        )
         if (
             self.ready
             and self._module_enabled('ohc')
@@ -337,6 +788,31 @@ class A_pwmenu(plugins.Plugin):
                 self._start_wpa_sync_thread()
 
     def on_handshake(self, agent, filename, access_point, client_station):
+        self._agent = agent
+        if not self.storage_ready and not self._initialize_from_agent(agent):
+            return
+        self._invalidate_web_data_cache(files=True)
+        access_point = access_point or {}
+        captured_essid = str(
+            access_point.get('hostname')
+            or access_point.get('essid')
+            or self._essid_from_filename(filename)
+            or 'Unknown network'
+        )
+        captured_bssid = self._format_bssid(
+            access_point.get('mac')
+            or access_point.get('bssid')
+            or ''
+        )
+        capture_detail = os.path.basename(filename)
+        if captured_bssid:
+            capture_detail += f' · {captured_bssid}'
+        self._record_action(
+            'capture',
+            f'Handshake captured: {captured_essid}',
+            capture_detail,
+            source='Pwnagotchi',
+        )
         loc = self._fresh_live_gps() if self._module_enabled('gps') else None
         if loc:
             try:
@@ -380,6 +856,32 @@ class A_pwmenu(plugins.Plugin):
                 [os.path.basename(filename)], force=False
             ):
                 self._start_wpa_sync_thread()
+
+    def on_peer_detected(self, agent, peer):
+        peer_name = str(
+            getattr(peer, 'name', None)
+            or getattr(peer, 'identity', None)
+            or getattr(peer, 'fingerprint', None)
+            or 'Pwnagotchi peer'
+        )
+        self._record_action(
+            'peer',
+            f'Peer detected: {peer_name}',
+            'Nearby Pwnagotchi announced itself',
+            source='Pwnagotchi',
+            dedupe_key=f'peer:{peer_name}',
+            dedupe_window=3600,
+        )
+
+    def on_rebooting(self, agent):
+        self._record_action(
+            'system',
+            'Pwnagotchi reboot requested',
+            'The operating system reported a reboot event',
+            source='Pwnagotchi',
+            dedupe_key='pwnagotchi-rebooting',
+            dedupe_window=60,
+        )
 
     def _display_password_position(self, ui):
         if (
@@ -625,6 +1127,7 @@ class A_pwmenu(plugins.Plugin):
             logging.warning("[A_pwmenu] QuickDic found a key but could not read it")
             return False
 
+        self._invalidate_web_data_cache(credentials=True, files=True)
         with self.data_lock:
             self.data.setdefault('capture_password_checks', {}).pop(
                 os.path.basename(filename), None
@@ -656,6 +1159,12 @@ class A_pwmenu(plugins.Plugin):
             plugins.on('cracked', access_point, password)
         except Exception as error:
             logging.debug(f"[A_pwmenu] QuickDic cracked event failed: {error}")
+        self._record_action(
+            'password',
+            f'QuickDic recovered: {exact_essid or essid}',
+            self._format_bssid(bssid)
+            or 'Password verified against the capture',
+        )
         logging.info(f"[A_pwmenu] QuickDic recovered {exact_essid or essid}")
         return True
 
@@ -689,13 +1198,90 @@ class A_pwmenu(plugins.Plugin):
             path = '/'
 
         try:
+            if request.method == 'GET' and path.startswith('assets/'):
+                return self._serve_web_asset(
+                    path.replace('assets/', '', 1), request
+                )
+
+            if request.method == 'GET' and path.startswith('api/tab/'):
+                return self._tab_fragment_response(
+                    path.replace('api/tab/', '', 1), request
+                )
+
+            if request.method == 'GET' and path == 'api/history':
+                return self._activity_history_response(request)
+
+            if (
+                request.method == 'GET'
+                and path.startswith('api/repair-password-conflict/')
+            ):
+                return self._password_conflict_repair_status(
+                    path.replace(
+                        'api/repair-password-conflict/',
+                        '',
+                        1,
+                    )
+                )
+
+            if request.method == 'GET' and path.startswith('api/details/'):
+                return self._details_fragment_response(
+                    request, path.replace('api/details/', '', 1)
+                )
+
+            if request.method == 'GET' and path.startswith('api/detail/'):
+                detail_path = path.replace('api/detail/', '', 1)
+                detail_parts = detail_path.split('/')
+                if len(detail_parts) != 2:
+                    return self._json_response(
+                        {'ok': False, 'message': 'Invalid detail route'},
+                        404,
+                    )
+                return self._detail_fragment_response(
+                    request, detail_parts[0], detail_parts[1]
+                )
+
             if request.method == 'POST':
+                if path == 'backup-export':
+                    return self._serve_backup(request)
+
+                if path == 'backup-restore':
+                    ok, message = self._restore_backup(request)
+                    if ok:
+                        self._record_action(
+                            'backup',
+                            'PWMenu backup restored',
+                            'Settings, state and credential files were restored',
+                        )
+                    response = self._action_response(
+                        request, message, not ok, 'other'
+                    )
+                    if (
+                        ok
+                        and self._option_bool(
+                            'backup_restart_after_restore', True
+                        )
+                    ):
+                        self._schedule_pwnagotchi_service_restart()
+                    return response
+
+                if path == 'repair-password-conflict':
+                    ok, payload = self._start_password_conflict_repair(
+                        request.form.get('bssid')
+                    )
+                    return self._json_response(payload, 202 if ok else 409)
+
                 if path == 'delete-password':
                     essid = request.form.get('essid')
                     pwd = request.form.get('password')
                     source = request.form.get('source')
                     bssid = request.form.get('bssid')
                     deleted = self._delete_password(essid, pwd, source, bssid)
+                    if deleted:
+                        self._record_action(
+                            'password',
+                            f'Password removed: {essid or "Unknown network"}',
+                            self._format_bssid(bssid) or str(source or ''),
+                        )
                     message = (
                         "Password deleted"
                         if deleted
@@ -712,6 +1298,13 @@ class A_pwmenu(plugins.Plugin):
                         request.form.get('bssid'),
                         request.form.get('old_password'),
                     )
+                    if ok:
+                        self._record_action(
+                            'password',
+                            'Password updated: '
+                            + str(request.form.get('essid') or 'Unknown network'),
+                            self._format_bssid(request.form.get('bssid')),
+                        )
                     return self._password_action_response(
                         request,
                         ok,
@@ -724,11 +1317,22 @@ class A_pwmenu(plugins.Plugin):
                 if path == 'delete-file':
                     fname = request.form.get('filename')
                     if self._delete_specific_file(fname):
+                        self._record_action(
+                            'capture',
+                            'Handshake deleted',
+                            os.path.basename(str(fname or '')),
+                        )
                         return self._render_page(notification=f"Deleted {fname}", notif_type="success", active_tab="handshakes")
                     return self._render_page(notification=f"Failed to delete {fname}", notif_type="error", active_tab="handshakes")
 
                 if path == 'clean-captures':
                     deleted, total, message = self._clean_capture_candidates(request.form.get('report_token') or '')
+                    if deleted:
+                        self._record_action(
+                            'cleanup',
+                            f'Capture cleanup removed {deleted} file(s)',
+                            f'{total} reviewed candidate(s)',
+                        )
                     return self._render_page(
                         notification=message or f"Removed {deleted}/{total} unusable capture files",
                         notif_type="success" if deleted == total else "error",
@@ -797,6 +1401,11 @@ class A_pwmenu(plugins.Plugin):
                     self.wpa_force_download = True
                     queued = self._queue_wpa_files(force=False)
                     self._start_wpa_sync_thread()
+                    self._record_action(
+                        'cloud',
+                        'WPA-sec synchronization started',
+                        f'{queued} new capture(s) queued',
+                    )
                     return self._action_response(
                         request,
                         f"WPA-sec sync started; {queued} new capture(s) queued",
@@ -814,6 +1423,12 @@ class A_pwmenu(plugins.Plugin):
                     if not self._module_enabled('ohc'):
                         return self._render_page(notification="OHC module is disabled", notif_type="error")
                     res, is_err = self._handle_ohc_all_missing()
+                    if not is_err:
+                        self._record_action(
+                            'cloud',
+                            'OHC synchronization started',
+                            res,
+                        )
                     return self._render_page(notification=res, notif_type="error" if is_err else "success", active_tab="handshakes")
 
                 if path == 'add-password':
@@ -832,6 +1447,12 @@ class A_pwmenu(plugins.Plugin):
                         request.form.get('lat'),
                         request.form.get('lon'),
                     )
+                    if ok:
+                        self._record_action(
+                            'map',
+                            'Handshake placed on map',
+                            filename,
+                        )
                     return self._map_point_action_response(
                         request, ok, message, filename
                     )
@@ -850,6 +1471,12 @@ class A_pwmenu(plugins.Plugin):
                     if not self._module_enabled('time_sync'):
                         return self._render_page(notification="Time sync module is disabled", notif_type="error", active_tab='other')
                     if self._sync_time_now():
+                        self._record_action(
+                            'system',
+                            'System time synchronized',
+                            'Google connectivity time was applied',
+                            source='Pwnagotchi',
+                        )
                         return self._render_page(notification="Time synchronized!", notif_type="success", active_tab='other')
                     else:
                         return self._render_page(notification="Time sync failed (No Internet?)", notif_type="error", active_tab='other')
@@ -876,6 +1503,11 @@ class A_pwmenu(plugins.Plugin):
                             message += f", source {report['source']}"
                         if report.get('ohc_tasks'):
                             message += f", OHC snapshot {report['ohc_tasks']} task(s)"
+                        self._record_action(
+                            'import',
+                            'Password data imported',
+                            message,
+                        )
                         return self._render_page(notification=message, notif_type="success", active_tab='other')
                     except Exception as e:
                         return self._render_page(notification=f"Import Error: {e}", notif_type="error", active_tab='other')
@@ -937,56 +1569,628 @@ class A_pwmenu(plugins.Plugin):
         threading.Thread(target=worker, daemon=True, name='pwmenu-time-sync').start()
 
     def _render_page(self, notification=None, notif_type=None, active_tab='cracked'):
-        cracked = self._get_cracked_data()
-        groups = self._scan_and_group_files(cracked)
-        map_points = self._build_map_points(groups)
-        no_gps_networks = self._build_no_gps_networks(groups)
-        gps_status = self._gps_status()
-        ohc_status = self._ohc_status()
-        wpa_status = self._wpa_status()
-        pot_health = self._potfile_health(self.potfile_ohc)
-        cleanup_report = self._capture_cleanup_report()
-        whitelist = self._get_whitelist() if self._module_enabled('whitelist') else []
-        ach = self._update_achievements(groups, cracked)
-
-        t_nets = len(groups)
-        c_nets = len([g for g in groups if g['is_cracked']])
-        pct = int((c_nets / t_nets * 100)) if t_nets > 0 else 0
-
-        stats = {
-            'cracked': c_nets, 'total': t_nets, 'percent': pct,
-            'files': sum(len(g['files']) for g in groups),
-            'level': ach['level'], 'xp': ach['xp'], 'next_xp': ach['next_xp'], 'rank': ach['rank'],
-            'lvl_percent': ach['lvl_percent'],
-            'gps_points': len(map_points),
-            'cracked_gps': len([p for p in map_points if p['is_cracked']]),
-            'no_gps': len([g for g in groups if g.get('lat') is None or g.get('lon') is None])
-        }
-
+        snapshot = self._page_snapshot()
         tok = generate_csrf() if generate_csrf else ""
+        tab_name = (
+            active_tab
+            if active_tab in ('cracked', 'handshakes', 'map', 'other')
+            else 'cracked'
+        )
+        notification_html = ''
+        if notification:
+            css_class = ' err' if notif_type == 'error' else ''
+            notification_html = (
+                f'<div id="nt" class="notif{css_class}"><b>'
+                f'{html.escape(str(notification))}</b></div>'
+            )
+        page = (
+            snapshot['shell']
+            .replace('__PWMENU_CSRF__', tok)
+            .replace('__PWMENU_TAB__', tab_name)
+            .replace('<!-- PWMENU_NOTIFICATION -->', notification_html)
+        )
+        return self._html_response(page)
+
+    def _invalidate_web_data_cache(self, credentials=False, files=False):
+        """Discard derived Web UI data after files or persistent state change."""
+        with self.web_data_cache_lock:
+            self.web_data_cache_revision += 1
+            self.web_data_cache_key = None
+            self.web_data_cache = None
+        with self.web_snapshot_lock:
+            if self.web_snapshot_cache:
+                snapshot_id = str(
+                    self.web_snapshot_cache.get('id') or ''
+                )
+                if snapshot_id:
+                    self.web_snapshot_history[snapshot_id] = (
+                        self.web_snapshot_cache
+                    )
+                newest = sorted(
+                    self.web_snapshot_history.values(),
+                    key=lambda item: float(item.get('created_at', 0)),
+                    reverse=True,
+                )[:4]
+                self.web_snapshot_history = {
+                    item['id']: item for item in newest
+                }
+            self.web_snapshot_cache = None
+        if credentials:
+            with self.credential_cache_lock:
+                self.credential_cache_revision = None
+                self.credential_cache = None
+                self.credential_revision_value = None
+                self.credential_revision_checked_at = 0
+        if files:
+            with self.source_inventory_cache_lock:
+                self.source_inventory_cache.clear()
+        if (
+            self.ready
+            and self._option_bool('web_model_warmup', True)
+            and self._module_enabled('web')
+        ):
+            self._schedule_web_model_warmup()
+
+    def _schedule_web_model_warmup(self):
+        """Debounce changes and rebuild the expensive model off the HTTP path."""
+        with self.web_model_warm_lock:
+            if (
+                self.web_model_warm_thread
+                and self.web_model_warm_thread.is_alive()
+            ):
+                return
+
+            def worker():
+                try:
+                    time.sleep(0.35)
+                    observed = -1
+                    for _ in range(3):
+                        with self.web_data_cache_lock:
+                            revision = self.web_data_cache_revision
+                        if revision == observed:
+                            break
+                        observed = revision
+                        self._web_page_model()
+                        time.sleep(0.1)
+                except Exception as error:
+                    logging.debug(
+                        f"[A_pwmenu] Web model warmup failed: {error}"
+                    )
+                finally:
+                    with self.web_model_warm_lock:
+                        self.web_model_warm_thread = None
+
+            self.web_model_warm_thread = threading.Thread(
+                target=worker,
+                daemon=True,
+                name='pwmenu-web-model-warmup',
+            )
+            self.web_model_warm_thread.start()
+
+    def _web_page_model(self):
+        """Build expensive, stable page data once and reuse it until inputs change."""
+        with self.web_data_cache_lock:
+            capture_revision = self._capture_source_revision()
+            credential_revision = self._credential_source_revision()
+            cache_key = (
+                capture_revision,
+                credential_revision,
+                self.web_data_cache_revision,
+            )
+            if (
+                self.web_data_cache is not None
+                and self.web_data_cache_key == cache_key
+            ):
+                return self.web_data_cache
+
+            cracked = self._get_cracked_data(credential_revision)
+            groups = self._scan_and_group_files(cracked)
+            map_points = self._build_map_points(groups)
+            no_gps_networks = self._build_no_gps_networks(groups)
+            conflicts = self._build_conflicts(groups, cracked)
+            activity_history = self._activity_history_page()
+            pot_health = self._potfile_health(self.potfile_ohc)
+            cleanup_report = self._capture_cleanup_report(groups)
+            for group in groups:
+                for file_info in group.get('files', []):
+                    file_info.pop('_path', None)
+                    file_info.pop('_signature', None)
+            achievements = self._update_achievements(groups, cracked)
+
+            total_networks = len(groups)
+            cracked_networks = sum(
+                1 for group in groups if group['is_cracked']
+            )
+            percent = (
+                int(cracked_networks / total_networks * 100)
+                if total_networks else 0
+            )
+            stats = {
+                'cracked': cracked_networks,
+                'total': total_networks,
+                'percent': percent,
+                'files': sum(len(group['files']) for group in groups),
+                'level': achievements['level'],
+                'xp': achievements['xp'],
+                'next_xp': achievements['next_xp'],
+                'rank': achievements['rank'],
+                'lvl_percent': achievements['lvl_percent'],
+                'gps_points': len(map_points),
+                'cracked_gps': sum(
+                    1 for point in map_points if point['is_cracked']
+                ),
+                'no_gps': sum(
+                    1 for group in groups
+                    if group.get('lat') is None or group.get('lon') is None
+                ),
+            }
+            model = {
+                'cracked': cracked,
+                'groups': groups,
+                'map_points': map_points,
+                'no_gps_networks': no_gps_networks,
+                'pot_health': pot_health,
+                'cleanup_report': cleanup_report,
+                'conflicts': conflicts,
+                'activity_history': activity_history,
+                'achievements': achievements,
+                'stats': stats,
+            }
+
+            # A first scan can discover a sidecar/location or award XP and save
+            # state. Keep the source fingerprints from the start (so a file
+            # changed during the build forces one safe retry), but cache against
+            # the resulting in-memory generation.
+            self.web_data_cache_key = (
+                capture_revision,
+                credential_revision,
+                self.web_data_cache_revision,
+            )
+            self.web_data_cache = model
+            return model
+
+    def _snapshot_sections(self, rendered):
+        details = {'cracked': {}, 'handshake': {}}
+        paged_tabs = {}
+        detail_pattern = re.compile(
+            r'<!-- PWMENU_DETAIL_(CRACKED|HANDSHAKE)_(\d+)_START -->'
+            r'(?P<body>.*?)'
+            r'<!-- PWMENU_DETAIL_\1_\2_END -->',
+            re.DOTALL,
+        )
+
+        def remove_detail(match):
+            kind = match.group(1).lower()
+            details[kind][match.group(2)] = match.group('body').strip()
+            return ''
+
+        without_details = detail_pattern.sub(remove_detail, rendered)
+        fragments = {}
+        shell = without_details
+        skeleton = (
+            '<div class="pwmenu-tab-skeleton" aria-busy="true">'
+            '<i></i><i></i><i></i></div>'
+        )
+        map_skeleton = (
+            '<div class="pwmenu-map-loading" aria-busy="true">'
+            '<div class="pwmenu-map-loading-core"><i></i></div>'
+            '<b>Loading map...</b>'
+            '<span>Preparing locations and map tiles</span>'
+            '</div>'
+        )
+        for tab_name in ('cracked', 'handshakes', 'map', 'other'):
+            upper = tab_name.upper()
+            pattern = re.compile(
+                rf'<!-- PWMENU_TAB_{upper}_START -->'
+                rf'(?P<body>.*?)'
+                rf'<!-- PWMENU_TAB_{upper}_END -->',
+                re.DOTALL,
+            )
+            match = pattern.search(shell)
+            if not match:
+                raise RuntimeError(
+                    f'PWMenu {tab_name} snapshot marker was not found'
+                )
+            fragments[tab_name] = match.group('body').strip()
+            if tab_name in ('cracked', 'handshakes'):
+                card_pattern = re.compile(
+                    rf'<!-- PWMENU_CARD_{upper}_(\d+)_START -->'
+                    rf'(?P<body>.*?)'
+                    rf'<!-- PWMENU_CARD_{upper}_\1_END -->',
+                    re.DOTALL,
+                )
+                cards = []
+                for card_match in card_pattern.finditer(
+                    fragments[tab_name]
+                ):
+                    card_html = card_match.group('body').strip()
+                    search_match = re.search(
+                        r'\bdata-t="([^"]*)"', card_html,
+                        re.IGNORECASE,
+                    )
+                    search_text = html.unescape(
+                        search_match.group(1) if search_match else ''
+                    )
+                    cards.append({
+                        'id': card_match.group(1),
+                        'html': card_html,
+                        'search': search_text.casefold(),
+                    })
+                paged_tabs[tab_name] = {
+                    'cards': cards,
+                    'tail': card_pattern.sub(
+                        '', fragments[tab_name]
+                    ).strip(),
+                }
+            shell = pattern.sub(
+                map_skeleton if tab_name == 'map' else skeleton,
+                shell,
+                count=1,
+            )
+        return shell, fragments, details, paged_tabs
+
+    def _page_snapshot(self):
+        """Render one full snapshot, then serve a thin shell and lazy fragments."""
+        model = self._web_page_model()
+        whitelist = (
+            self._get_whitelist()
+            if self._module_enabled('whitelist') else []
+        )
         show_wpa = bool(
-            self._module_enabled('wpa_sec') and self.options.get('wpa_sec_key')
+            self._module_enabled('wpa_sec')
+            and self.options.get('wpa_sec_key')
         )
+        with self.web_data_cache_lock:
+            model_key = self.web_data_cache_key
+        snapshot_key = (
+            model_key,
+            show_wpa,
+            tuple(whitelist),
+        )
+        now = time.monotonic()
+        maximum_age = max(
+            0,
+            self._option_int('web_snapshot_seconds', 5),
+        )
+        with self.web_snapshot_lock:
+            cached = self.web_snapshot_cache
+            if (
+                cached
+                and cached['key'] == snapshot_key
+                and maximum_age
+                and now - cached['created_at'] <= maximum_age
+            ):
+                return cached
 
-        notification_duration_ms = max(
-            250,
-            min(
-                self._option_int('web_notification_duration_ms', 2600),
-                60000,
+            gps_status = self._gps_status()
+            ohc_status = self._ohc_status()
+            wpa_status = self._wpa_status()
+            health_issues = self._health_issues(
+                gps_status, ohc_status, wpa_status
+            )
+            snapshot_id = hashlib.sha256(
+                repr(snapshot_key).encode('utf-8')
+            ).hexdigest()[:20]
+            notification_duration_ms = max(
+                250,
+                min(
+                    self._option_int(
+                        'web_notification_duration_ms', 2600
+                    ),
+                    60000,
+                ),
+            )
+            rendered = self._render_cached_template(
+                groups=model['groups'],
+                cracked=model['cracked'],
+                notif=None,
+                ntype=None,
+                tab='__PWMENU_TAB__',
+                stats=model['stats'],
+                ach=model['achievements']['badges'],
+                token='__PWMENU_CSRF__',
+                show_wpa=show_wpa,
+                map_points=[],
+                gps_status=gps_status,
+                no_gps_networks=[],
+                ohc_status=ohc_status,
+                wpa_status=wpa_status,
+                pot_health=model['pot_health'],
+                cleanup_report=model['cleanup_report'],
+                conflicts=model['conflicts'],
+                activity_history=model['activity_history'],
+                whitelist=whitelist,
+                notification_duration_ms=notification_duration_ms,
+                snapshot_id=snapshot_id,
+                web_background_preload=self._option_bool(
+                    'web_background_preload', True
+                ),
+                web_background_batch_size=max(
+                    2,
+                    min(
+                        self._option_int(
+                            'web_background_batch_size', 12
+                        ),
+                        24,
+                    ),
+                ),
+                web_background_batch_delay_ms=max(
+                    50,
+                    min(
+                        self._option_int(
+                            'web_background_batch_delay_ms', 120
+                        ),
+                        5000,
+                    ),
+                ),
+                web_foreground_batch_size=max(
+                    2,
+                    min(
+                        self._option_int(
+                            'web_foreground_batch_size', 24
+                        ),
+                        100,
+                    ),
+                ),
+                web_foreground_batch_delay_ms=max(
+                    25,
+                    min(
+                        self._option_int(
+                            'web_foreground_batch_delay_ms', 50
+                        ),
+                        5000,
+                    ),
+                ),
+                health_issues=health_issues,
+                ui_revision=self.__ui_revision__,
+            )
+            shell, fragments, details, paged_tabs = (
+                self._snapshot_sections(rendered)
+            )
+            snapshot = {
+                'key': snapshot_key,
+                'id': snapshot_id,
+                'created_at': now,
+                'shell': shell,
+                'fragments': fragments,
+                'details': details,
+                'paged_tabs': paged_tabs,
+                'map_points': model['map_points'],
+                'no_gps_networks': model['no_gps_networks'],
+                'gps_status': gps_status,
+                'health_issues': health_issues,
+            }
+            previous = self.web_snapshot_cache
+            if previous and previous.get('id') != snapshot_id:
+                self.web_snapshot_history[previous['id']] = previous
+            newest = sorted(
+                self.web_snapshot_history.values(),
+                key=lambda item: float(item.get('created_at', 0)),
+                reverse=True,
+            )[:4]
+            self.web_snapshot_history = {
+                item['id']: item for item in newest
+            }
+            self.web_snapshot_cache = snapshot
+            return snapshot
+
+    def _snapshot_for_request(self, request=None):
+        requested = ''
+        if request is not None:
+            requested = str(
+                request.args.get('snapshot') or ''
+            ).strip()
+        if requested:
+            with self.web_snapshot_lock:
+                current = self.web_snapshot_cache
+                if current and current.get('id') == requested:
+                    return current
+                historical = self.web_snapshot_history.get(requested)
+                if historical:
+                    return historical
+        return self._page_snapshot()
+
+    def _json_response(self, payload, status=200):
+        body = json.dumps(
+            payload,
+            ensure_ascii=False,
+            separators=(',', ':'),
+        ).encode('utf-8')
+        response = make_response(body, status)
+        response.headers['Content-Type'] = (
+            'application/json; charset=utf-8'
+        )
+        response.headers['Cache-Control'] = 'no-store'
+        response.headers['Vary'] = 'Accept-Encoding'
+        accepts_gzip = (
+            has_request_context()
+            and flask_request.accept_encodings['gzip'] > 0
+        )
+        if accepts_gzip and len(body) >= 1024:
+            compressed = gzip.compress(body, compresslevel=1)
+            if len(compressed) < len(body):
+                response.set_data(compressed)
+                response.headers['Content-Encoding'] = 'gzip'
+                response.headers['Content-Length'] = str(len(compressed))
+        return response
+
+    def _tab_fragment_response(self, tab_name, request=None):
+        if tab_name not in ('cracked', 'handshakes', 'map', 'other'):
+            return self._json_response(
+                {'ok': False, 'message': 'Unknown tab'}, 404
+            )
+        snapshot = self._snapshot_for_request(request)
+        token = generate_csrf() if generate_csrf else ''
+        fragment = snapshot['fragments'][tab_name]
+        page_number = 1
+        page_size = max(
+            2,
+            min(self._option_int('web_page_size', 24), 100),
+        )
+        total = 0
+        has_more = False
+        detail_ids = []
+        query = ''
+        start = 0
+        if tab_name in snapshot.get('paged_tabs', {}):
+            if request is not None:
+                try:
+                    page_number = max(
+                        1, int(request.args.get('page') or 1)
+                    )
+                except (TypeError, ValueError):
+                    page_number = 1
+                try:
+                    requested_size = int(
+                        request.args.get('limit') or page_size
+                    )
+                    page_size = max(2, min(requested_size, 100))
+                except (TypeError, ValueError):
+                    pass
+                query = str(request.args.get('q') or '').strip()[:128]
+            paged = snapshot['paged_tabs'][tab_name]
+            cards = paged['cards']
+            if query:
+                query_key = query.casefold()
+                cards = [
+                    card for card in cards
+                    if query_key in card['search']
+                ]
+            total = len(cards)
+            if (
+                request is not None
+                and request.args.get('offset') is not None
+            ):
+                try:
+                    start = max(
+                        0, int(request.args.get('offset') or 0)
+                    )
+                except (TypeError, ValueError):
+                    start = 0
+                page_number = start // page_size + 1
+            else:
+                start = (page_number - 1) * page_size
+            selected = cards[start:start + page_size]
+            detail_ids = [card['id'] for card in selected]
+            has_more = start + len(selected) < total
+            fragment = ''.join(card['html'] for card in selected)
+            if not has_more:
+                if not selected and query:
+                    fragment += (
+                        '<div class="pwmenu-page-empty">'
+                        'No matching networks.</div>'
+                    )
+                fragment += paged['tail']
+        payload = {
+            'ok': True,
+            'tab': tab_name,
+            'snapshotId': snapshot['id'],
+            'html': fragment.replace(
+                '__PWMENU_CSRF__', token
             ),
-        )
-        html = self._render_cached_template(
-            groups=groups, cracked=cracked, notif=notification, ntype=notif_type,
-            tab=active_tab, stats=stats, ach=ach['badges'], token=tok,
-            show_wpa=show_wpa, map_points=map_points, gps_status=gps_status,
-            no_gps_networks=no_gps_networks, ohc_status=ohc_status,
-            wpa_status=wpa_status,
-            pot_health=pot_health, cleanup_report=cleanup_report,
-            whitelist=whitelist,
-            notification_duration_ms=notification_duration_ms,
-        )
+            'page': page_number,
+            'pageSize': page_size,
+            'total': total,
+            'hasMore': has_more,
+            'nextPage': page_number + 1 if has_more else None,
+            'offset': start,
+            'nextOffset': start + len(detail_ids),
+            'detailIds': detail_ids,
+            'query': query,
+        }
+        if tab_name == 'map':
+            payload.update({
+                'mapPoints': snapshot['map_points'],
+                'noGpsNetworks': snapshot['no_gps_networks'],
+                'gpsStatus': snapshot['gps_status'],
+            })
+        return self._json_response(payload)
 
-        return self._html_response(html)
+    def _detail_fragment_response(
+        self, request, detail_kind, detail_id
+    ):
+        if detail_kind not in ('cracked', 'handshake'):
+            return self._json_response(
+                {'ok': False, 'message': 'Unknown detail type'}, 404
+            )
+        if not re.fullmatch(r'\d{1,6}', str(detail_id or '')):
+            return self._json_response(
+                {'ok': False, 'message': 'Invalid detail id'}, 400
+            )
+        snapshot = self._snapshot_for_request(request)
+        requested_snapshot = str(
+            request.args.get('snapshot') or ''
+        )
+        if (
+            requested_snapshot
+            and requested_snapshot != snapshot['id']
+        ):
+            return self._json_response({
+                'ok': False,
+                'reload': True,
+                'snapshotId': snapshot['id'],
+                'message': 'Capture data changed; refreshing the tab',
+            }, 409)
+        fragment = snapshot['details'].get(
+            detail_kind, {}
+        ).get(str(detail_id))
+        if fragment is None:
+            return self._json_response(
+                {'ok': False, 'message': 'Detail was not found'}, 404
+            )
+        token = generate_csrf() if generate_csrf else ''
+        return self._json_response({
+            'ok': True,
+            'snapshotId': snapshot['id'],
+            'html': fragment.replace('__PWMENU_CSRF__', token),
+        })
+
+    def _details_fragment_response(self, request, tab_name):
+        detail_kind = {
+            'cracked': 'cracked',
+            'handshakes': 'handshake',
+        }.get(str(tab_name or ''))
+        if not detail_kind:
+            return self._json_response(
+                {'ok': False, 'message': 'This tab has no card details'},
+                404,
+            )
+        snapshot = self._snapshot_for_request(request)
+        requested_snapshot = str(request.args.get('snapshot') or '')
+        if requested_snapshot and requested_snapshot != snapshot['id']:
+            return self._json_response({
+                'ok': False,
+                'reload': True,
+                'snapshotId': snapshot['id'],
+                'message': 'Capture data changed; refreshing the tab',
+            }, 409)
+        token = generate_csrf() if generate_csrf else ''
+        available = snapshot['details'].get(detail_kind, {})
+        requested_ids = []
+        for raw_id in str(request.args.get('ids') or '').split(','):
+            value = raw_id.strip()
+            if re.fullmatch(r'\d{1,6}', value):
+                requested_ids.append(value)
+            if len(requested_ids) >= 100:
+                break
+        selected_ids = (
+            list(dict.fromkeys(requested_ids))
+            if requested_ids else list(available)
+        )
+        details = {
+            detail_id: available[detail_id].replace(
+                '__PWMENU_CSRF__', token
+            )
+            for detail_id in selected_ids
+            if detail_id in available
+        }
+        return self._json_response({
+            'ok': True,
+            'tab': tab_name,
+            'kind': detail_kind,
+            'snapshotId': snapshot['id'],
+            'details': details,
+        })
 
     def _render_cached_template(self, **context):
         """Compile the large Jinja template once per Flask environment."""
@@ -998,7 +2202,9 @@ class A_pwmenu(plugins.Plugin):
                 self.web_template is None
                 or self.web_template_environment is not environment
             ):
-                self.web_template = environment.from_string(self._get_html())
+                self.web_template = environment.from_string(
+                    self._web_resources()['page']
+                )
                 self.web_template_environment = environment
             template = self.web_template
         return template.render(context)
@@ -1009,7 +2215,24 @@ class A_pwmenu(plugins.Plugin):
         r = make_response(body)
         r.headers["Content-Type"] = "text/html; charset=utf-8"
         r.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+        r.headers["Pragma"] = "no-cache"
+        r.headers["Expires"] = "0"
+        r.headers["X-PWMenu-UI-Revision"] = self.__ui_revision__
         r.headers["Vary"] = "Accept-Encoding"
+        if (
+            has_request_context()
+            and flask_request.cookies.get('pwmenu_ui_revision')
+            != self.__ui_revision__
+        ):
+            r.headers['Clear-Site-Data'] = '"cache"'
+            r.set_cookie(
+                'pwmenu_ui_revision',
+                self.__ui_revision__,
+                max_age=31536000,
+                httponly=True,
+                samesite='Lax',
+                path='/plugins/A_pwmenu/',
+            )
 
         accepts_gzip = (
             has_request_context()
@@ -1026,6 +2249,845 @@ class A_pwmenu(plugins.Plugin):
                 r.headers["Content-Encoding"] = "gzip"
                 r.headers["Content-Length"] = str(len(compressed))
         return r
+
+    def _critical_web_css(self):
+        return """
+        :root{--bg:#050607;--text:#f3f6f7;--sub:#899095;--accent:#20e4f4}
+        *{box-sizing:border-box}
+        html,body{min-height:100%;margin:0;background:var(--bg);color:var(--text)}
+        body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+        .pwmenu-shell-loading{min-height:100vh;padding:18px;display:grid;place-items:center}
+        .pwmenu-shell-loading i{width:34px;height:34px;border:3px solid rgba(255,255,255,.12);border-top-color:var(--accent);border-radius:50%;animation:pwboot .75s linear infinite}
+        .pwmenu-tab-skeleton{display:grid;gap:10px;padding:8px 0}
+        .pwmenu-tab-skeleton i{display:block;height:86px;border-radius:18px;background:linear-gradient(90deg,#111518,#1b2225,#111518);background-size:200% 100%;animation:pwshimmer 1.1s linear infinite}
+        .pwmenu-map-loading{min-height:min(72vh,720px);display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;border:1px solid rgba(255,255,255,.08);border-radius:24px;background:radial-gradient(circle at center,rgba(32,228,244,.08),transparent 30%),linear-gradient(rgba(255,255,255,.025) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.025) 1px,transparent 1px),#090c0e;background-size:auto,34px 34px,34px 34px;color:var(--text);text-align:center}
+        .pwmenu-map-loading-core{width:58px;height:58px;margin-bottom:8px;display:grid;place-items:center;border:1px solid rgba(32,228,244,.28);border-radius:50%;box-shadow:0 0 28px rgba(32,228,244,.12)}
+        .pwmenu-map-loading-core i{width:18px;height:18px;border-radius:50%;background:var(--accent);box-shadow:0 0 0 0 rgba(32,228,244,.45);animation:pwmapload 1.35s ease-out infinite}
+        .pwmenu-map-loading b{font-size:15px;letter-spacing:.02em}
+        .pwmenu-map-loading span{font-size:12px;color:var(--sub)}
+        .pwmenu-load-error{margin:18px 0;padding:22px;border:1px solid rgba(255,255,255,.1);border-radius:18px;background:#0e1214;text-align:center}
+        .pwmenu-load-error b{display:block;margin-bottom:12px}
+        .pwmenu-load-error button{border:0;border-radius:12px;padding:9px 16px;background:var(--accent);font-weight:800}
+        .pwmenu-detail-loading{padding:18px;color:var(--sub);text-align:center}
+        .pwmenu-page-more{grid-column:1/-1;display:flex;justify-content:center;padding:14px 0 4px}
+        .pwmenu-page-more button{min-width:170px;padding:11px 18px;border:1px solid rgba(32,228,244,.28);border-radius:14px;background:#0d1315;color:var(--text);font:inherit;cursor:pointer}
+        .pwmenu-page-more button b,.pwmenu-page-more button span{display:block}
+        .pwmenu-page-more button span{margin-top:2px;color:var(--sub);font-size:11px}
+        .pwmenu-page-more.loading{opacity:.55;pointer-events:none}
+        .pwmenu-card-placeholder{min-height:92px!important;display:flex;flex-direction:column;justify-content:center;gap:10px;padding:20px!important;pointer-events:none;background:linear-gradient(110deg,rgba(255,255,255,.025) 20%,rgba(255,255,255,.065) 36%,rgba(255,255,255,.025) 52%)!important;background-size:240% 100%!important;animation:pwplaceholder 1.6s ease-in-out infinite}
+        .pwmenu-card-placeholder-line{width:44%;height:9px;border-radius:999px;background:rgba(255,255,255,.075)}
+        .pwmenu-card-placeholder-line.wide{width:68%;height:13px}
+        .pwmenu-card-placeholder.stale{animation:none;opacity:.4}
+        .pwmenu-card-arrival{animation:pwcardarrival .42s ease-out both}
+        @keyframes pwplaceholder{0%{background-position:120% 0}100%{background-position:-120% 0}}
+        @keyframes pwcardarrival{from{opacity:0;transform:translateY(7px)}to{opacity:1;transform:none}}
+        .pwmenu-page-empty{grid-column:1/-1;padding:38px 14px;color:var(--sub);text-align:center}
+        .backup-actions{display:grid;grid-template-columns:1fr 1fr;gap:9px;margin-top:13px}
+        .backup-actions .btn{margin:0}
+        .backup-restore-button{background:#20262a!important}
+        .backup-warning{margin-top:10px;padding:9px 10px;border:1px solid rgba(255,159,10,.28);border-radius:11px;background:rgba(255,159,10,.07);color:#d8b47a;font-size:11px;line-height:1.4}
+        .health-panel{margin:0 0 14px;border:1px solid rgba(255,159,10,.38);border-radius:16px;background:rgba(255,159,10,.07);overflow:hidden}
+        .health-panel summary{display:flex;align-items:center;justify-content:space-between;padding:12px 14px;cursor:pointer;list-style:none}
+        .health-panel summary::-webkit-details-marker{display:none}
+        .health-panel summary span{display:flex;align-items:center;gap:9px}
+        .health-panel summary span>i{width:8px;height:8px;border-radius:50%;background:#ff9f0a;box-shadow:0 0 14px rgba(255,159,10,.55)}
+        .health-panel summary strong{min-width:25px;padding:3px 7px;border-radius:999px;background:#ff9f0a;color:#111;text-align:center;font-size:11px}
+        .health-issue-list{padding:0 8px 8px}
+        .health-issue{width:100%;display:flex;align-items:center;justify-content:space-between;gap:10px;padding:10px;border:0;border-top:1px solid rgba(255,255,255,.07);background:transparent;color:var(--text);text-align:left;cursor:pointer}
+        .health-issue span,.health-issue b,.health-issue small{display:block}
+        .health-issue small{margin-top:3px;color:var(--sub);font-size:11px}
+        .health-issue>i{color:#ff9f0a;font-size:22px;font-style:normal}
+        @media(max-width:520px){.backup-actions{grid-template-columns:1fr}}
+        @keyframes pwboot{to{transform:rotate(360deg)}}
+        @keyframes pwshimmer{to{background-position:-200% 0}}
+        @keyframes pwmapload{70%,100%{box-shadow:0 0 0 22px rgba(32,228,244,0)}}
+        """
+
+    def _replace_web_svgs(self, source, symbols):
+        asset_url = (
+            '/plugins/A_pwmenu/assets/icons.svg'
+            '?h=__PWMENU_ICON_REV__'
+        )
+        pattern = re.compile(
+            r'<svg(?P<attrs>[^>]*)>(?P<body>.*?)</svg>',
+            re.DOTALL | re.IGNORECASE,
+        )
+
+        def replace(match):
+            attrs = match.group('attrs')
+            body = match.group('body')
+            viewbox_match = re.search(
+                r'\bviewBox\s*=\s*["\']([^"\']+)["\']',
+                attrs,
+                re.IGNORECASE,
+            )
+            if not viewbox_match:
+                return match.group(0)
+            viewbox = viewbox_match.group(1)
+            digest = hashlib.sha256(
+                (viewbox + '\0' + body).encode('utf-8')
+            ).hexdigest()[:12]
+            symbol_id = f'pw-{digest}'
+            symbols.setdefault(
+                symbol_id,
+                f'<symbol id="{symbol_id}" viewBox="{viewbox}">'
+                f'{body}</symbol>',
+            )
+            return (
+                f'<svg{attrs}><use href="{asset_url}#{symbol_id}">'
+                '</use></svg>'
+            )
+
+        return pattern.sub(replace, source)
+
+    def _web_resources(self):
+        """Split the single-file UI into immutable browser-cached resources."""
+        with self.web_resource_lock:
+            if self.web_resource_cache is not None:
+                return self.web_resource_cache
+
+            page = self._get_html()
+            style_match = re.search(
+                r'<style>(?P<body>.*?)</style>',
+                page,
+                re.DOTALL | re.IGNORECASE,
+            )
+            scripts = list(re.finditer(
+                r'<script>(?P<body>.*?)</script>',
+                page,
+                re.DOTALL | re.IGNORECASE,
+            ))
+            if not style_match or not scripts:
+                # Keep lightweight template overrides usable for diagnostics
+                # and downstream integrations which deliberately replace the
+                # bundled UI with a minimal Jinja page.
+                self.web_resource_cache = {
+                    'page': page,
+                    'app.css': '',
+                    'app.js': '',
+                    'icons.svg': '',
+                    'encoded': {},
+                }
+                return self.web_resource_cache
+
+            css = style_match.group('body').strip()
+            script_match = scripts[-1]
+            javascript = script_match.group('body').strip()
+            dynamic_lines = """const csrfToken = '{{ token }}';
+        const wpaEnabled = {{ 'true' if show_wpa else 'false' }};
+        let mapPoints = {{ map_points|tojson }};
+        let noGpsNetworks = {{ no_gps_networks|tojson }};
+        const gpsStatus = {{ gps_status|tojson }};
+        const whitelistedNetworks = new Set({{ whitelist|tojson }});
+        const notificationDurationMs = {{ notification_duration_ms }};
+        const backgroundBatchSize = {{ web_background_batch_size|default(12) }};
+        const backgroundBatchDelayMs = {{ web_background_batch_delay_ms|default(120) }};
+        const foregroundBatchSize = {{ web_foreground_batch_size|default(24) }};
+        const foregroundBatchDelayMs = {{ web_foreground_batch_delay_ms|default(50) }};"""
+            static_lines = """const bootstrap = window.PWMenuBootstrap || {};
+        const csrfToken = String(bootstrap.csrfToken || '');
+        const wpaEnabled = !!bootstrap.wpaEnabled;
+        let mapPoints = Array.isArray(bootstrap.mapPoints) ? bootstrap.mapPoints : [];
+        let noGpsNetworks = Array.isArray(bootstrap.noGpsNetworks) ? bootstrap.noGpsNetworks : [];
+        let gpsStatus = bootstrap.gpsStatus || {};
+        const whitelistedNetworks = new Set(bootstrap.whitelist || []);
+        const notificationDurationMs = Number(bootstrap.notificationDurationMs || 2600);
+        const backgroundBatchSize = Math.max(2, Number(bootstrap.backgroundBatchSize || 12));
+        const backgroundBatchDelayMs = Math.max(50, Number(bootstrap.backgroundBatchDelayMs || 120));
+        const foregroundBatchSize = Math.max(backgroundBatchSize, Number(bootstrap.foregroundBatchSize || 24));
+        const foregroundBatchDelayMs = Math.max(25, Number(bootstrap.foregroundBatchDelayMs || 50));
+        let currentSnapshotId = String(bootstrap.snapshotId || '');
+        const loadedTabs = new Set();
+        const loadingTabs = new Map();
+        const tabPageState = new Map();
+        const tabBackfillTasks = new Map();
+        const tabRequestGeneration = new Map();
+        const detailHtmlCache = new Map();
+        const loadingDetailBatches = new Map();
+        let tabSearchTimer = null;"""
+            if dynamic_lines not in javascript:
+                raise RuntimeError('PWMenu dynamic JavaScript block was not found')
+            javascript = javascript.replace(
+                dynamic_lines, static_lines, 1
+            )
+            javascript = javascript.replace(
+                "        const t0 = '{{ tab }}';",
+                "        const t0 = String(bootstrap.tab || 'cracked');",
+                1,
+            )
+            javascript = javascript.replace(
+                """        initAccentPicker();
+        tab(t0);
+        startPhoneGps(false);
+        updateGpsStatusDot();
+        renderMap();""",
+                """        initAccentPicker();
+        tab(t0);
+        startPhoneGps(false);
+        updateGpsStatusDot();
+        scheduleBackgroundPreload();""",
+                1,
+            )
+
+            css_url = (
+                '/plugins/A_pwmenu/assets/app.css'
+                '?h=__PWMENU_CSS_REV__'
+            )
+            resource_links = (
+                '<style>' + self._critical_web_css() + '</style>'
+                f'<link rel="preload" href="{css_url}" as="style" '
+                'onload="this.onload=null;this.rel=\'stylesheet\'">'
+                f'<noscript><link rel="stylesheet" href="{css_url}">'
+                '</noscript>'
+            )
+            page = (
+                page[:style_match.start()]
+                + resource_links
+                + page[style_match.end():script_match.start()]
+                + """
+    <script>
+        window.PWMenuBootstrap = {
+            csrfToken: {{ token|tojson }},
+            wpaEnabled: {{ 'true' if show_wpa else 'false' }},
+            mapPoints: [],
+            noGpsNetworks: [],
+            gpsStatus: {{ gps_status|tojson }},
+            whitelist: {{ whitelist|tojson }},
+            notificationDurationMs: {{ notification_duration_ms }},
+            tab: {{ tab|tojson }},
+            snapshotId: {{ snapshot_id|default('')|tojson }},
+            backgroundPreload: {{ 'true' if web_background_preload|default(true) else 'false' }}
+            ,backgroundBatchSize: {{ web_background_batch_size|default(12) }}
+            ,backgroundBatchDelayMs: {{ web_background_batch_delay_ms|default(120) }}
+            ,foregroundBatchSize: {{ web_foreground_batch_size|default(24) }}
+            ,foregroundBatchDelayMs: {{ web_foreground_batch_delay_ms|default(50) }}
+        };
+    </script>
+    <script defer src="/plugins/A_pwmenu/assets/app.js?h=__PWMENU_JS_REV__"></script>
+"""
+                + page[script_match.end():]
+            )
+
+            symbols = {}
+            page = self._replace_web_svgs(page, symbols)
+            javascript = self._replace_web_svgs(javascript, symbols)
+            sprite = (
+                '<svg xmlns="http://www.w3.org/2000/svg">'
+                '<defs>' + ''.join(symbols.values()) + '</defs></svg>'
+            )
+            icon_revision = hashlib.sha256(
+                sprite.encode('utf-8')
+            ).hexdigest()[:12]
+            page = page.replace(
+                '__PWMENU_ICON_REV__', icon_revision
+            )
+            javascript = javascript.replace(
+                '__PWMENU_ICON_REV__', icon_revision
+            )
+            css_revision = hashlib.sha256(
+                css.encode('utf-8')
+            ).hexdigest()[:12]
+            javascript_revision = hashlib.sha256(
+                javascript.encode('utf-8')
+            ).hexdigest()[:12]
+            page = (
+                page
+                .replace('__PWMENU_CSS_REV__', css_revision)
+                .replace('__PWMENU_JS_REV__', javascript_revision)
+            )
+            resources = {
+                'page': page,
+                'app.css': css,
+                'app.js': javascript,
+                'icons.svg': sprite,
+            }
+            encoded = {}
+            mime_types = {
+                'app.css': 'text/css; charset=utf-8',
+                'app.js': 'application/javascript; charset=utf-8',
+                'icons.svg': 'image/svg+xml; charset=utf-8',
+            }
+            for name, mime_type in mime_types.items():
+                body = resources[name].encode('utf-8')
+                encoded[name] = {
+                    'body': body,
+                    'gzip': gzip.compress(body, compresslevel=1),
+                    'etag': hashlib.sha256(body).hexdigest(),
+                    'mime': mime_type,
+                }
+            resources['encoded'] = encoded
+            self.web_resource_cache = resources
+            return resources
+
+    def _serve_web_asset(self, name, request):
+        resource = self._web_resources()['encoded'].get(name)
+        if resource is None:
+            return make_response('Not found', 404)
+        etag = f'"{resource["etag"]}"'
+        if request.headers.get('If-None-Match') == etag:
+            response = make_response('', 304)
+        else:
+            use_gzip = request.accept_encodings['gzip'] > 0
+            body = resource['gzip'] if use_gzip else resource['body']
+            response = make_response(body)
+            response.headers['Content-Type'] = resource['mime']
+            response.headers['Content-Length'] = str(len(body))
+            if use_gzip:
+                response.headers['Content-Encoding'] = 'gzip'
+        response.headers['ETag'] = etag
+        response.headers['Cache-Control'] = (
+            'public, max-age=31536000, immutable'
+        )
+        response.headers['Vary'] = 'Accept-Encoding'
+        return response
+
+    def _backup_sources(self):
+        sources = [
+            ('config/config.toml', self.config_path),
+            ('state/a_pwmenu_data.json', self.data_file),
+            ('state/ohc_export.json', self.ohc_export_file),
+            ('credentials/ohc.potfile', self.potfile_ohc),
+            (
+                'credentials/handshake-lab.potfile',
+                self.potfile_handshake_lab,
+            ),
+            ('credentials/manual.potfile', self.potfile_manual),
+        ]
+        if not os.path.isfile(self.data_file):
+            sources[1] = (
+                'state/a_pwmenu_data.json',
+                self.data_file + '.bak',
+            )
+        for index, directory in enumerate(self.handshake_dirs):
+            sources.append((
+                f'credentials/wpa-sec-{index}.potfile',
+                os.path.join(directory, 'wpa-sec.cracked.potfile'),
+            ))
+            try:
+                with os.scandir(directory) as iterator:
+                    file_names = sorted(
+                        entry.name for entry in iterator
+                        if entry.is_file(follow_symlinks=False)
+                    )
+            except OSError:
+                file_names = []
+            supported_sidecars = set()
+            for capture_name in (
+                name for name in file_names
+                if name.lower().endswith('.pcap')
+            ):
+                base_name = os.path.splitext(capture_name)[0]
+                supported_sidecars.update((
+                    capture_name + '.gps.json',
+                    capture_name + '.geo.json',
+                    capture_name + '.json',
+                    base_name + '.gps.json',
+                    base_name + '.geo.json',
+                    base_name + '.json',
+                ))
+            for name in file_names:
+                if name.lower().endswith('.pcap'):
+                    sources.append((
+                        f'captures/{index}/{name}',
+                        os.path.join(directory, name),
+                    ))
+                if name not in supported_sidecars:
+                    continue
+                sources.append((
+                    f'locations/{index}/{name}',
+                    os.path.join(directory, name),
+                ))
+        unique = []
+        seen = set()
+        for logical_name, path in sources:
+            absolute = os.path.abspath(path)
+            if absolute in seen or not os.path.isfile(absolute):
+                continue
+            seen.add(absolute)
+            unique.append((logical_name, absolute))
+        return unique
+
+    def _backup_size_limit(self):
+        return max(
+            1048576,
+            min(
+                self._option_int(
+                    'backup_max_bytes', 2147483648
+                ),
+                4294967296,
+            ),
+        )
+
+    def _build_backup_file(self):
+        maximum = max(
+            1048576, self._backup_size_limit()
+        )
+        sources = self._backup_sources()
+        if len(sources) > 5000:
+            raise ValueError('Backup contains too many files')
+        records = []
+        total = 0
+        for logical_name, path in sources:
+            try:
+                size = os.path.getsize(path)
+            except OSError as error:
+                raise ValueError(
+                    f'Could not inspect backup source {logical_name}: {error}'
+                )
+            total += max(0, int(size))
+            if total > maximum:
+                raise ValueError(
+                    'Backup data exceeds the configured size limit'
+                )
+            try:
+                digest = hashlib.sha256()
+                with open(path, 'rb') as handle:
+                    while True:
+                        chunk = handle.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        digest.update(chunk)
+            except OSError as error:
+                raise ValueError(
+                    f'Could not read backup source {logical_name}: {error}'
+                )
+            records.append({
+                'name': logical_name,
+                'path': path,
+                'size': size,
+                'sha256': digest.hexdigest(),
+            })
+
+        manifest = {
+            'format': 'newfpv-pwmenu-backup-v1',
+            'plugin_version': self.__version__,
+            'created_at': int(time.time()),
+            'files': [
+                {
+                    'name': record['name'],
+                    'size': record['size'],
+                    'sha256': record['sha256'],
+                }
+                for record in records
+            ],
+        }
+        output = tempfile.SpooledTemporaryFile(
+            max_size=max(
+                1048576,
+                min(
+                    self._option_int(
+                        'archive_memory_limit', 2097152
+                    ),
+                    16777216,
+                ),
+            ),
+            mode='w+b',
+        )
+        with zipfile.ZipFile(
+            output, 'w', zipfile.ZIP_DEFLATED, compresslevel=6
+        ) as archive:
+            archive.writestr(
+                'manifest.json',
+                json.dumps(
+                    manifest,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(',', ':'),
+                ).encode('utf-8'),
+            )
+            for record in records:
+                archive.write(
+                    record['path'],
+                    'data/' + record['name'],
+                )
+        output.seek(0, os.SEEK_END)
+        archive_size = output.tell()
+        if archive_size > maximum:
+            output.close()
+            raise ValueError(
+                'Compressed backup exceeds the configured size limit'
+            )
+        output.seek(0)
+        return output, len(records), archive_size
+
+    def _build_backup_archive(self):
+        output, count, _ = self._build_backup_file()
+        try:
+            return output.read(), count
+        finally:
+            output.close()
+
+    def _serve_backup(self, request):
+        try:
+            with self.backup_lock:
+                archive, file_count, archive_size = (
+                    self._build_backup_file()
+                )
+            stamp = datetime.datetime.utcnow().strftime(
+                '%Y%m%d-%H%M%S'
+            )
+            response = send_file(
+                archive,
+                mimetype='application/zip',
+                as_attachment=True,
+                download_name=(
+                    f'PWMenu-backup-{stamp}.pwmenu-backup'
+                ),
+            )
+            response.headers['Content-Length'] = str(archive_size)
+            response.headers['Cache-Control'] = 'no-store'
+            response.headers['X-Content-Type-Options'] = 'nosniff'
+            response.headers['X-PWMenu-Backup-Files'] = str(file_count)
+            logging.info(
+                f'[A_pwmenu] Created backup with '
+                f'{file_count} file(s)'
+            )
+            self._record_action(
+                'backup',
+                'PWMenu backup downloaded',
+                f'{file_count} file(s) · {archive_size} byte(s)',
+            )
+            return response
+        except (OSError, ValueError, zipfile.BadZipFile) as error:
+            logging.warning(
+                f'[A_pwmenu] Backup failed: {error}'
+            )
+            if request.headers.get('X-PWMenu-Async') == '1':
+                return self._json_response({
+                    'ok': False,
+                    'message': str(error),
+                }, 400)
+            return self._render_page(
+                notification=str(error),
+                notif_type='error',
+                active_tab='other',
+            )
+
+    def _backup_restore_target(self, logical_name):
+        fixed = {
+            'config/config.toml': self.config_path,
+            'state/a_pwmenu_data.json': self.data_file,
+            'state/ohc_export.json': self.ohc_export_file,
+            'credentials/ohc.potfile': self.potfile_ohc,
+            'credentials/handshake-lab.potfile': (
+                self.potfile_handshake_lab
+            ),
+            'credentials/manual.potfile': self.potfile_manual,
+        }
+        if logical_name in fixed:
+            return os.path.abspath(fixed[logical_name])
+        wpa_match = re.fullmatch(
+            r'credentials/wpa-sec-(\d{1,3})\.potfile',
+            logical_name,
+        )
+        if wpa_match:
+            index = int(wpa_match.group(1))
+            if index >= len(self.handshake_dirs):
+                raise ValueError(
+                    'Backup references an unavailable handshake directory'
+                )
+            return os.path.abspath(os.path.join(
+                self.handshake_dirs[index],
+                'wpa-sec.cracked.potfile',
+            ))
+        capture_match = re.fullmatch(
+            r'captures/(\d{1,3})/([^/\\]+\.pcap)',
+            logical_name,
+            re.IGNORECASE,
+        )
+        if capture_match:
+            index = int(capture_match.group(1))
+            name = self._safe_handshake_name(
+                capture_match.group(2)
+            )
+            if index >= len(self.handshake_dirs) or not name:
+                raise ValueError(
+                    'Backup contains an invalid capture destination'
+                )
+            return os.path.abspath(os.path.join(
+                self.handshake_dirs[index], name
+            ))
+        location_match = re.fullmatch(
+            r'locations/(\d{1,3})/([^/\\]+)',
+            logical_name,
+        )
+        if location_match:
+            index = int(location_match.group(1))
+            name = location_match.group(2)
+            if (
+                index >= len(self.handshake_dirs)
+                or name != os.path.basename(name)
+                or not name.lower().endswith('.json')
+            ):
+                raise ValueError(
+                    'Backup contains an invalid location sidecar'
+                )
+            return os.path.abspath(os.path.join(
+                self.handshake_dirs[index], name
+            ))
+        raise ValueError(
+            f'Backup contains unsupported data: {logical_name}'
+        )
+
+    def _atomic_restore_file(self, target, content):
+        return self._atomic_restore_stream(
+            target, io.BytesIO(content)
+        )
+
+    def _atomic_restore_stream(self, target, source):
+        directory = os.path.dirname(target)
+        os.makedirs(directory, exist_ok=True)
+        mode = 0o600
+        try:
+            mode = os.stat(target).st_mode & 0o777
+        except OSError:
+            pass
+        descriptor, temporary = tempfile.mkstemp(
+            prefix='.pwmenu-restore-', dir=directory
+        )
+        try:
+            with os.fdopen(descriptor, 'wb') as handle:
+                while True:
+                    chunk = source.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    handle.write(chunk)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.chmod(temporary, mode)
+            os.replace(temporary, target)
+            try:
+                flags = os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0)
+                directory_fd = os.open(directory, flags)
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+            except OSError:
+                pass
+        finally:
+            try:
+                if os.path.exists(temporary):
+                    os.remove(temporary)
+            except OSError:
+                pass
+
+    def _restore_backup(self, request):
+        uploaded = request.files.get('file')
+        if uploaded is None or not uploaded.filename:
+            return False, 'Select a .pwmenu-backup file'
+        owned_stream = None
+        try:
+            maximum = self._backup_size_limit()
+            source = uploaded.stream
+            try:
+                source.seek(0, os.SEEK_END)
+                archive_size = source.tell()
+                source.seek(0)
+            except (AttributeError, OSError):
+                owned_stream = tempfile.SpooledTemporaryFile(
+                    max_size=max(
+                        1048576,
+                        min(
+                            self._option_int(
+                                'archive_memory_limit', 2097152
+                            ),
+                            16777216,
+                        ),
+                    ),
+                    mode='w+b',
+                )
+                archive_size = 0
+                while True:
+                    chunk = source.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    archive_size += len(chunk)
+                    if archive_size > maximum:
+                        raise ValueError(
+                            'Backup exceeds the configured size limit'
+                        )
+                    owned_stream.write(chunk)
+                owned_stream.seek(0)
+                source = owned_stream
+            if archive_size > maximum:
+                raise ValueError(
+                    'Backup exceeds the configured size limit'
+                )
+            with self.backup_lock:
+                with zipfile.ZipFile(source, 'r') as archive:
+                    infos = archive.infolist()
+                    if len(infos) > 5001:
+                        raise ValueError(
+                            'Backup contains too many files'
+                        )
+                    total = sum(max(0, info.file_size) for info in infos)
+                    if total > maximum:
+                        raise ValueError(
+                            'Backup expands beyond the configured limit'
+                        )
+                    try:
+                        manifest = json.loads(
+                            archive.read('manifest.json').decode(
+                                'utf-8'
+                            )
+                        )
+                    except (
+                        KeyError, UnicodeDecodeError, ValueError,
+                        TypeError, json.JSONDecodeError,
+                    ) as error:
+                        raise ValueError(
+                            f'Backup manifest is invalid: {error}'
+                        )
+                    if (
+                        not isinstance(manifest, dict)
+                        or manifest.get('format')
+                        != 'newfpv-pwmenu-backup-v1'
+                        or not isinstance(manifest.get('files'), list)
+                    ):
+                        raise ValueError(
+                            'Unsupported PWMenu backup format'
+                        )
+                    writes = []
+                    targets = set()
+                    archive_names = [info.filename for info in infos]
+                    if len(archive_names) != len(set(archive_names)):
+                        raise ValueError(
+                            'Backup contains duplicate ZIP entries'
+                        )
+                    for record in manifest['files']:
+                        if not isinstance(record, dict):
+                            raise ValueError(
+                                'Backup manifest contains an invalid entry'
+                            )
+                        logical_name = str(record.get('name') or '')
+                        archive_name = 'data/' + logical_name
+                        try:
+                            info = archive.getinfo(archive_name)
+                        except KeyError:
+                            raise ValueError(
+                                f'Backup data is missing: {logical_name}'
+                            )
+                        try:
+                            expected_size = int(
+                                record.get('size', -1)
+                            )
+                        except (TypeError, ValueError):
+                            expected_size = -1
+                        if info.file_size != expected_size:
+                            raise ValueError(
+                                f'Backup integrity check failed: '
+                                f'{logical_name}'
+                            )
+                        digest = hashlib.sha256()
+                        size = 0
+                        with archive.open(info, 'r') as handle:
+                            while True:
+                                chunk = handle.read(1024 * 1024)
+                                if not chunk:
+                                    break
+                                size += len(chunk)
+                                digest.update(chunk)
+                        if (
+                            size != expected_size
+                            or digest.hexdigest()
+                            != str(record.get('sha256') or '')
+                        ):
+                            raise ValueError(
+                                f'Backup integrity check failed: '
+                                f'{logical_name}'
+                            )
+                        target = self._backup_restore_target(
+                            logical_name
+                        )
+                        if target in targets:
+                            raise ValueError(
+                                'Backup contains duplicate destinations'
+                            )
+                        targets.add(target)
+                        writes.append((
+                            target,
+                            archive_name,
+                            logical_name,
+                        ))
+
+                    declared_names = {
+                        'data/' + str(record.get('name') or '')
+                        for record in manifest['files']
+                    }
+                    if set(archive_names) != (
+                        declared_names | {'manifest.json'}
+                    ):
+                        raise ValueError(
+                            'Backup contains undeclared ZIP entries'
+                        )
+
+                    for target, _, logical_name in writes:
+                        if (
+                            os.path.isfile(target)
+                            and not logical_name.startswith('captures/')
+                        ):
+                            shutil.copy2(
+                                target,
+                                target + '.pwmenu-restore.bak'
+                            )
+                    for target, archive_name, _ in writes:
+                        with archive.open(archive_name, 'r') as handle:
+                            self._atomic_restore_stream(target, handle)
+                        if target == os.path.abspath(self.data_file):
+                            with archive.open(
+                                archive_name, 'r'
+                            ) as handle:
+                                self._atomic_restore_stream(
+                                    self.data_file + '.bak', handle
+                                )
+                with self.data_lock:
+                    self._load_data()
+                self._invalidate_web_data_cache(
+                    credentials=True, files=True
+                )
+            logging.warning(
+                f'[A_pwmenu] Restored {len(writes)} file(s) from '
+                'a backup'
+            )
+            return (
+                True,
+                f'Restored {len(writes)} file(s). '
+                'PWMenu service is restarting.',
+            )
+        except (
+            OSError, ValueError, TypeError, zipfile.BadZipFile,
+        ) as error:
+            logging.warning(
+                f'[A_pwmenu] Backup restore rejected: {error}'
+            )
+            return False, str(error)
+        finally:
+            if owned_stream is not None:
+                owned_stream.close()
+
+    def _schedule_pwnagotchi_service_restart(self):
+        def worker():
+            time.sleep(2.5)
+            try:
+                subprocess.run(
+                    ['systemctl', 'restart', 'pwnagotchi'],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=30,
+                    check=False,
+                )
+            except (OSError, subprocess.SubprocessError) as error:
+                logging.error(
+                    f'[A_pwmenu] Could not restart service after '
+                    f'backup restore: {error}'
+                )
+
+        threading.Thread(
+            target=worker,
+            daemon=True,
+            name='pwmenu-backup-restore-restart',
+        ).start()
 
     def _whitelist_action_response(self, req, changed, message, active_tab):
         if req.headers.get('X-PWMenu-Async') == '1':
@@ -1321,6 +3383,11 @@ class A_pwmenu(plugins.Plugin):
             self.wpa_last_result = (
                 "WPA-sec sync: " + ", ".join(details or ["already up to date"])
             )
+            self._record_action(
+                'cloud',
+                'WPA-sec synchronization finished',
+                self.wpa_last_result,
+            )
             if failed:
                 logging.warning(f"[A_pwmenu] {self.wpa_last_result}")
             else:
@@ -1332,21 +3399,12 @@ class A_pwmenu(plugins.Plugin):
             self._start_wpa_sync_thread()
 
     def _wpa_results_path(self):
-        try:
-            configured = (
-                self._agent.config().get('bettercap', {}).get('handshakes')
-                if self._agent is not None else ''
-            )
-        except (AttributeError, TypeError):
-            configured = ''
-        directory = str(configured or '').strip()
+        directory = self.storage_dir
+        if not directory and self.handshake_dirs:
+            directory = self.handshake_dirs[0]
         if not directory:
-            directory = next(
-                (
-                    item for item in self.handshake_dirs
-                    if os.path.isdir(item)
-                ),
-                self.handshake_dirs[-1],
+            directory = os.path.realpath(
+                os.path.join(os.path.expanduser('~'), 'handshakes')
             )
         os.makedirs(directory, exist_ok=True)
         return os.path.join(directory, 'wpa-sec.cracked.potfile')
@@ -1360,7 +3418,7 @@ class A_pwmenu(plugins.Plugin):
             response = requests.get(
                 api_url,
                 cookies={'key': str(key)},
-                headers={'User-Agent': 'PWMenu/1.3.9'},
+                headers={'User-Agent': 'PWMenu/1.4.0'},
                 timeout=(10, 30),
             )
             response.raise_for_status()
@@ -1385,6 +3443,7 @@ class A_pwmenu(plugins.Plugin):
             finally:
                 if os.path.exists(tmp_path):
                     os.remove(tmp_path)
+            self._invalidate_web_data_cache(credentials=True)
             with self.data_lock:
                 self.data['wpa_last_download'] = int(time.time())
             self._save_data()
@@ -2004,6 +4063,7 @@ class A_pwmenu(plugins.Plugin):
                 'request_id': request_id or prev.get('request_id', ''),
                 'updated_at': int(time.time())
             }
+        self._invalidate_web_data_cache()
 
     def _ohc_mark_path(self, path, status, message='', hashes=0, request_id=''):
         self._ohc_mark_file(os.path.basename(path or ''), status, message, hashes, request_id)
@@ -2054,6 +4114,14 @@ class A_pwmenu(plugins.Plugin):
             if current is None or score > current[0]:
                 selected[identity] = (score, path)
         return [item[1] for item in selected.values()]
+
+    def _best_capture_for_path(self, path):
+        """Resolve any capture link to the strongest file for that AP."""
+        if not path or not os.path.isfile(path):
+            return path
+        essid, bssid = self._capture_export_network(path)
+        matches = self._matching_capture_paths(essid, bssid)
+        return matches[0] if matches else path
 
     def _ohc_reported_bssids(self, hashes):
         bssids = set()
@@ -2264,6 +4332,11 @@ class A_pwmenu(plugins.Plugin):
                     logging.debug(f"[A_pwmenu] {msg}")
                 else:
                     logging.info(f"[A_pwmenu] {msg}")
+                self._record_action(
+                    'cloud',
+                    'OHC synchronization finished',
+                    msg,
+                )
             finally:
                 self.ohc_upload_face = '0__0'
                 self.ohc_progress_current = 0
@@ -2672,7 +4745,7 @@ class A_pwmenu(plugins.Plugin):
                     headers={
                         'User-Agent': (
                             'Mozilla/5.0 (X11; Linux aarch64) '
-                            'PWMenu/1.3.9'
+                            'PWMenu/1.4.0'
                         )
                     },
                     timeout=(10, 30)
@@ -2698,6 +4771,8 @@ class A_pwmenu(plugins.Plugin):
         p = self._find_handshake_path(safe_name)
         if not p:
             return make_response("Not found", 404)
+        p = self._best_capture_for_path(p)
+        safe_name = os.path.basename(p)
 
         out = None
         try:
@@ -2775,7 +4850,9 @@ class A_pwmenu(plugins.Plugin):
             'wpa_networks': {},
             'wpa_last_download': 0,
             'replacement_history': [],
-            'empty_cleanup_history': []
+            'empty_cleanup_history': [],
+            'action_history': [],
+            'credential_rejections': [],
         }
         candidates = [self.data_file, self.data_file + '.bak']
         candidates = [p for p in candidates if os.path.exists(p)]
@@ -2823,6 +4900,137 @@ class A_pwmenu(plugins.Plugin):
             self.data['replacement_history'] = []
         if not isinstance(self.data.get('empty_cleanup_history'), list):
             self.data['empty_cleanup_history'] = []
+        if not isinstance(self.data.get('action_history'), list):
+            self.data['action_history'] = []
+        if not isinstance(self.data.get('credential_rejections'), list):
+            self.data['credential_rejections'] = []
+
+    def _record_action(
+        self,
+        kind,
+        title,
+        detail='',
+        source='PWMenu',
+        dedupe_key='',
+        dedupe_window=0,
+    ):
+        if not hasattr(self, 'data') or not isinstance(self.data, dict):
+            return False
+        now = int(time.time())
+        key = str(dedupe_key or '').strip()
+        record = {
+            'ts': now,
+            'kind': str(kind or 'system')[:32],
+            'title': str(title or 'Activity')[:180],
+            'detail': str(detail or '')[:320],
+            'source': str(source or 'PWMenu')[:64],
+            'key': key[:180],
+        }
+        with self.data_lock:
+            history = self.data.setdefault('action_history', [])
+            if key and dedupe_window:
+                for previous in reversed(history[-100:]):
+                    if (
+                        str(previous.get('key') or '') == key
+                        and now - int(previous.get('ts', 0) or 0)
+                        < int(dedupe_window)
+                    ):
+                        return False
+            history.append(record)
+            maximum = max(
+                1,
+                min(
+                    self._option_int('activity_history_max', 200),
+                    200,
+                ),
+            )
+            hours = max(
+                1,
+                min(self._option_int('activity_history_hours', 24), 24 * 30),
+            )
+            cutoff = now - (hours * 3600)
+            history[:] = [
+                item for item in history
+                if self._activity_is_recent(item, cutoff)
+            ]
+            if len(history) > maximum:
+                del history[:-maximum]
+        self._save_data()
+        return True
+
+    def _activity_is_recent(self, item, cutoff):
+        if not isinstance(item, dict):
+            return False
+        try:
+            return int(item.get('ts', 0) or 0) >= int(cutoff)
+        except (TypeError, ValueError):
+            return False
+
+    def _activity_history_page(self, offset=0, limit=None):
+        maximum = max(
+            1,
+            min(self._option_int('activity_history_max', 200), 200),
+        )
+        page_size = max(
+            1,
+            min(
+                int(
+                    limit
+                    if limit is not None
+                    else maximum
+                ),
+                maximum,
+            ),
+        )
+        start = max(0, int(offset or 0))
+        hours = max(
+            1,
+            min(self._option_int('activity_history_hours', 24), 24 * 30),
+        )
+        cutoff = int(time.time()) - (hours * 3600)
+        with self.data_lock:
+            history = [
+                dict(item)
+                for item in reversed(
+                    self.data.get('action_history', []) or []
+                )
+                if self._activity_is_recent(item, cutoff)
+            ][:maximum]
+        total = len(history)
+        selected = history[start:start + page_size]
+        timezone = self._option_int('timezone', 0)
+        for item in selected:
+            try:
+                item['time'] = get_local_time(
+                    float(item.get('ts', 0) or 0), timezone
+                )
+            except (TypeError, ValueError, OSError):
+                item['time'] = ''
+            item.pop('key', None)
+        next_offset = start + len(selected)
+        return {
+            'items': selected,
+            'total': total,
+            'offset': start,
+            'nextOffset': next_offset,
+            'hasMore': next_offset < total,
+        }
+
+    def _activity_history_response(self, request):
+        try:
+            offset = int(request.args.get('offset') or 0)
+        except (TypeError, ValueError):
+            offset = 0
+        try:
+            limit = int(
+                request.args.get('limit')
+                or self._option_int('activity_history_max', 200)
+            )
+        except (TypeError, ValueError):
+            limit = self._option_int('activity_history_max', 200)
+        payload = self._activity_history_page(offset, limit)
+        payload['ok'] = True
+        return self._json_response(payload)
 
     def _migrate_wpa_sec_state(self):
         """Import the stock plugin report once so PWMenu does not resubmit it."""
@@ -2869,6 +5077,7 @@ class A_pwmenu(plugins.Plugin):
             )
 
     def _save_data(self):
+        saved = False
         try:
             with self.save_lock:
                 with self.data_lock:
@@ -2891,6 +5100,7 @@ class A_pwmenu(plugins.Plugin):
                             os.close(dir_fd)
                     except OSError:
                         pass
+                saved = True
         except Exception as e:
             logging.error(f"[A_pwmenu] Could not save state: {e}")
             for target in (self.data_file + '.bak.tmp', self.data_file + '.tmp'):
@@ -2899,6 +5109,8 @@ class A_pwmenu(plugins.Plugin):
                         os.remove(target)
                 except OSError:
                     pass
+        if saved:
+            self._invalidate_web_data_cache()
 
     def _option_bool(self, key, default=True):
         v = getattr(self, 'options', {}).get(key, default)
@@ -3216,6 +5428,149 @@ class A_pwmenu(plugins.Plugin):
             'retry_in': retry_in
         }
 
+    def _health_issues(self, gps_status, ohc_status, wpa_status):
+        issues = []
+        memory_limit = max(
+            16,
+            self._option_int('health_memory_warning_mb', 64),
+        )
+        try:
+            available_kb = None
+            with open('/proc/meminfo', 'r', encoding='utf-8') as handle:
+                for line in handle:
+                    if line.startswith('MemAvailable:'):
+                        available_kb = int(line.split()[1])
+                        break
+            if (
+                available_kb is not None
+                and available_kb < memory_limit * 1024
+            ):
+                issues.append({
+                    'kind': 'memory',
+                    'title': 'Low available memory',
+                    'detail': (
+                        f'{available_kb // 1024} MB available; '
+                        f'warning threshold is {memory_limit} MB'
+                    ),
+                    'tab': 'other',
+                })
+        except (OSError, ValueError, IndexError):
+            pass
+
+        disk_limit = max(
+            1,
+            min(
+                self._option_int(
+                    'health_disk_warning_percent', 10
+                ),
+                50,
+            ),
+        )
+        try:
+            usage = shutil.disk_usage('/')
+            free_percent = (
+                int(usage.free * 100 / usage.total)
+                if usage.total else 100
+            )
+            if free_percent < disk_limit:
+                issues.append({
+                    'kind': 'disk',
+                    'title': 'Low storage space',
+                    'detail': (
+                        f'{free_percent}% free on the system volume; '
+                        f'warning threshold is {disk_limit}%'
+                    ),
+                    'tab': 'other',
+                })
+        except OSError:
+            pass
+
+        gps_grace = max(
+            0,
+            self._option_int('health_gps_grace_seconds', 900),
+        )
+        gps_state = str(
+            (gps_status or {}).get('state') or ''
+        ).casefold()
+        gps_healthy = (
+            'connected' in gps_state
+            or 'receiving gps' in gps_state
+        )
+        if (
+            self._module_enabled('gps')
+            and time.time() - self.loaded_at >= gps_grace
+            and not gps_healthy
+        ):
+            issues.append({
+                'kind': 'gps',
+                'title': 'GPS is not providing coordinates',
+                'detail': (
+                    f"{(gps_status or {}).get('label') or 'GPS'}: "
+                    f"{(gps_status or {}).get('state') or 'offline'}"
+                ),
+                'tab': 'map',
+            })
+
+        queue_limit = max(
+            300,
+            self._option_int('health_queue_stuck_seconds', 3600),
+        )
+        with self.data_lock:
+            pending_records = list(
+                (self.data.get('ohc_pending_files', {}) or {}).values()
+            )
+        queued_times = []
+        for record in pending_records:
+            try:
+                queued_at = int(
+                    (record or {}).get('queued_at', 0) or 0
+                )
+            except (TypeError, ValueError):
+                continue
+            if queued_at > 0:
+                queued_times.append(queued_at)
+        oldest_ohc = min(queued_times, default=0)
+        if (
+            (ohc_status or {}).get('pending', 0)
+            and oldest_ohc
+            and time.time() - oldest_ohc >= queue_limit
+            and not (ohc_status or {}).get('uploading')
+        ):
+            retry_in = int(
+                (ohc_status or {}).get('retry_in', 0) or 0
+            )
+            detail = (
+                f"{(ohc_status or {}).get('pending', 0)} file(s) "
+                f"waiting for more than {queue_limit // 60} minutes"
+            )
+            if retry_in:
+                detail += f'; retry in {retry_in} seconds'
+            issues.append({
+                'kind': 'ohc',
+                'title': 'OHC queue is delayed',
+                'detail': detail,
+                'tab': 'other',
+            })
+
+        wpa_pending = int(
+            (wpa_status or {}).get('pending', 0) or 0
+        )
+        wpa_worker_alive = bool(
+            self.wpa_upload_thread
+            and self.wpa_upload_thread.is_alive()
+        )
+        if wpa_pending and not wpa_worker_alive:
+            issues.append({
+                'kind': 'wpa',
+                'title': 'WPA-sec queue is not running',
+                'detail': (
+                    f'{wpa_pending} capture(s) are waiting while '
+                    'the upload worker is stopped'
+                ),
+                'tab': 'other',
+            })
+        return issues
+
     def _read_gpsd_location(self):
         if not self._option_bool('gpsd_enabled', True):
             return None
@@ -3265,7 +5620,7 @@ class A_pwmenu(plugins.Plugin):
                 pass
         return None
 
-    def _fresh_live_gps(self):
+    def _fresh_live_gps(self, poll_gpsd=True):
         pwndroid = self._fresh_pwndroid_ws_gps()
         if pwndroid:
             return pwndroid
@@ -3276,6 +5631,11 @@ class A_pwmenu(plugins.Plugin):
         now = time.time()
         interval = max(1, self._option_int('gpsd_poll_interval', 10))
         with self.gps_lock:
+            if not poll_gpsd:
+                return (
+                    dict(self.gpsd_cached_location)
+                    if self.gpsd_cached_location else None
+                )
             if now - self.gpsd_last_poll < interval:
                 return dict(self.gpsd_cached_location) if self.gpsd_cached_location else None
             self.gpsd_last_poll = now
@@ -3534,6 +5894,13 @@ class A_pwmenu(plugins.Plugin):
                 n['history'] = [m]
                 network_groups.append(n)
 
+        # A one-capture network already contains the complete capture record.
+        # Keeping an identical self-copy in `history` nearly doubles map JSON
+        # for the common case and provides no UI information.
+        for network in network_groups:
+            if len(network.get('history', [])) <= 1:
+                network['history'] = []
+
         clusters = []
         for m in network_groups:
             bucket = None
@@ -3614,6 +5981,133 @@ class A_pwmenu(plugins.Plugin):
                 'files': files
             })
         return items
+
+    def _build_conflicts(self, groups, cracked):
+        """Return only identity, password and duplicate records needing review."""
+        conflicts = []
+        identities = {}
+        bssids_by_name = {}
+        for group in groups or []:
+            group_bssid = self._compact_bssid(group.get('bssid'))
+            if group_bssid == '000000000000':
+                group_bssid = ''
+            file_essids = {
+                str(file_info.get('essid') or '').strip()
+                for file_info in group.get('files', [])
+                if str(file_info.get('essid') or '').strip()
+            }
+            display_name = str(group.get('essid') or '').strip()
+            if display_name:
+                file_essids.add(display_name)
+            if group_bssid:
+                for essid in file_essids:
+                    normalized = self._normalized_essid_key(essid)
+                    if normalized:
+                        bssids_by_name.setdefault(normalized, set()).add(
+                            group_bssid
+                        )
+                bucket = identities.setdefault(
+                    group_bssid,
+                    {'essids': set(), 'passwords': set()},
+                )
+                bucket['essids'].update(file_essids)
+            files = list(group.get('files', []) or [])
+            if len(files) > 1:
+                best = group.get('best_file') or files[0]
+                conflicts.append({
+                    'kind': 'duplicate',
+                    'title': display_name or 'Duplicate captures',
+                    'detail': (
+                        f'{len(files)} captures; '
+                        f'{best.get("filename", "best capture")} selected'
+                    ),
+                    'bssid': self._format_bssid(group_bssid),
+                    'count': len(files),
+                })
+
+        for record in (cracked or {}).values():
+            essid = str(record.get('essid') or '').strip()
+            password = str(record.get('password') or '')
+            bssid = self._compact_bssid(record.get('bssid'))
+            if bssid == '000000000000':
+                bssid = ''
+            if not bssid:
+                candidates = bssids_by_name.get(
+                    self._normalized_essid_key(essid),
+                    set(),
+                )
+                if len(candidates) == 1:
+                    # A legacy zero/name-only credential can be linked safely
+                    # when one and only one captured AP has the same normalized
+                    # name. This prevents 00:00:00:00:00:00 from becoming one
+                    # fake shared access point.
+                    bssid = next(iter(candidates))
+            if not bssid:
+                conflicts.append({
+                    'kind': 'name-only',
+                    'title': essid or 'Name-only credential',
+                    'detail': (
+                        'Credential has no BSSID and cannot be tied '
+                        'to one exact access point'
+                    ),
+                    'bssid': '',
+                    'count': 1,
+                })
+                continue
+            bucket = identities.setdefault(
+                bssid,
+                {'essids': set(), 'passwords': set()},
+            )
+            if essid:
+                bucket['essids'].add(essid)
+            if password:
+                bucket['passwords'].add(password)
+
+        for bssid, bucket in identities.items():
+            essids = sorted(bucket['essids'], key=str.casefold)
+            passwords = bucket['passwords']
+            formatted = self._format_bssid(bssid)
+            normalized_names = {
+                self._normalized_essid_key(essid)
+                for essid in essids
+                if self._normalized_essid_key(essid)
+            }
+            if len(normalized_names) > 1:
+                conflicts.append({
+                    'kind': 'identity',
+                    'title': formatted,
+                    'detail': (
+                        f'{len(essids)} network names: '
+                        + ', '.join(essids[:3])
+                        + ('…' if len(essids) > 3 else '')
+                    ),
+                    'bssid': formatted,
+                    'count': len(essids),
+                })
+            if len(passwords) > 1:
+                conflicts.append({
+                    'kind': 'password',
+                    'title': formatted,
+                    'detail': (
+                        f'{len(passwords)} different recovered passwords '
+                        'are attached to this BSSID'
+                    ),
+                    'bssid': formatted,
+                    'count': len(passwords),
+                    'repairable': True,
+                })
+
+        priority = {
+            'password': 0,
+            'identity': 1,
+            'name-only': 2,
+            'duplicate': 3,
+        }
+        conflicts.sort(key=lambda item: (
+            priority.get(item.get('kind'), 9),
+            str(item.get('title') or '').casefold(),
+        ))
+        return conflicts
 
     def _update_achievements(self, groups, cracked):
         with self.data_lock:
@@ -4044,6 +6538,12 @@ class A_pwmenu(plugins.Plugin):
                 with self.data_lock:
                     self.data['xp'] += 200
                 self._save_data()
+                self._record_action(
+                    'password',
+                    f'Password verified: {name}',
+                    self._format_bssid(compact_bssid)
+                    or 'Verified against a local capture',
+                )
                 logging.info(
                     "[A_pwmenu] Manual password saved for %s",
                     self._format_bssid(compact_bssid) or name,
@@ -4091,6 +6591,253 @@ class A_pwmenu(plugins.Plugin):
             return False, message
         self._delete_password(essid, old_password, None, bssid)
         return True, message.replace('password saved', 'password updated')
+
+    def _credential_rejection_key(self, bssid, password):
+        compact_bssid = self._compact_bssid(bssid)
+        if not compact_bssid or compact_bssid == '000000000000':
+            return ''
+        payload = (
+            compact_bssid + '\0' + str(password or '')
+        ).encode('utf-8', errors='surrogatepass')
+        return hashlib.sha256(payload).hexdigest()
+
+    def _conflict_repair_payload(self, compact_bssid, job):
+        return {
+            'ok': True,
+            'bssid': self._format_bssid(compact_bssid),
+            'status': str(job.get('status') or 'running'),
+            'message': str(
+                job.get('message')
+                or 'Local password verification is running'
+            ),
+            'current': int(job.get('current', 0) or 0),
+            'total': int(job.get('total', 0) or 0),
+        }
+
+    def _update_conflict_repair_job(self, compact_bssid, **updates):
+        with self.conflict_repair_lock:
+            job = self.conflict_repair_jobs.get(compact_bssid)
+            if not job:
+                return
+            job.update(updates)
+            job['updated_at'] = int(time.time())
+
+    def _start_password_conflict_repair(self, bssid):
+        compact_bssid = self._compact_bssid(bssid)
+        if not compact_bssid or compact_bssid == '000000000000':
+            return False, {
+                'ok': False,
+                'message': 'A real BSSID is required for local verification',
+            }
+
+        with self.conflict_repair_lock:
+            existing = self.conflict_repair_jobs.get(compact_bssid)
+            if existing and existing.get('status') == 'running':
+                return True, self._conflict_repair_payload(
+                    compact_bssid,
+                    existing,
+                )
+            now = int(time.time())
+            self.conflict_repair_jobs[compact_bssid] = {
+                'status': 'running',
+                'message': 'Loading local password candidates...',
+                'current': 0,
+                'total': 0,
+                'started_at': now,
+                'updated_at': now,
+            }
+            if len(self.conflict_repair_jobs) > 32:
+                completed = sorted(
+                    (
+                        (key, value)
+                        for key, value in self.conflict_repair_jobs.items()
+                        if value.get('status') != 'running'
+                    ),
+                    key=lambda item: int(
+                        item[1].get('updated_at', 0) or 0
+                    ),
+                )
+                for key, _ in completed[
+                    :max(0, len(self.conflict_repair_jobs) - 32)
+                ]:
+                    self.conflict_repair_jobs.pop(key, None)
+            payload = self._conflict_repair_payload(
+                compact_bssid,
+                self.conflict_repair_jobs[compact_bssid],
+            )
+
+        def progress(current, total, message):
+            self._update_conflict_repair_job(
+                compact_bssid,
+                current=current,
+                total=total,
+                message=message,
+            )
+
+        def worker():
+            try:
+                ok, message = self._repair_password_conflict(
+                    compact_bssid,
+                    progress=progress,
+                )
+                self._update_conflict_repair_job(
+                    compact_bssid,
+                    status='done' if ok else 'error',
+                    message=message,
+                )
+            except Exception as error:
+                logging.exception(
+                    '[A_pwmenu] Password conflict repair failed for %s',
+                    self._format_bssid(compact_bssid),
+                )
+                self._update_conflict_repair_job(
+                    compact_bssid,
+                    status='error',
+                    message=f'Local verification failed: {error}',
+                )
+
+        threading.Thread(
+            target=worker,
+            daemon=True,
+            name='pwmenu-password-conflict-repair',
+        ).start()
+        return True, payload
+
+    def _password_conflict_repair_status(self, bssid):
+        compact_bssid = self._compact_bssid(
+            urllib.parse.unquote(str(bssid or ''))
+        )
+        with self.conflict_repair_lock:
+            job = self.conflict_repair_jobs.get(compact_bssid)
+            if not job:
+                return self._json_response(
+                    {
+                        'ok': False,
+                        'message': 'Password verification job was not found',
+                    },
+                    404,
+                )
+            payload = self._conflict_repair_payload(
+                compact_bssid,
+                dict(job),
+            )
+        return self._json_response(payload)
+
+    def _repair_password_conflict(self, bssid, progress=None):
+        compact_bssid = self._compact_bssid(bssid)
+        if not compact_bssid or compact_bssid == '000000000000':
+            return False, 'A real BSSID is required for local verification'
+
+        with self.password_verify_lock:
+            cracked = self._get_cracked_data()
+            candidates = {}
+            for record in cracked.values():
+                if self._compact_bssid(record.get('bssid')) != compact_bssid:
+                    continue
+                password = str(record.get('password') or '')
+                if password:
+                    candidates.setdefault(
+                        password,
+                        str(record.get('essid') or ''),
+                    )
+            if len(candidates) < 2:
+                return True, 'The password conflict is already resolved'
+
+            verified = []
+            conclusive_failures = []
+            inconclusive = []
+            total = len(candidates)
+            for index, (password, essid) in enumerate(
+                candidates.items(),
+                start=1,
+            ):
+                if progress:
+                    progress(
+                        index,
+                        total,
+                        f'Checking local candidate {index} of {total}...',
+                    )
+                ok, detail = self._verify_manual_password(
+                    essid,
+                    compact_bssid,
+                    password,
+                )
+                if ok:
+                    verified.append(password)
+                elif re.search(
+                    r'cannot be verified|could not be verified|no matching capture',
+                    str(detail),
+                    re.IGNORECASE,
+                ):
+                    inconclusive.append(password)
+                else:
+                    conclusive_failures.append(password)
+
+            if len(verified) != 1:
+                if not verified and inconclusive:
+                    return (
+                        False,
+                        'No password was changed: the local capture has no '
+                        'usable hash for conclusive verification',
+                    )
+                if len(verified) > 1:
+                    return (
+                        False,
+                        'No password was changed: multiple passwords match '
+                        'different local captures for this BSSID',
+                    )
+                return (
+                    False,
+                    'No password was changed: none of the candidates matched '
+                    'the local capture',
+                )
+            if inconclusive:
+                return (
+                    False,
+                    'No password was changed: one candidate matched, but '
+                    'another could not be checked conclusively',
+                )
+
+            confirmed = verified[0]
+            rejected = list(conclusive_failures)
+            rejection_keys = {
+                self._credential_rejection_key(compact_bssid, password)
+                for password in rejected
+            }
+            rejection_keys.discard('')
+            confirmed_key = self._credential_rejection_key(
+                compact_bssid,
+                confirmed,
+            )
+            with self.data_lock:
+                stored = set(
+                    self.data.setdefault('credential_rejections', [])
+                )
+                stored.update(rejection_keys)
+                stored.discard(confirmed_key)
+                self.data['credential_rejections'] = sorted(stored)
+
+            for password in rejected:
+                self._delete_password(
+                    '',
+                    password,
+                    bssid=compact_bssid,
+                )
+            self._save_data()
+            self._invalidate_web_data_cache(credentials=True)
+            self._record_action(
+                'password',
+                'Password conflict repaired',
+                (
+                    f'{self._format_bssid(compact_bssid)}: one locally '
+                    f'verified credential kept, {len(rejected)} rejected'
+                ),
+            )
+            return (
+                True,
+                f'Conflict repaired: one verified password kept and '
+                f'{len(rejected)} invalid candidate(s) rejected',
+            )
 
     def _delete_specific_file(self, fname):
         name = self._safe_handshake_name(fname)
@@ -4332,6 +7079,12 @@ class A_pwmenu(plugins.Plugin):
                     return False, f"{value} is already in the whitelist"
                 self._write_whitelist_config(names)
                 self._set_runtime_whitelist(names)
+            self._invalidate_web_data_cache()
+            self._record_action(
+                'whitelist',
+                f'Whitelist added: {value}',
+                'Applied to the running Pwnagotchi session',
+            )
             logging.info(f"[A_pwmenu] Added network to whitelist: {value}")
             return True, f"Added {value} to the whitelist"
         except (OSError, ValueError) as error:
@@ -4374,6 +7127,13 @@ class A_pwmenu(plugins.Plugin):
                     updated = sorted(dict.fromkeys(current + added), key=str.casefold)
                     self._write_whitelist_config(updated)
                     self._set_runtime_whitelist(updated)
+            if added:
+                self._invalidate_web_data_cache()
+                self._record_action(
+                    'whitelist',
+                    f'Whitelist added {len(added)} network(s)',
+                    'Excellent-quality map group',
+                )
 
             parts = []
             if added:
@@ -4401,6 +7161,12 @@ class A_pwmenu(plugins.Plugin):
                 names = [item for item in names if item != value]
                 self._write_whitelist_config(names)
                 self._set_runtime_whitelist(names)
+            self._invalidate_web_data_cache()
+            self._record_action(
+                'whitelist',
+                f'Whitelist removed: {value}',
+                'Applied to the running Pwnagotchi session',
+            )
             logging.info(f"[A_pwmenu] Removed network from whitelist: {value}")
             return True, f"Removed {value} from the whitelist"
         except (OSError, ValueError) as error:
@@ -4430,15 +7196,37 @@ class A_pwmenu(plugins.Plugin):
         except (TypeError, ValueError):
             return True
 
-    def _capture_cleanup_report(self):
+    def _capture_cleanup_report(self, groups=None):
         entries = []
-        for directory in self.handshake_dirs:
-            if not os.path.isdir(directory):
+        if groups is None:
+            candidates = []
+            for directory in self.handshake_dirs:
+                if not os.path.isdir(directory):
+                    continue
+                for path in sorted(glob.glob(os.path.join(directory, '*.pcap'))):
+                    candidates.append((path, None, ''))
+        else:
+            candidates = [
+                (
+                    file_info.get('_path', ''),
+                    file_info.get('quality') or {},
+                    file_info.get('_signature', ''),
+                )
+                for group in groups
+                for file_info in group.get('files', [])
+            ]
+
+        for path, cached_quality, cached_signature in candidates:
+            if not path:
                 continue
-            for path in sorted(glob.glob(os.path.join(directory, '*.pcap'))):
+            try:
                 name = os.path.basename(path)
                 empty = self._is_empty_pcap(path)
-                quality = self._quality_file_record(name, path)
+                quality = (
+                    cached_quality
+                    if cached_quality is not None
+                    else self._quality_file_record(name, path)
+                )
                 unusable = quality.get('grade') == 'Unusable'
                 uncrackable = self._quality_is_uncrackable(quality)
                 if not empty and not unusable and not uncrackable:
@@ -4461,11 +7249,19 @@ class A_pwmenu(plugins.Plugin):
                 entries.append({
                     'name': name,
                     'path': path,
-                    'signature': self._ohc_file_signature(path),
+                    'signature': (
+                        cached_signature
+                        or self._ohc_file_signature(path)
+                    ),
                     'reason': reason,
                     'empty': empty,
                     'category': category,
                 })
+            except (OSError, TypeError, ValueError) as error:
+                logging.debug(
+                    f"[A_pwmenu] Could not inspect cleanup candidate "
+                    f"{path}: {error}"
+                )
         fingerprint = json.dumps(
             [(entry['path'], entry['signature'], entry['reason']) for entry in entries],
             separators=(',', ':'),
@@ -4894,6 +7690,7 @@ class A_pwmenu(plugins.Plugin):
             finally:
                 if os.path.exists(tmp_path):
                     os.remove(tmp_path)
+        self._invalidate_web_data_cache(credentials=True)
 
     def _normalize_potfile(self, path):
         try:
@@ -4967,15 +7764,28 @@ class A_pwmenu(plugins.Plugin):
 
     def _serve_zip(self):
         m = self._new_archive_buffer()
-        seen = set()
+        candidates = {}
+        for directory in self.handshake_dirs:
+            if not os.path.exists(directory):
+                continue
+            for path in glob.glob(os.path.join(directory, '*.pcap')):
+                name = os.path.basename(path)
+                previous = candidates.get(name)
+                if (
+                    previous is None
+                    or self._capture_export_score(path)
+                    > self._capture_export_score(previous)
+                ):
+                    candidates[name] = path
+        best_paths = self._best_capture_paths_by_ap(
+            list(candidates.values())
+        )
         with zipfile.ZipFile(m, 'w', zipfile.ZIP_DEFLATED) as z:
-            for d in self.handshake_dirs:
-                if not os.path.exists(d): continue
-                for f in glob.glob(os.path.join(d, '*.pcap')):
-                    name = os.path.basename(f)
-                    if name not in seen:
-                        z.write(f, name)
-                        seen.add(name)
+            for path in sorted(
+                best_paths,
+                key=lambda item: os.path.basename(item).casefold(),
+            ):
+                z.write(path, os.path.basename(path))
         m.seek(0)
         return send_file(m, mimetype='application/zip', as_attachment=True, download_name='handshakes.zip')
 
@@ -4987,15 +7797,149 @@ class A_pwmenu(plugins.Plugin):
         m.seek(0)
         return send_file(m, mimetype='application/zip', as_attachment=True, download_name='uncracked-handshakes.zip')
 
+    def _source_directory_entries(self, directory):
+        """Return lightweight file metadata with a short, safe inventory cache."""
+        real_directory = os.path.realpath(directory)
+        try:
+            directory_stat = os.stat(directory)
+            directory_signature = (
+                directory_stat.st_mtime_ns,
+                directory_stat.st_ctime_ns,
+                directory_stat.st_size,
+            )
+        except OSError:
+            return {}
+
+        now = time.monotonic()
+        maximum_age = max(
+            0,
+            self._option_int('web_inventory_cache_seconds', 30),
+        )
+        with self.source_inventory_cache_lock:
+            cached = self.source_inventory_cache.get(real_directory)
+            if (
+                cached
+                and cached['signature'] == directory_signature
+                and maximum_age
+                and now - cached['checked_at'] <= maximum_age
+            ):
+                return cached['entries']
+
+        entries = {}
+        try:
+            with os.scandir(directory) as iterator:
+                candidates = {
+                    entry.name: entry
+                    for entry in iterator
+                    if (
+                        entry.name.endswith('.pcap')
+                        or entry.name.endswith('.pcap.cracked')
+                        or entry.name.endswith('.json')
+                    )
+                }
+                names = tuple(sorted(candidates))
+                for name, entry in candidates.items():
+                    if not entry.is_file(follow_symlinks=False):
+                        continue
+                    try:
+                        stat = entry.stat(follow_symlinks=False)
+                    except OSError:
+                        continue
+                    entries[name] = (
+                        entry.path,
+                        stat.st_mtime_ns,
+                        stat.st_size,
+                    )
+        except OSError as error:
+            logging.debug(
+                f"[A_pwmenu] Could not inventory {directory}: {error}"
+            )
+            return {}
+
+        with self.source_inventory_cache_lock:
+            self.source_inventory_cache[real_directory] = {
+                'signature': directory_signature,
+                'names': names,
+                'checked_at': now,
+                'entries': entries,
+            }
+        return entries
+
+    def _quickdic_result_paths(self):
+        paths = []
+        seen_directories = set()
+        for directory in self.handshake_dirs:
+            real_directory = os.path.realpath(directory)
+            if real_directory in seen_directories or not os.path.isdir(directory):
+                continue
+            seen_directories.add(real_directory)
+            paths.extend(
+                metadata[0]
+                for name, metadata in self._source_directory_entries(
+                    directory
+                ).items()
+                if name.endswith('.pcap.cracked')
+            )
+        return sorted(paths)
+
+    def _capture_source_revision(self):
+        """Fingerprint PCAPs and their possible GPS sidecars with one scan."""
+        metadata = []
+        seen_directories = set()
+        for directory in self.handshake_dirs:
+            real_directory = os.path.realpath(directory)
+            if real_directory in seen_directories or not os.path.isdir(directory):
+                continue
+            seen_directories.add(real_directory)
+            entries = self._source_directory_entries(directory)
+
+            pcap_names = sorted(
+                name for name in entries if name.endswith('.pcap')
+            )
+            relevant_names = set(pcap_names)
+            for name in pcap_names:
+                base = os.path.splitext(name)[0]
+                relevant_names.update((
+                    name + '.gps.json',
+                    name + '.geo.json',
+                    name + '.json',
+                    base + '.gps.json',
+                    base + '.geo.json',
+                    base + '.json',
+                ))
+            for name in sorted(relevant_names):
+                file_metadata = entries.get(name)
+                if file_metadata is None:
+                    continue
+                _, modified_ns, size = file_metadata
+                metadata.append(
+                    f"{real_directory}:{name}:{modified_ns}:{size}"
+                )
+        return hashlib.sha256(
+            '\n'.join(metadata).encode('utf-8')
+        ).hexdigest()
+
     def _credential_source_revision(self):
-        """Fingerprint credential files by metadata without persisting password hashes."""
+        """Fingerprint credential files by metadata without reading passwords."""
+        now = time.monotonic()
+        maximum_age = max(
+            0,
+            self._option_int('web_credential_cache_seconds', 10),
+        )
+        with self.credential_cache_lock:
+            if (
+                self.credential_revision_value is not None
+                and maximum_age
+                and now - self.credential_revision_checked_at <= maximum_age
+            ):
+                return self.credential_revision_value
+
         paths = [
             self.potfile_ohc,
             self.potfile_handshake_lab,
             self.potfile_manual,
         ] + self._wpa_potfile_paths()
-        for directory in self.handshake_dirs:
-            paths.extend(glob.glob(os.path.join(directory, '*.pcap.cracked')))
+        paths.extend(self._quickdic_result_paths())
         metadata = []
         for path in sorted(set(paths)):
             try:
@@ -5005,7 +7949,13 @@ class A_pwmenu(plugins.Plugin):
                 )
             except OSError:
                 continue
-        return hashlib.sha256('\n'.join(metadata).encode('utf-8')).hexdigest()
+        revision = hashlib.sha256(
+            '\n'.join(metadata).encode('utf-8')
+        ).hexdigest()
+        with self.credential_cache_lock:
+            self.credential_revision_value = revision
+            self.credential_revision_checked_at = now
+        return revision
 
     def _known_passwords_for_capture(self, cracked, essid, bssid):
         compact_bssid = self._compact_bssid(bssid)
@@ -5208,14 +8158,18 @@ class A_pwmenu(plugins.Plugin):
             if name and name not in safe_names:
                 safe_names.append(name)
 
+        selected_paths = []
+        for name in safe_names:
+            path = self._find_handshake_path(name)
+            if path:
+                selected_paths.append(path)
+        selected_paths = self._best_capture_paths_by_ap(
+            selected_paths
+        )
         m = self._new_archive_buffer()
         with zipfile.ZipFile(m, 'w', zipfile.ZIP_DEFLATED) as z:
-            for name in safe_names:
-                for d in self.handshake_dirs:
-                    fp = os.path.join(d, name)
-                    if os.path.exists(fp):
-                        z.write(fp, name)
-                        break
+            for path in selected_paths:
+                z.write(path, os.path.basename(path))
         m.seek(0)
         return send_file(m, mimetype='application/zip', as_attachment=True, download_name='cluster-handshakes.zip')
 
@@ -5260,7 +8214,12 @@ class A_pwmenu(plugins.Plugin):
         safe_name = self._safe_handshake_name(name)
         fp = self._find_handshake_path(safe_name)
         if fp:
-            return send_file(fp, as_attachment=True, download_name=safe_name)
+            fp = self._best_capture_for_path(fp)
+            return send_file(
+                fp,
+                as_attachment=True,
+                download_name=os.path.basename(fp),
+            )
         return make_response("Not found", 404)
 
     def _new_archive_buffer(self):
@@ -5282,28 +8241,61 @@ class A_pwmenu(plugins.Plugin):
         grps = {}
         data_changed = False
         quality_pending = []
+        credential_lookup = self._build_credential_lookup(cracked)
         with self.data_lock:
             seen_files = dict(self.data.setdefault('seen_files', {}))
-        live_gps = self._fresh_live_gps()
+        # Rendering the page must never wait on a GPSD socket. The UI/display
+        # loop and on_handshake keep this cache warm when GPSD is available.
+        live_gps = self._fresh_live_gps(poll_gpsd=False)
         try:
             tz_offset = int(self.options.get('timezone', 0))
         except (TypeError, ValueError):
             tz_offset = 0
 
-        for d in self.handshake_dirs:
-            if not os.path.exists(d): continue
-            for f in glob.glob(os.path.join(d, '*.pcap')):
+        for directory in self.handshake_dirs:
+            if not os.path.isdir(directory):
+                continue
+            try:
+                with os.scandir(directory) as iterator:
+                    capture_entries = sorted(
+                        (
+                            entry for entry in iterator
+                            if (
+                                entry.name.endswith('.pcap')
+                                and entry.is_file()
+                            )
+                        ),
+                        key=lambda entry: entry.name,
+                    )
+            except OSError as error:
+                logging.warning(
+                    f"[A_pwmenu] Could not scan handshake directory "
+                    f"{directory}: {error}"
+                )
+                continue
+            for entry in capture_entries:
+                path = entry.path
                 try:
-                    fn = os.path.basename(f)
-                    st = os.stat(f)
+                    fn = entry.name
+                    st = entry.stat()
                     es, bs = self._handshake_identity(fn)
-                    credential = self._find_cracked_record(cracked, es, bs)
-                    quality = self._quality_file_record(fn, f)
+                    credential = self._find_cracked_record(
+                        cracked, es, bs, credential_lookup
+                    )
+                    quality = self._quality_file_record(fn, path)
                     quality_essid = str(quality.get('essid') or '').strip()
                     quality_bssid = self._compact_bssid(quality.get('bssid'))
                     if quality_bssid and bs and quality_bssid != bs:
                         quality_essid = ''
-                    group_key = ('bssid', bs) if bs else ('essid', es)
+                    resolved_bssid = (
+                        quality_bssid
+                        if quality_bssid and (not bs or quality_bssid == bs)
+                        else bs
+                    )
+                    group_key = (
+                        ('bssid', resolved_bssid)
+                        if resolved_bssid else ('essid', es)
+                    )
                     if group_key not in grps:
                         display_essid = (
                             credential.get('essid')
@@ -5313,7 +8305,7 @@ class A_pwmenu(plugins.Plugin):
                         grps[group_key] = {
                             'essid': display_essid or es,
                             'capture_essid': es,
-                            'bssid': bs,
+                            'bssid': resolved_bssid,
                             'files': [],
                             'ts': 0,
                             'is_cracked': bool(credential),
@@ -5332,15 +8324,22 @@ class A_pwmenu(plugins.Plugin):
                         seen_files[fn] = sig
                         data_changed = True
 
-                    loc, loc_changed = self._location_for_file(fn, f, es, bs, st.st_mtime, date_str, live_gps)
+                    loc, loc_changed = self._location_for_file(
+                        fn, path, es, bs, st.st_mtime, date_str, live_gps
+                    )
                     if loc_changed:
                         data_changed = True
 
                     file_info = {
-                        'filename': fn, 'bssid': bs, 'size': f"{round(st.st_size/1024,1)}KB",
+                        'filename': fn,
+                        'essid': quality_essid or es,
+                        'bssid': resolved_bssid,
+                        'size': f"{round(st.st_size/1024,1)}KB",
                         'date': date_str,
                         'ts': st.st_mtime,
-                        'quality': quality
+                        'quality': quality,
+                        '_path': path,
+                        '_signature': f"{st.st_mtime_ns}:{st.st_size}",
                     }
                     if not file_info['quality']:
                         quality_pending.append(fn)
@@ -5363,7 +8362,9 @@ class A_pwmenu(plugins.Plugin):
                     if st.st_mtime > group['ts']:
                         group['ts'] = st.st_mtime
                 except (OSError, TypeError, ValueError) as e:
-                    logging.warning(f"[A_pwmenu] Could not scan handshake {f}: {e}")
+                    logging.warning(
+                        f"[A_pwmenu] Could not scan handshake {path}: {e}"
+                    )
         if data_changed:
             with self.data_lock:
                 self.data['seen_files'] = seen_files
@@ -5373,6 +8374,25 @@ class A_pwmenu(plugins.Plugin):
         res = list(grps.values())
         for g in res:
             g['files'].sort(key=lambda x: x['ts'], reverse=True)
+            best_file = max(
+                g['files'],
+                key=lambda item: self._capture_export_score(
+                    item.get('_path') or ''
+                ),
+            )
+            for file_info in g['files']:
+                file_info['is_best'] = file_info is best_file
+            g['best_file'] = best_file
+            g['other_files'] = sorted(
+                [
+                    file_info for file_info in g['files']
+                    if file_info is not best_file
+                ],
+                key=lambda item: self._capture_export_score(
+                    item.get('_path') or ''
+                ),
+                reverse=True,
+            )
             g['last_seen'] = g['files'][0]['date']
             g['count'] = len(g['files'])
             g['gps_count'] = len([f for f in g['files'] if f.get('lat') is not None and f.get('lon') is not None])
@@ -5385,8 +8405,25 @@ class A_pwmenu(plugins.Plugin):
         res.sort(key=lambda x: x['ts'], reverse=True)
         return res
 
-    def _get_cracked_data(self):
+    def _get_cracked_data(self, revision=None):
+        revision = revision or self._credential_source_revision()
+        with self.credential_cache_lock:
+            if (
+                self.credential_cache is not None
+                and self.credential_cache_revision == revision
+            ):
+                return self.credential_cache
+            records = self._load_cracked_data()
+            self.credential_cache_revision = revision
+            self.credential_cache = records
+            return records
+
+    def _load_cracked_data(self):
         records = {}
+        with self.data_lock:
+            rejected_credentials = set(
+                self.data.get('credential_rejections', []) or []
+            )
 
         def add_record(record, source):
             if not record or not record.get('password'):
@@ -5394,6 +8431,9 @@ class A_pwmenu(plugins.Plugin):
             essid = str(record.get('essid') or '')
             password = str(record.get('password') or '')
             bssid = self._compact_bssid(record.get('bssid'))
+            rejection_key = self._credential_rejection_key(bssid, password)
+            if rejection_key and rejection_key in rejected_credentials:
+                return
             identity = (
                 ('bssid', bssid, password)
                 if bssid and bssid != '000000000000'
@@ -5438,54 +8478,71 @@ class A_pwmenu(plugins.Plugin):
                             }, s)
                 except OSError as e:
                     logging.warning(f"[A_pwmenu] Could not read potfile {p}: {e}")
-        for ddir in self.handshake_dirs:
-            if os.path.exists(ddir):
-                for c in glob.glob(os.path.join(ddir, '*.pcap.cracked')):
-                    try:
-                        with open(c) as f:
-                            pwd = f.read().strip()
-                            if pwd:
-                                es, bs = self._handshake_identity(
-                                    os.path.basename(c)[:-len('.cracked')]
-                                )
-                                add_record({
-                                    'essid': es,
-                                    'bssid': bs,
-                                    'password': pwd,
-                                }, 'QuickDic')
-                    except (OSError, ValueError, TypeError) as e:
-                        logging.warning(f"[A_pwmenu] Could not read QuickDic result {c}: {e}")
+        for path in self._quickdic_result_paths():
+            try:
+                with open(path) as handle:
+                    password = handle.read().strip()
+                    if password:
+                        essid, bssid = self._handshake_identity(
+                            os.path.basename(path)[:-len('.cracked')]
+                        )
+                        add_record({
+                            'essid': essid,
+                            'bssid': bssid,
+                            'password': password,
+                        }, 'QuickDic')
+            except (OSError, ValueError, TypeError) as error:
+                logging.warning(
+                    f"[A_pwmenu] Could not read QuickDic result "
+                    f"{path}: {error}"
+                )
         return records
 
-    def _find_cracked_record(self, cracked, essid, bssid):
+    def _build_credential_lookup(self, cracked):
+        by_bssid = {}
+        by_exact_essid = {}
+        normalized_records = {}
+        normalized_identities = {}
+        for record in cracked.values():
+            bssid = self._compact_bssid(record.get('bssid'))
+            essid = str(record.get('essid') or '')
+            if bssid:
+                by_bssid[bssid] = record
+            by_exact_essid[essid] = record
+            normalized = self._normalized_essid_key(essid)
+            if normalized:
+                normalized_records[normalized] = record
+                normalized_identities.setdefault(normalized, set()).add(
+                    bssid or essid
+                )
+        by_normalized_essid = {
+            normalized: record
+            for normalized, record in normalized_records.items()
+            if len(normalized_identities.get(normalized, ())) == 1
+        }
+        return {
+            'bssid': by_bssid,
+            'exact_essid': by_exact_essid,
+            'normalized_essid': by_normalized_essid,
+        }
+
+    def _find_cracked_record(self, cracked, essid, bssid, lookup=None):
+        if lookup is None:
+            lookup = self._build_credential_lookup(cracked)
         compact_bssid = self._compact_bssid(bssid)
         if compact_bssid:
-            matches = [
-                record for record in cracked.values()
-                if self._compact_bssid(record.get('bssid')) == compact_bssid
-            ]
-            if matches:
-                return matches[-1]
+            matched = lookup['bssid'].get(compact_bssid)
+            if matched:
+                return matched
 
-        exact = [
-            record for record in cracked.values()
-            if record.get('essid') == essid
-        ]
+        exact = lookup['exact_essid'].get(essid)
         if exact:
-            return exact[-1]
+            return exact
 
         normalized = self._normalized_essid_key(essid)
         if not normalized:
             return None
-        matches = [
-            record for record in cracked.values()
-            if self._normalized_essid_key(record.get('essid')) == normalized
-        ]
-        identities = {
-            self._compact_bssid(record.get('bssid')) or record.get('essid')
-            for record in matches
-        }
-        return matches[-1] if len(identities) == 1 and matches else None
+        return lookup['normalized_essid'].get(normalized)
 
     def _is_locally_cracked(self, filename, cracked=None):
         essid, bssid = self._handshake_identity(filename)
@@ -5503,6 +8560,7 @@ class A_pwmenu(plugins.Plugin):
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <meta name="pwmenu-ui-revision" content="{{ ui_revision|default('') }}">
     <title>A_pwmenu</title>
     <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='16' fill='%23080b0c'/%3E%3Ccircle cx='14' cy='16' r='5' fill='%2320e4f4'/%3E%3Cpath d='M16 24h10c12 0 20 6 20 17S38 57 26 57H16V24Zm10 9v15c7 0 10-2 10-7s-3-8-10-8Z' fill='%23f4f6f7'/%3E%3C/svg%3E">
     <script>
@@ -5511,7 +8569,7 @@ class A_pwmenu(plugins.Plugin):
                 let saved = JSON.parse(localStorage.getItem('a_pwmenu_accent_v1') || 'null');
                 let color = saved && saved.color;
                 if(!color) {
-                    const cookie = document.cookie.match(/(?:^|;\s*)a_pwmenu_accent=([0-9a-f]{6})/i);
+                const cookie = document.cookie.match(/(?:^|;\\s*)a_pwmenu_accent=([0-9a-f]{6})/i);
                     if(cookie) color = '#' + cookie[1];
                 }
                 if(!/^#[0-9a-f]{6}$/i.test(String(color || ''))) return;
@@ -5637,7 +8695,7 @@ class A_pwmenu(plugins.Plugin):
         .map-copy { border:none; border-radius:14px; padding:11px 14px; background:rgba(142,255,184,0.12); color:#8effb8; font-weight:850; cursor:pointer; white-space:nowrap; }
         .map-password { font-size:28px; font-weight:800; margin-top:8px; overflow-wrap:anywhere; filter: blur(7px); user-select:none; cursor:pointer; transition:0.18s; }
         .map-password.visible { filter:none; user-select:text; }
-        .map-toast { position:absolute; z-index:30; left:50%; bottom:92px; transform:translateX(-50%) translateY(18px); padding:12px 16px; border-radius:999px; background:rgba(247,248,251,0.94); color:#050507; font-weight:850; box-shadow:0 14px 35px rgba(0,0,0,0.25); opacity:0; pointer-events:none; transition:0.2s; }
+        .map-toast { position:fixed; z-index:300; left:50%; bottom:92px; transform:translateX(-50%) translateY(18px); padding:12px 16px; border-radius:999px; background:rgba(247,248,251,0.94); color:#050507; font-weight:850; box-shadow:0 14px 35px rgba(0,0,0,0.25); opacity:0; pointer-events:none; transition:0.2s; }
         .map-toast.show { opacity:1; transform:translateX(-50%) translateY(0); }
         .map-toast.error { background:#ff453a;color:#fff; }
         .map-status { background: rgba(255,255,255,0.04); border-radius: 16px; padding: 12px 14px; color: #c9ccd2; font-weight: 700; margin-top: 12px; }
@@ -5666,18 +8724,83 @@ class A_pwmenu(plugins.Plugin):
         .map-list-item.green { background: rgba(4, 63, 32, 0.85); border: 1px solid rgba(7,140,69,0.8); }
         .map-list-item.blue { background: rgba(7, 31, 69, 0.86); border: 1px solid rgba(10,102,220,0.75); }
         .map-list-item.red { background: rgba(74, 15, 18, 0.88); border: 1px solid rgba(255,69,58,0.72); }
-        .cleanup-file-list, .whitelist-list { margin:12px 0 0;padding:0;list-style:none;display:grid;gap:7px; }
-        .cleanup-file-list li, .whitelist-item { padding:9px 10px;border-radius:11px;background:rgba(255,255,255,.035);color:#aeb2bb;font-size:11px;overflow-wrap:anywhere; }
+        .cleanup-file-list { margin:12px 0 0;padding:0;list-style:none;display:grid;gap:7px; }
+        .cleanup-file-list li { padding:9px 10px;border-radius:11px;background:rgba(255,255,255,.035);color:#aeb2bb;font-size:11px;overflow-wrap:anywhere; }
         .cleanup-file-list strong { display:block;color:#d8dcdf;font-family:monospace;font-size:11px; }
         .cleanup-file-list span { display:block;margin-top:3px;color:#7f898e; }
         .whitelist-form { display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px;margin-top:12px; }
         .whitelist-input { min-width:0;border:1px solid #333;border-radius:12px;outline:none;background:#0b0d0f;color:#fff;padding:11px 12px;font-size:14px; }
         .whitelist-input:focus { border-color:rgba(32,228,244,.58);box-shadow:0 0 0 3px rgba(32,228,244,.08); }
         .whitelist-submit { border:1px solid rgba(32,228,244,.35);border-radius:12px;background:rgba(32,228,244,.08);color:#20e4f4;padding:0 15px;font-weight:850;cursor:pointer; }
-        .whitelist-item { display:flex;align-items:center;justify-content:space-between;gap:10px;color:#e4e8ea; }
-        .whitelist-remove { flex:0 0 auto;border:0;background:transparent;color:#ff6b62;font-size:12px;font-weight:800;cursor:pointer; }
-        .whitelist-more { margin-top:9px;border:1px solid rgba(255,255,255,.07);border-radius:12px;padding:0 10px 10px; }
-        .whitelist-more summary { padding:10px 0 0;color:var(--accent);font-size:12px;font-weight:850;cursor:pointer; }
+        .compact-card-heading{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:8px}
+        .compact-card-heading small,.compact-card-heading h3{display:block;margin:0}
+        .compact-card-heading small{margin-bottom:3px;color:var(--sub);font-size:9px;font-weight:800;letter-spacing:.11em;text-transform:uppercase}
+        .compact-card-heading h3{font-size:1.05rem}
+        .compact-card-heading>strong{min-width:31px;padding:5px 8px;border-radius:999px;background:color-mix(in srgb,var(--accent) 10%,transparent);color:var(--accent);font-size:12px;text-align:center}
+        .compact-card-heading-actions{display:flex;align-items:center;gap:7px}
+        .compact-card-heading-actions>strong{min-width:31px;padding:5px 8px;border-radius:999px;background:color-mix(in srgb,var(--accent) 10%,transparent);color:var(--accent);font-size:12px;text-align:center}
+        .compact-copy-button{display:grid;width:31px;height:31px;min-width:31px;place-items:center;padding:0;border:1px solid var(--line);border-radius:10px;background:rgba(255,255,255,.025);color:var(--accent);cursor:pointer}
+        .compact-copy-button svg{width:13px;height:13px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+        .conflict-list,.activity-history-list,.whitelist-compact-list{max-height:305px;margin-top:12px;display:grid;gap:7px;overflow:auto;overscroll-behavior:contain;scrollbar-width:thin}
+        .conflict-item,.activity-history-item,.whitelist-compact-item{display:grid;grid-template-columns:auto minmax(0,1fr) auto;align-items:center;gap:9px;padding:10px;border:1px solid rgba(255,255,255,.055);border-radius:12px;background:rgba(255,255,255,.025)}
+        .conflict-item>i,.activity-history-item>i,.whitelist-compact-item>i{width:8px;height:8px;border-radius:50%;background:#ff9f0a;box-shadow:0 0 11px rgba(255,159,10,.3)}
+        .conflict-item.password>i{background:var(--danger)}
+        .conflict-item.identity>i{background:#ffcc00}
+        .conflict-item.name-only>i{background:#5fa8ff}
+        .conflict-item.duplicate>i{background:var(--sub)}
+        .conflict-item span,.conflict-item b,.conflict-item small,.activity-history-item span,.activity-history-item b,.activity-history-item small,.whitelist-compact-item span,.whitelist-compact-item b,.whitelist-compact-item small{display:block;min-width:0}
+        .conflict-item b,.activity-history-item b,.whitelist-compact-item b{overflow:hidden;color:var(--text);font-size:12px;text-overflow:ellipsis;white-space:nowrap}
+        .conflict-item small,.activity-history-item small,.whitelist-compact-item small{margin-top:3px;color:var(--sub);font-size:10px;line-height:1.35}
+        .conflict-item em{padding:3px 6px;border-radius:999px;background:rgba(255,255,255,.055);color:var(--sub);font-size:8px;font-style:normal;font-weight:850;text-transform:uppercase}
+        .conflict-item-actions{display:grid;justify-items:end;gap:5px}
+        .conflict-repair{padding:5px 7px;border:1px solid color-mix(in srgb,var(--accent) 32%,transparent);border-radius:9px;background:color-mix(in srgb,var(--accent) 8%,transparent);color:var(--accent);font-size:8px;font-weight:900;cursor:pointer}
+        .conflict-repair:disabled{opacity:.5;cursor:wait}
+        .conflict-repair.loading{opacity:1}
+        .conflict-repair.loading:before{content:"";display:inline-block;width:8px;height:8px;margin-right:5px;border:1.5px solid currentColor;border-right-color:transparent;border-radius:50%;vertical-align:-1px;animation:pwmenu-spin .75s linear infinite}
+        @keyframes pwmenu-spin{to{transform:rotate(360deg)}}
+        .activity-history-item>i{background:var(--accent);box-shadow:0 0 11px color-mix(in srgb,var(--accent) 30%,transparent)}
+        .activity-history-item.capture>i{background:#42d982}
+        .activity-history-item.cloud>i{background:#5fa8ff}
+        .activity-history-item.password>i{background:#bd7cff}
+        .activity-history-item.cleanup>i{background:#ff6b62}
+        .activity-history-item time{color:var(--sub);font-size:9px;text-align:right;white-space:nowrap}
+        .activity-history-item time small{font-size:8px}
+        .whitelist-compact-item>i{background:#42d982;box-shadow:0 0 11px rgba(66,217,130,.3)}
+        .whitelist-remove{flex:0 0 auto;border:1px solid color-mix(in srgb,var(--danger) 28%,transparent);border-radius:999px;background:color-mix(in srgb,var(--danger) 7%,transparent);color:var(--danger);padding:5px 8px;font-size:9px;font-weight:850;cursor:pointer}
+        .activity-history-empty,.whitelist-compact-empty{padding:18px;color:var(--sub);font-size:11px;text-align:center}
+        .compact-load-more{width:100%;margin-top:9px;padding:10px;border:1px solid var(--line);border-radius:11px;background:rgba(255,255,255,.025);color:var(--accent);font-weight:850;cursor:pointer}
+        .compact-load-more:disabled{opacity:.5;cursor:wait}
+        .identity-card{padding:15px!important;text-align:left}
+        .identity-card-top{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:9px}
+        .identity-disclosure{display:grid;width:100%;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:10px;padding:0;border:0;background:transparent;color:inherit;text-align:left;cursor:pointer}
+        .identity-disclosure small,.identity-disclosure strong,.identity-disclosure span span{display:block}
+        .identity-disclosure small{color:var(--accent);font-size:9px;font-weight:900;letter-spacing:.13em;text-transform:uppercase}
+        .identity-disclosure strong{margin-top:2px;color:var(--text);font-size:1.1rem;letter-spacing:-.03em}
+        .identity-disclosure span span{margin-top:2px;color:var(--sub);font-size:10px}
+        .identity-chevron{width:30px;height:30px;display:grid;place-items:center;border:1px solid var(--line);border-radius:50%;color:var(--sub);transition:transform .2s,color .2s,border-color .2s}
+        .identity-chevron svg{width:14px;height:14px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+        .identity-disclosure[aria-expanded="true"] .identity-chevron{border-color:color-mix(in srgb,var(--accent) 35%,transparent);color:var(--accent);transform:rotate(180deg)}
+        .identity-theme{display:none;min-height:36px;align-items:center;gap:7px;padding:7px 9px;border:1px solid var(--line);border-radius:11px;background:rgba(255,255,255,.03);color:var(--text);font-size:9px;font-weight:850;cursor:pointer}
+        .identity-theme .accent-current{display:block;width:11px;height:11px}
+        .identity-card .mobile-xp-track{height:4px;overflow:hidden;margin-top:11px;border-radius:999px;background:rgba(255,255,255,.07)}
+        .identity-card .mobile-xp-track i{display:block;height:100%;border-radius:inherit;background:var(--accent);box-shadow:0 0 12px color-mix(in srgb,var(--accent) 55%,transparent)}
+        .identity-achievements{margin-top:12px;padding-top:12px;border-top:1px solid var(--line)}
+        .identity-achievements.hidden{display:none}
+        .other-stat-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:7px}
+        .other-stat{padding:11px 8px;border:1px solid var(--line);border-radius:13px;background:rgba(255,255,255,.025);text-align:center}
+        .other-stat strong,.other-stat small{display:block}
+        .other-stat strong{color:var(--text);font-size:1.12rem}
+        .other-stat.primary strong{color:var(--green)}
+        .other-stat small{margin-top:2px;color:var(--sub);font-size:8px;font-weight:850;letter-spacing:.08em;text-transform:uppercase}
+        .other-action-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:7px;margin-top:10px}
+        .other-action{display:flex;min-height:42px;align-items:center;justify-content:center;padding:8px 10px;border:1px solid var(--line);border-radius:12px;background:rgba(255,255,255,.03);color:#dce2e4;font-size:10px;font-weight:850;text-align:center;text-decoration:none;cursor:pointer}
+        .other-action.primary{border-color:color-mix(in srgb,var(--accent) 30%,transparent);background:color-mix(in srgb,var(--accent) 8%,transparent);color:var(--accent)}
+        .compact-import-state{display:none;margin-top:8px;padding:9px;border:1px solid var(--line);border-radius:11px;background:rgba(255,255,255,.02);color:var(--sub);font-size:10px}
+        .compact-import-state.ready{display:flex;align-items:center;justify-content:space-between;gap:8px}
+        .compact-import-state button{flex:0 0 auto;border:0;border-radius:9px;background:var(--accent);color:var(--accent-contrast);padding:7px 9px;font-weight:850;cursor:pointer}
+        .service-alert{margin-top:10px;padding:10px;border:1px solid rgba(255,69,58,.25);border-radius:12px;background:rgba(255,69,58,.06);color:#ff8c85;font-size:10px;line-height:1.45}
+        .service-alert b,.service-alert span{display:block}
+        .service-alert span{margin-top:3px;color:var(--sub)}
         .external-service-link { color:inherit;text-decoration:none; }
         .external-service-link:hover { color:var(--accent); }
         .map-placement-target { position:absolute;z-index:20;left:50%;top:50%;width:58px;height:58px;transform:translate(-50%,-100%);pointer-events:none;filter:drop-shadow(0 14px 18px rgba(0,0,0,.46)); }
@@ -5721,6 +8844,7 @@ class A_pwmenu(plugins.Plugin):
             .newfpv-credit { width:100%;min-width:0; }
             .whitelist-form { grid-template-columns:1fr; }
             .whitelist-submit { min-height:44px; }
+            .identity-theme{display:flex}
         }
 
         :root {
@@ -5855,7 +8979,7 @@ class A_pwmenu(plugins.Plugin):
         .tab.active span { color:var(--accent-contrast);opacity:.88; }
         .notif { position:relative;z-index:60;margin:0 0 16px;border-radius:17px;background:rgba(48,209,88,.10);box-shadow:0 14px 45px rgba(0,0,0,.18); }
         #v-cracked.list, #v-handshakes.list { display:grid;grid-template-columns:repeat(2,minmax(0,1fr));align-items:start;gap:12px;overflow:visible;border-radius:0;background:transparent; }
-        #v-cracked>.si, #v-handshakes>.si { overflow:hidden;border:1px solid var(--line);border-radius:21px;background:linear-gradient(145deg,rgba(20,23,26,.94),rgba(11,13,15,.94));transition:border-color .2s,transform .2s,background .2s; }
+        #v-cracked>.si, #v-handshakes>.si { overflow:hidden;border:1px solid var(--line);border-radius:21px;background:linear-gradient(145deg,rgba(20,23,26,.94),rgba(11,13,15,.94));transition:border-color .2s,transform .2s,background .2s;content-visibility:auto;contain-intrinsic-size:auto 92px; }
         #v-cracked>.si>.row { min-height:112px;padding:18px 19px;border:0; }
         #v-cracked>.si:hover, #v-handshakes>.si:hover { border-color:color-mix(in srgb,var(--accent) 38%,transparent);background:linear-gradient(145deg,color-mix(in srgb,var(--accent) 5%,#14171a),#0d0f11);transform:translateY(-2px); }
         #v-handshakes>.si>.row { min-height:112px;padding:18px 19px;border:0; }
@@ -5868,6 +8992,13 @@ class A_pwmenu(plugins.Plugin):
         .capture-file-head { display:flex;align-items:flex-start;justify-content:space-between;gap:10px; }
         .capture-file-info { min-width:0; }
         .capture-file-name { overflow:hidden;color:#eef2f3;font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:.7rem;font-weight:800;text-overflow:ellipsis;white-space:nowrap; }
+        .best-capture-badge{display:inline-flex;margin-left:7px;padding:2px 6px;border:1px solid color-mix(in srgb,var(--accent) 38%,transparent);border-radius:999px;background:color-mix(in srgb,var(--accent) 10%,transparent);color:var(--accent);font-family:Inter,system-ui,sans-serif;font-size:8px;letter-spacing:.08em;vertical-align:1px}
+        .capture-other-list{margin:9px 0 0;border:1px solid var(--line);border-radius:13px;background:rgba(255,255,255,.018);overflow:hidden}
+        .capture-other-list>summary{display:flex;align-items:center;justify-content:space-between;padding:11px 12px;color:var(--sub);font-size:11px;font-weight:850;cursor:pointer;list-style:none}
+        .capture-other-list>summary::-webkit-details-marker{display:none}
+        .capture-other-list>summary b{min-width:25px;padding:3px 7px;border-radius:999px;background:rgba(255,255,255,.07);color:var(--text);text-align:center}
+        .capture-other-body{padding:0 8px 8px}
+        .capture-other-body .capture-row{margin-top:7px;opacity:.82}
         .capture-file-bssid { overflow:hidden;color:#dce1e3;font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:.68rem;text-overflow:ellipsis;white-space:nowrap; }
         .capture-file-meta { margin-top:2px;color:#727c81;font-size:.56rem; }
         .capture-file-info .quality-badge { display:inline-flex;margin-top:4px;padding:3px 6px;font-size:.48rem; }
@@ -5901,6 +9032,15 @@ class A_pwmenu(plugins.Plugin):
         #v-cracked>.newfpv-credit, #v-handshakes>.newfpv-credit { grid-column:1/-1; }
         #v-other { grid-template-columns:repeat(2,minmax(0,1fr));align-items:start;gap:14px; }
         #v-other:not(.hidden) { display:grid; }
+        #v-other>.cleanup-card{order:1}
+        #v-other>.identity-card{order:2}
+        #v-other>.operations-card{order:3}
+        #v-other>.ohc-card{order:4}
+        #v-other>.wpa-card{order:5}
+        #v-other>.whitelist-card{order:6}
+        #v-other>.activity-card{grid-column:1/-1;order:7}
+        #v-other>.conflict-card{grid-column:1/-1;order:8}
+        #v-other>.newfpv-credit{order:9}
         .mobile-profile-card { display:none; }
         .card { height:100%;margin:0;padding:22px;border:1px solid var(--line);border-radius:23px;background:linear-gradient(145deg,rgba(20,23,26,.94),rgba(11,13,15,.94));box-shadow:none; }
         .card h3 { letter-spacing:-.025em; }
@@ -6214,6 +9354,28 @@ class A_pwmenu(plugins.Plugin):
         <i aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"></path><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"></path></svg></i>
     </a>
     {%- endmacro %}
+    {% macro capture_row(g, f, best=false) -%}
+    <div class="sub-row capture-row{% if best %} best-capture{% endif %}" data-filename="{{ f.filename }}">
+        <div class="capture-file-head">
+            <div class="capture-file-info">
+                <div class="capture-file-name" title="{{ f.filename }}">{{ f.filename }}{% if best %}<span class="best-capture-badge">BEST</span>{% endif %}</div>
+                <div class="capture-file-bssid">{{ f.bssid or 'Unknown BSSID' }}</div>
+                <div class="capture-file-meta">{{ f.date }} В· {{ f.size }}</div>
+                {% if f.quality.grade %}<div class="quality-badge {{ f.quality.grade|lower }}" title="{{ f.quality.summary }}">{{ f.quality.grade }}</div>{% else %}<div class="quality-badge">Pending</div>{% endif %}
+            </div>
+            <button class="capture-file-delete" onclick='rm({{ f.filename|tojson }})' title="Delete {{ f.filename }}"><svg viewBox="0 0 24 24"><path d="M4 7h16M9 7V4h6v3m-9 0 1 14h10l1-14M10 11v6m4-6v6"></path></svg></button>
+        </div>
+        <div class="capture-actions">
+            <button class="capture-action map-capture-action" onclick='placeHandshakeOnMap({{ f.filename|tojson }}, {{ g.essid|tojson }}, {{ f.bssid|tojson }})'><svg viewBox="0 0 24 24"><path d="M20 10c0 5-8 11-8 11S4 15 4 10a8 8 0 1 1 16 0Z"></path><circle cx="12" cy="10" r="2.5"></circle></svg><span>{{ 'Move' if f.lat is not none and f.lon is not none else 'Map' }}</span></button>
+            {% if best %}
+            {% if show_wpa %}<button class="capture-action" onclick='upl({{ f.filename|tojson }})'><svg viewBox="0 0 24 24"><path d="M12 3 5 6v5c0 4.6 2.8 8 7 10 4.2-2 7-5.4 7-10V6l-7-3Z"></path><path d="M9 12h6"></path></svg><span>WPA</span></button>{% endif %}
+            <button class="capture-action" onclick='sendSingleToOhc({{ f.filename|tojson }})'><svg viewBox="0 0 24 24"><path d="M7 18h10a4 4 0 0 0 .7-7.9A6 6 0 0 0 6.3 8.5 4.8 4.8 0 0 0 7 18Z"></path><path d="m9 13 3-3 3 3m-3-3v6"></path></svg><span>OHC</span></button>
+            <a href="/plugins/A_pwmenu/download-22000/{{ f.filename|urlencode }}" class="capture-action accent"><svg viewBox="0 0 24 24"><path d="M8 3 6 21m10-18-2 18M3 9h18M2 15h18"></path></svg><span>22000</span></a>
+            <a href="/plugins/A_pwmenu/download/{{ f.filename|urlencode }}" class="capture-action accent"><svg viewBox="0 0 24 24"><path d="M12 3v12m-4-4 4 4 4-4"></path><path d="M5 19h14"></path></svg><span>PCAP</span></a>
+            {% endif %}
+        </div>
+    </div>
+    {%- endmacro %}
     <div class="pwmenu-page">
 
         <header class="pw-nav-wrap">
@@ -6293,9 +9455,29 @@ class A_pwmenu(plugins.Plugin):
         {% if notif %}
         <div id="nt" class="notif {{ 'err' if ntype == 'error' else '' }}"><b>{{ notif }}</b></div>
         {% endif %}
+        <!-- PWMENU_NOTIFICATION -->
+
+        {% if health_issues %}
+        <details class="health-panel">
+            <summary>
+                <span><i></i><b>System attention</b></span>
+                <strong>{{ health_issues|length }}</strong>
+            </summary>
+            <div class="health-issue-list">
+                {% for issue in health_issues %}
+                <button class="health-issue {{ issue.kind }}" type="button" onclick="tab({{ issue.tab|tojson }})">
+                    <span><b>{{ issue.title }}</b><small>{{ issue.detail }}</small></span>
+                    <i>&rsaquo;</i>
+                </button>
+                {% endfor %}
+            </div>
+        </details>
+        {% endif %}
 
         <div id="v-cracked" class="list hidden">
+            <!-- PWMENU_TAB_CRACKED_START -->
             {% for credential_id, d in cracked.items() %}
+            <!-- PWMENU_CARD_CRACKED_{{ loop.index }}_START -->
             <div class="si credential-card" data-kind="credential" data-essid="{{ d.essid }}" data-bssid="{{ d.bssid }}" data-t="{{ d.essid }} {{ d.bssid }} {{ d.password }}">
                 <div class="row" onclick="tog('cracked-{{ loop.index }}')">
                     <div style="flex-grow:1;min-width:0">
@@ -6304,7 +9486,8 @@ class A_pwmenu(plugins.Plugin):
                     </div>
                     <span class="arr" title="Open credential"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9 6 6 6-6 6"></path></svg></span>
                 </div>
-                <div id="s-cracked-{{ loop.index }}" class="subs">
+                <div id="s-cracked-{{ loop.index }}" class="subs" data-detail-kind="cracked" data-detail-id="{{ loop.index }}">
+                    <!-- PWMENU_DETAIL_CRACKED_{{ loop.index }}_START -->
                     <div class="credential-expanded credential-panel">
                         <div class="credential-label">Password</div>
                         <div class="credential-value">{{ d.password }}</div>
@@ -6313,16 +9496,21 @@ class A_pwmenu(plugins.Plugin):
                             <button class="network-expanded-action" style="color:var(--danger)" onclick='del({{ d.essid|tojson }}, {{ d.password|tojson }}, {{ d.source|tojson }}, {{ d.bssid|tojson }})'>Delete password</button>
                         </div>
                     </div>
+                    <!-- PWMENU_DETAIL_CRACKED_{{ loop.index }}_END -->
                 </div>
             </div>
+            <!-- PWMENU_CARD_CRACKED_{{ loop.index }}_END -->
             {% endfor %}
             {% if not cracked %}<div style="padding:30px;text-align:center;color:var(--sub);">No cracked networks yet.</div>{% endif %}
             {{ newfpv_credit(false) }}
+            <!-- PWMENU_TAB_CRACKED_END -->
         </div>
 
         <div id="v-handshakes" class="list hidden">
+            <!-- PWMENU_TAB_HANDSHAKES_START -->
             {% for g in groups %}
             {% set group_index = loop.index %}
+            <!-- PWMENU_CARD_HANDSHAKES_{{ loop.index }}_START -->
             <div class="si handshake-card" data-kind="handshake" data-essid="{{ g.essid }}" data-bssid="{{ g.bssid }}" data-t="{{ g.essid }}">
                 <div class="row">
                     <div style="flex-grow:1;min-width:0" onclick="tog('handshake-{{ loop.index }}')">
@@ -6333,7 +9521,8 @@ class A_pwmenu(plugins.Plugin):
                         <span class="arr" onclick="tog('handshake-{{ loop.index }}')" title="Open captures"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9 6 6 6-6 6"></path></svg></span>
                     </div>
                 </div>
-                <div id="s-handshake-{{ loop.index }}" class="subs">
+                <div id="s-handshake-{{ loop.index }}" class="subs" data-detail-kind="handshake" data-detail-id="{{ loop.index }}">
+                    <!-- PWMENU_DETAIL_HANDSHAKE_{{ loop.index }}_START -->
                     {% if g.is_cracked and g.pwd %}
                     <div class="credential-expanded credential-panel">
                         <div class="credential-label">Recovered password</div>
@@ -6351,10 +9540,11 @@ class A_pwmenu(plugins.Plugin):
                         <button class="network-expanded-action" onclick='whitelistAdd({{ g.essid|tojson }}, "handshakes", {{ g.bssid|tojson }})' title="Add this network to the whitelist"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3 5 6v5c0 4.6 2.8 8 7 10 4.2-2 7-5.4 7-10V6l-7-3Z"></path><path d="m9 12 2 2 4-4"></path></svg><span>Whitelist</span></button>
                     </div>
                     {% for f in g.files %}
+                    {% if f.is_best %}
                     <div class="sub-row capture-row" data-filename="{{ f.filename }}">
                         <div class="capture-file-head">
                             <div class="capture-file-info">
-                                <div class="capture-file-name" title="{{ f.filename }}">{{ f.filename }}</div>
+                                <div class="capture-file-name" title="{{ f.filename }}">{{ f.filename }}<span class="best-capture-badge">BEST</span></div>
                                 <div class="capture-file-bssid">{{ f.bssid or 'Unknown BSSID' }}</div>
                                 <div class="capture-file-meta">{{ f.date }} · {{ f.size }}</div>
                                 {% if f.quality.grade %}<div class="quality-badge {{ f.quality.grade|lower }}" title="{{ f.quality.summary }}">{{ f.quality.grade }}</div>{% else %}<div class="quality-badge">Pending</div>{% endif %}
@@ -6369,14 +9559,29 @@ class A_pwmenu(plugins.Plugin):
                             <a href="/plugins/A_pwmenu/download/{{ f.filename|urlencode }}" class="capture-action accent"><svg viewBox="0 0 24 24"><path d="M12 3v12m-4-4 4 4 4-4"></path><path d="M5 19h14"></path></svg><span>PCAP</span></a>
                         </div>
                     </div>
+                    {% endif %}
                     {% endfor %}
+                    {% if g.other_files %}
+                    <details class="capture-other-list">
+                        <summary><span>Other captures</span><b>{{ g.other_files|length }}</b></summary>
+                        <div class="capture-other-body">
+                            {% for f in g.other_files %}
+                            {{ capture_row(g, f, false) }}
+                            {% endfor %}
+                        </div>
+                    </details>
+                    {% endif %}
+                    <!-- PWMENU_DETAIL_HANDSHAKE_{{ loop.index }}_END -->
                 </div>
             </div>
+            <!-- PWMENU_CARD_HANDSHAKES_{{ loop.index }}_END -->
             {% endfor %}
             {{ newfpv_credit(false) }}
+            <!-- PWMENU_TAB_HANDSHAKES_END -->
         </div>
 
         <div id="v-map" class="map-shell hidden">
+            <!-- PWMENU_TAB_MAP_START -->
             <div class="map-stage" id="mapStage">
                 <div class="map-topbar">
                     <label class="map-filter-toggle map-glass" title="Show only cracked networks">
@@ -6406,7 +9611,6 @@ class A_pwmenu(plugins.Plugin):
                 <div id="yandexMap" class="ymap-real"></div>
                 <div id="mapMarkers"></div>
                 <div id="mapDock" class="hidden" style="display:none!important" aria-hidden="true"><button id="mapAllBtn"></button><button id="mapCrackedBtn"></button><button id="mapNoGpsBtn"></button></div>
-                <div id="mapToast" class="map-toast">Copied</div>
             </div>
             <div id="mapSheet" class="map-sheet hidden">
                 <div class="map-handle"></div>
@@ -6448,25 +9652,45 @@ class A_pwmenu(plugins.Plugin):
                 </div>
                 <div id="mapDetails" class="hidden"></div>
             </div>
+            <!-- PWMENU_TAB_MAP_END -->
         </div>
         <footer class="map-desktop-footer">{{ newfpv_credit(false) }}</footer>
 
         <div id="v-other" class="hidden">
-            <section class="mobile-profile-card" aria-label="Pwnagotchi identity and appearance">
-                <div class="mobile-profile-top">
-                    <div>
-                        <small>Identity</small>
-                        <strong>{{ stats.rank }}</strong>
-                        <span>Level {{ stats.level }} &middot; {{ stats.xp }} / {{ stats.next_xp }} XP</span>
-                    </div>
-                    <button id="mobileAccentToggle" class="mobile-profile-accent accent-trigger" type="button" onclick="toggleAccentPanel(event)" aria-expanded="false" aria-controls="accentPanel">
-                        <i class="accent-current"></i>
-                        <span>Theme</span>
+            <!-- PWMENU_TAB_OTHER_START -->
+            {% set conflicts = conflicts|default([]) %}
+            {% set activity_history = activity_history|default({'items': [], 'total': 0, 'nextOffset': 0, 'hasMore': false}) %}
+            <div class="card identity-card" aria-label="Pwnagotchi identity and achievements">
+                <div class="identity-card-top">
+                    <button id="identityDisclosure" class="identity-disclosure" type="button" onclick="toggleIdentityAchievements()" aria-expanded="false" aria-controls="identityAchievements">
+                        <span>
+                            <small>Identity</small>
+                            <strong>{{ stats.rank }}</strong>
+                            <span>Level {{ stats.level }} &middot; {{ stats.xp }} / {{ stats.next_xp }} XP</span>
+                        </span>
+                        <i class="identity-chevron"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6"></path></svg></i>
+                    </button>
+                    <button id="mobileAccentToggle" class="identity-theme accent-trigger" type="button" onclick="toggleAccentPanel(event)" aria-expanded="false" aria-controls="accentPanel">
+                        <i class="accent-current"></i><span>Theme</span>
                     </button>
                 </div>
                 <div class="mobile-xp-track" aria-label="Level progress {{ stats.lvl_percent }} percent"><i style="width:{{ stats.lvl_percent }}%"></i></div>
-            </section>
-            <div class="card" style="padding:15px;text-align:left;">
+                <div id="identityAchievements" class="identity-achievements hidden">
+                    <div class="ach-list">
+                        {% for a in ach %}
+                        <div class="ach-row {{ 'unlocked' if a.unlocked else '' }}">
+                            <div class="ach-icon">{{ a.icon }}</div>
+                            <div class="ach-info">
+                                <div class="ach-name">{{ a.name }}</div>
+                                <div class="ach-desc">{{ a.desc }}</div>
+                            </div>
+                            <div class="ach-prog">{{ a.current }} / {{ a.target }}</div>
+                        </div>
+                        {% endfor %}
+                    </div>
+                </div>
+            </div>
+            <div class="card ohc-card" style="padding:15px;text-align:left;">
                 <h3 style="margin-top:0;text-align:center;"><a class="external-service-link" href="https://app.onlinehashcrack.com/" target="_blank" rel="noopener noreferrer">OnlineHashCrack ↗</a></h3>
                 <button class="btn" style="margin-top:0;background:#ff9f0a;" onclick="sendAllMissingToOhc()">Send all missing to OHC</button>
                 <div class="sub" style="margin-top:10px;">
@@ -6474,12 +9698,18 @@ class A_pwmenu(plugins.Plugin):
                     {% if ohc_status.retry_in > 0 %} • retry in {{ ohc_status.retry_in }}s{% endif %}
                 </div>
                 {% if ohc_status.uncrackable %}
-                <div class="sub" style="margin-top:4px;color:var(--danger);">{{ ohc_status.uncrackable }} capture(s) cannot be sent because they contain no extractable WPA/PMKID hash. Review Capture Cleanup below.</div>
+                <div class="service-alert"><b>{{ ohc_status.uncrackable }} capture(s) have no extractable WPA/PMKID hash.</b><span>They are excluded before upload and listed in Capture cleanup.</span></div>
                 {% endif %}
-                <div class="sub" style="margin-top:4px;">Queues one best unresolved PCAP per BSSID. Local history and the last imported OHC export are excluded before upload.</div>
+                {% if not pot_health.ok %}
+                <div class="service-alert">
+                    <b>OHC password storage needs attention</b>
+                    <span>{{ pot_health.credentials }} credential(s), {{ pot_health.duplicates }} duplicate(s), {{ pot_health.invalid }} invalid line(s), {{ pot_health.nul_bytes }} NUL byte(s).</span>
+                </div>
+                {% endif %}
+                <div class="sub" style="margin-top:6px;">Queues one best unresolved PCAP per BSSID. Local history and the latest imported OHC export are excluded before upload.</div>
             </div>
 
-            <div class="card" style="padding:15px;text-align:left;">
+            <div class="card wpa-card" style="padding:15px;text-align:left;">
                 <h3 style="margin-top:0;text-align:center;"><a class="external-service-link" href="https://wpa-sec.stanev.org/?submit=" target="_blank" rel="noopener noreferrer">WPA-sec ↗</a></h3>
                 <button class="btn" style="margin-top:0;background:#147a45;color:#fff;" onclick="syncWpaSec()">Sync WPA-sec now</button>
                 <div class="sub" style="margin-top:10px;">
@@ -6496,21 +9726,11 @@ class A_pwmenu(plugins.Plugin):
                 {% if wpa_status.last_upload %}<div class="sub" style="margin-top:4px;">{{ wpa_status.last_upload }}</div>{% endif %}
             </div>
 
-            <div class="card" style="padding:15px;text-align:left;">
-                <h3 style="margin-top:0;text-align:center;">OHC Password Storage</h3>
-                <div style="font-weight:800;color:{{ 'var(--green)' if pot_health.ok else 'var(--danger)' }};">
-                    {{ 'Healthy' if pot_health.ok else 'Needs attention' }}
+            <div class="card whitelist-card" style="padding:15px;text-align:left;">
+                <div class="compact-card-heading">
+                    <div><small>Pwnagotchi protection</small><h3>Network whitelist</h3></div>
+                    <strong id="whitelistTotal">{{ whitelist|length }}</strong>
                 </div>
-                <div class="sub" style="margin-top:8px;">
-                    {{ pot_health.credentials }} credential(s) - {{ pot_health.bytes }} byte(s)
-                </div>
-                <div class="sub" style="margin-top:4px;">
-                    {{ pot_health.duplicates }} duplicate(s) - {{ pot_health.invalid }} invalid line(s) - {{ pot_health.nul_bytes }} NUL byte(s)
-                </div>
-            </div>
-
-            <div class="card" style="padding:15px;text-align:left;">
-                <h3 style="margin-top:0;text-align:center;">Network Whitelist</h3>
                 <div class="sub">Add an exact network name. Changes are written atomically and applied to the running Pwnagotchi session.</div>
                 <form method="POST" action="/plugins/A_pwmenu/whitelist-add" class="whitelist-form" onsubmit="return whitelistFormSubmit(event)">
                     <input type="hidden" name="csrf_token" value="{{ token }}">
@@ -6519,77 +9739,108 @@ class A_pwmenu(plugins.Plugin):
                     <button class="whitelist-submit">Add network</button>
                 </form>
                 <div id="whitelistListHost">
-                <ul class="whitelist-list">
-                    {% for network in (whitelist[:10] if whitelist|length > 15 else whitelist) %}
-                    <li class="whitelist-item">
-                        <span>{{ network }}</span>
+                <div class="whitelist-compact-list">
+                    {% for network in whitelist %}
+                    <div class="whitelist-compact-item">
+                        <i></i>
+                        <span><b>{{ network }}</b><small>Ignored during capture</small></span>
                         <button class="whitelist-remove" type="button" onclick='whitelistRemove({{ network|tojson }})'>Remove</button>
-                    </li>
+                    </div>
                     {% else %}
-                    <li class="whitelist-item"><span>No active whitelist entries.</span></li>
+                    <div class="whitelist-compact-empty">No active whitelist entries.</div>
                     {% endfor %}
-                </ul>
-                {% if whitelist|length > 15 %}
-                <details class="whitelist-more">
-                    <summary>Show {{ whitelist|length - 10 }} more</summary>
-                    <ul class="whitelist-list">
-                        {% for network in whitelist[10:] %}
-                        <li class="whitelist-item">
-                            <span>{{ network }}</span>
-                            <button class="whitelist-remove" type="button" onclick='whitelistRemove({{ network|tojson }})'>Remove</button>
-                        </li>
-                        {% endfor %}
-                    </ul>
-                </details>
-                {% endif %}
+                </div>
                 </div>
             </div>
 
-            <div class="card">
-                <h3 style="margin-top:0">Achievements</h3>
-                <div class="ach-list">
-                    {% for a in ach %}
-                    <div class="ach-row {{ 'unlocked' if a.unlocked else '' }}">
-                        <div class="ach-icon">{{ a.icon }}</div>
-                        <div class="ach-info">
-                            <div class="ach-name">{{ a.name }}</div>
-                            <div class="ach-desc">{{ a.desc }}</div>
+            {% if conflicts %}
+            <div class="card conflict-card" style="padding:15px;text-align:left;">
+                <div class="compact-card-heading">
+                    <div><small>Needs review</small><h3>Conflict center</h3></div>
+                    <div class="compact-card-heading-actions">
+                        <strong id="conflictTotal">{{ conflicts|length }}</strong>
+                        <button class="compact-copy-button" type="button" onclick="copyConflictCenter(this)" title="Copy every conflict" aria-label="Copy every conflict">
+                            <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="8" y="8" width="11" height="11" rx="2"></rect><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"></path></svg>
+                        </button>
+                    </div>
+                </div>
+                <div class="sub">Equivalent punctuation-only aliases are reconciled automatically. Passwords change only after local cryptographic verification.</div>
+                <div class="conflict-list">
+                    {% for conflict in conflicts %}
+                    <div class="conflict-item {{ conflict.kind }}" data-bssid="{{ conflict.bssid }}">
+                        <i></i>
+                        <span>
+                            <b>{{ conflict.title }}</b>
+                            <small>{{ conflict.detail }}</small>
+                        </span>
+                        <div class="conflict-item-actions">
+                            <em>{{ conflict.kind }}</em>
+                            {% if conflict.repairable %}
+                            <button class="conflict-repair" type="button" onclick='repairPasswordConflict(this, {{ conflict.bssid|tojson }})'>Verify &amp; fix</button>
+                            {% endif %}
                         </div>
-                        <div class="ach-prog">{{ a.current }} / {{ a.target }}</div>
                     </div>
                     {% endfor %}
                 </div>
             </div>
+            {% endif %}
 
-            <div class="card">
-                <div class="stat-g">
-                    <div class="stat-item"><div class="sv" style="color:var(--green)">{{ stats.percent }}%</div><div class="sl">Cracked</div></div>
-                    <div class="stat-item"><div class="sv">{{ stats.total }}</div><div class="sl">Networks</div></div>
-                    <div class="stat-item"><div class="sv">{{ stats.files }}</div><div class="sl">Files</div></div>
+            <div class="card activity-card" style="padding:15px;text-align:left;">
+                <div class="compact-card-heading">
+                    <div><small>Pwnagotchi + PWMenu</small><h3>Activity history</h3></div>
+                    <div class="compact-card-heading-actions">
+                        <strong id="activityHistoryTotal">{{ activity_history['total'] }}</strong>
+                        <button class="compact-copy-button" type="button" onclick="copyAllActivityHistory(this)" title="Copy complete activity history" aria-label="Copy complete activity history">
+                            <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="8" y="8" width="11" height="11" rx="2"></rect><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"></path></svg>
+                        </button>
+                    </div>
                 </div>
-                <a href="/plugins/A_pwmenu/export-passwords" class="btn" style="background:var(--accent);">Export List (.txt)</a>
-                <a href="/plugins/A_pwmenu/download-zip" class="btn">Download All (.zip)</a>
-                <a href="/plugins/A_pwmenu/download-uncracked" class="btn" style="background:#071f45;color:#91c2ff;">Download All Uncracked APs (.zip)</a>
-                <form method="POST" action="/plugins/A_pwmenu/sync-time" style="margin-top:10px;">
-                    <input type="hidden" name="csrf_token" value="{{ token }}">
-                    <button class="btn" style="background:var(--sub);">Sync Time (Google)</button>
-                </form>
+                <div id="activityHistoryList" class="activity-history-list">
+                    {% for item in activity_history['items'] %}
+                    <div class="activity-history-item {{ item.kind }}">
+                        <i></i>
+                        <span>
+                            <b>{{ item.title }}</b>
+                            {% if item.detail %}<small>{{ item.detail }}</small>{% endif %}
+                        </span>
+                        <time>{{ item.time }}<small>{{ item.source }}</small></time>
+                    </div>
+                    {% else %}
+                    <div class="activity-history-empty">Important Pwnagotchi events will appear here.</div>
+                    {% endfor %}
+                </div>
             </div>
 
-            <div class="card">
-                <h3 style="margin-top:0">Import</h3>
+            <div class="card operations-card" style="padding:15px;text-align:left;">
+                <div class="compact-card-heading">
+                    <div><small>Library</small><h3>Results &amp; transfer</h3></div>
+                </div>
+                <div class="other-stat-grid">
+                    <div class="other-stat primary"><strong>{{ stats.percent }}%</strong><small>Cracked</small></div>
+                    <div class="other-stat"><strong>{{ stats.total }}</strong><small>Networks</small></div>
+                    <div class="other-stat"><strong>{{ stats.files }}</strong><small>Files</small></div>
+                </div>
+                <div class="other-action-grid">
+                    <a href="/plugins/A_pwmenu/export-passwords" class="other-action primary">Export passwords</a>
+                    <a href="/plugins/A_pwmenu/download-zip" class="other-action">Download all PCAPs</a>
+                    <a href="/plugins/A_pwmenu/download-uncracked" class="other-action">Download Uncracked</a>
+                    <button class="other-action" type="button" onclick="downloadPWMenuBackup()">Download backup</button>
+                    <button class="other-action" type="button" onclick="document.getElementById('fi').click()">Import</button>
+                    <button class="other-action" type="button" onclick="post('sync-time', {})">Sync device time</button>
+                </div>
                 <form method="POST" action="/plugins/A_pwmenu/import" enctype="multipart/form-data" id="if">
                     <input type="hidden" name="csrf_token" value="{{ token }}">
-                    <div class="upl" onclick="document.getElementById('fi').click()">
-                        <div style="font-size:30px; margin-bottom:10px;">📂</div>
-                        <div id="fn" style="color:var(--sub);">Select .json or .csv</div>
-                        <input type="file" id="fi" name="file" accept=".json,.csv" onchange="sel(this)">
+                    <input type="file" id="fi" name="file" accept=".json,.csv,.pwmenu-backup,application/zip" hidden onchange="sel(this)">
+                    <div id="fn" class="compact-import-state">
+                        <span>No import file selected</span>
+                        <button id="ib" type="submit">Import selected</button>
                     </div>
-                    <button class="btn" id="ib" style="display:none;">Import Passwords</button>
                 </form>
+                <div class="sub" style="margin-top:9px;">Import accepts OHC/Handshake Lab results or a PWMenu backup. A backup contains every PCAP, GPS/MAP point, setting, history record, submission state and recovered password. It is not encrypted.</div>
             </div>
 
-            <div class="card" style="padding:15px;text-align:left;">
+            {% if cleanup_report.count %}
+            <div class="card cleanup-card" style="padding:15px;text-align:left;">
                 <h3 style="margin-top:0;text-align:center;">Capture Cleanup</h3>
                 <div style="font-weight:800;color:{{ 'var(--danger)' if cleanup_report.count else 'var(--green)' }};">
                     {{ cleanup_report.count }} cleanup candidate(s)
@@ -6607,12 +9858,15 @@ class A_pwmenu(plugins.Plugin):
                 </form>
                 {% endif %}
             </div>
+            {% endif %}
 
             {{ newfpv_credit(false) }}
+            <!-- PWMENU_TAB_OTHER_END -->
         </div>
             </section>
         </main>
     </div>
+    <div id="mapToast" class="map-toast" role="status" aria-live="polite">Done</div>
 
     <script>
         const csrfToken = '{{ token }}';
@@ -6622,6 +9876,10 @@ class A_pwmenu(plugins.Plugin):
         const gpsStatus = {{ gps_status|tojson }};
         const whitelistedNetworks = new Set({{ whitelist|tojson }});
         const notificationDurationMs = {{ notification_duration_ms }};
+        const backgroundBatchSize = {{ web_background_batch_size|default(12) }};
+        const backgroundBatchDelayMs = {{ web_background_batch_delay_ms|default(120) }};
+        const foregroundBatchSize = {{ web_foreground_batch_size|default(24) }};
+        const foregroundBatchDelayMs = {{ web_foreground_batch_delay_ms|default(50) }};
         let gpsWatchId = null;
         let selectedMapPoint = null;
         let userLocation = null;
@@ -6668,6 +9926,77 @@ class A_pwmenu(plugins.Plugin):
             try { payload = await response.json(); } catch(error) {}
             if(!response.ok || !payload) throw new Error(payload && payload.message ? payload.message : `Request failed (${response.status})`);
             return payload;
+        }
+
+        async function downloadPWMenuBackup() {
+            showToast('Preparing backup...', false);
+            const body = new URLSearchParams();
+            body.set('csrf_token', csrfToken);
+            try {
+                const response = await fetch('/plugins/A_pwmenu/backup-export', {
+                    method:'POST',
+                    credentials:'same-origin',
+                    headers:{
+                        'Content-Type':'application/x-www-form-urlencoded;charset=UTF-8',
+                        'X-PWMenu-Async':'1'
+                    },
+                    body:body.toString()
+                });
+                if(!response.ok) {
+                    let message = 'Backup creation failed';
+                    try {
+                        const payload = await response.json();
+                        message = payload.message || message;
+                    } catch(error) {}
+                    throw new Error(message);
+                }
+                const blob = await response.blob();
+                const disposition = response.headers.get('Content-Disposition') || '';
+                const match = disposition.match(/filename="?([^";]+)"?/i);
+                const filename = match ? match[1] : 'PWMenu-backup.pwmenu-backup';
+                const url = URL.createObjectURL(blob);
+                const link = document.createElement('a');
+                link.href = url;
+                link.download = filename;
+                document.body.appendChild(link);
+                link.click();
+                link.remove();
+                setTimeout(() => URL.revokeObjectURL(url), 1500);
+                showToast('PWMenu backup downloaded', false);
+            } catch(error) {
+                showToast(error.message || 'Backup creation failed', true);
+            }
+        }
+
+        async function restorePWMenuBackup(input) {
+            const file = input && input.files ? input.files[0] : null;
+            if(!file) return;
+            if(!confirm('This backup is not encrypted. Restore its settings, state, every handshake, map point and password? PWMenu will restart only its service.')) {
+                input.value = '';
+                return;
+            }
+            const body = new FormData();
+            body.append('csrf_token', csrfToken);
+            body.append('file', file, file.name);
+            showToast('Verifying and restoring backup...', false);
+            try {
+                const response = await fetch('/plugins/A_pwmenu/backup-restore', {
+                    method:'POST',
+                    credentials:'same-origin',
+                    headers:{'X-PWMenu-Async':'1'},
+                    body
+                });
+                const payload = await response.json();
+                if(!response.ok || !payload.ok) {
+                    throw new Error(payload.message || 'Backup restore failed');
+                }
+                showToast(payload.message || 'Backup restored', false);
+                setTimeout(() => window.location.replace('/plugins/A_pwmenu/?restored=' + Date.now()), 9000);
+            } catch(error) {
+                showToast(error.message || 'Backup restore failed', true);
+            } finally {
+                input.value = '';
+            }
         }
 
         async function runMapAction(route, data, pendingMessage) {
@@ -6721,7 +10050,7 @@ class A_pwmenu(plugins.Plugin):
             let saved = null;
             try { saved = JSON.parse(localStorage.getItem(accentStorageKey) || 'null'); } catch(error) {}
             if(!saved || !saved.color) {
-                const cookieMatch = document.cookie.match(/(?:^|;\s*)a_pwmenu_accent=([0-9a-f]{6})(?:;|$)/i);
+                const cookieMatch = document.cookie.match(/(?:^|;\\s*)a_pwmenu_accent=([0-9a-f]{6})(?:;|$)/i);
                 if(cookieMatch) saved = {color:'#' + cookieMatch[1], name:'Saved ' + cookieMatch[1].toUpperCase()};
             }
             applyAccent(saved && saved.color ? saved.color : '#20e4f4', saved && saved.name ? saved.name : 'NewFPV Cyan', false);
@@ -6780,10 +10109,25 @@ class A_pwmenu(plugins.Plugin):
 
         function sel(i) {
             if(i.files[0]) {
-                document.getElementById('fn').innerText = i.files[0].name;
-                document.getElementById('fn').style.color = '#fff';
-                document.getElementById('ib').style.display = 'block';
+                const file = i.files[0];
+                if(/[.]pwmenu-backup$/i.test(file.name) || file.type === 'application/zip') {
+                    restorePWMenuBackup(i);
+                    return;
+                }
+                const state = document.getElementById('fn');
+                const name = state && state.querySelector('span');
+                if(name) name.innerText = file.name;
+                if(state) state.classList.add('ready');
             }
+        }
+
+        function toggleIdentityAchievements() {
+            const button = document.getElementById('identityDisclosure');
+            const panel = document.getElementById('identityAchievements');
+            if(!button || !panel) return;
+            const opening = panel.classList.contains('hidden');
+            panel.classList.toggle('hidden', !opening);
+            button.setAttribute('aria-expanded', opening ? 'true' : 'false');
         }
 
         function compactBssid(value) {
@@ -6792,7 +10136,7 @@ class A_pwmenu(plugins.Plugin):
         }
 
         function normalizedEssid(value) {
-            return String(value || '').normalize().replace(/[^\p{L}\p{N}]+/gu, '').toLowerCase();
+            return String(value || '').normalize().replace(/[^\\p{L}\\p{N}]+/gu, '').toLowerCase();
         }
 
         function sameNetwork(aEssid, aBssid, bEssid, bBssid) {
@@ -6945,24 +10289,20 @@ class A_pwmenu(plugins.Plugin):
         }
 
         function whitelistItemHtml(network) {
-            return `<li class="whitelist-item"><span>${esc(network)}</span><button class="whitelist-remove" type="button" onclick='whitelistRemove(${jsq(network)})'>Remove</button></li>`;
+            return `<div class="whitelist-compact-item"><i></i><span><b>${esc(network)}</b><small>Ignored during capture</small></span><button class="whitelist-remove" type="button" onclick='whitelistRemove(${jsq(network)})'>Remove</button></div>`;
         }
 
         function renderWhitelistList(values) {
             const host = document.getElementById('whitelistListHost');
             if(!host) return;
             const names = (values || []).map(String);
+            const total = document.getElementById('whitelistTotal');
+            if(total) total.textContent = String(names.length);
             if(!names.length) {
-                host.innerHTML = '<ul class="whitelist-list"><li class="whitelist-item"><span>No active whitelist entries.</span></li></ul>';
+                host.innerHTML = '<div class="whitelist-compact-list"><div class="whitelist-compact-empty">No active whitelist entries.</div></div>';
                 return;
             }
-            if(names.length <= 15) {
-                host.innerHTML = `<ul class="whitelist-list">${names.map(whitelistItemHtml).join('')}</ul>`;
-                return;
-            }
-            host.innerHTML = `<ul class="whitelist-list">${names.slice(0, 10).map(whitelistItemHtml).join('')}</ul>
-                <details class="whitelist-more"><summary>Show ${names.length - 10} more</summary>
-                <ul class="whitelist-list">${names.slice(10).map(whitelistItemHtml).join('')}</ul></details>`;
+            host.innerHTML = `<div class="whitelist-compact-list">${names.map(whitelistItemHtml).join('')}</div>`;
         }
 
         function whitelistFormSubmit(event) {
@@ -7252,20 +10592,175 @@ class A_pwmenu(plugins.Plugin):
                 .replace(/>/g, slash + 'u003e');
         }
 
-        function copyText(v) {
+        async function copyText(v, successMessage='Copied') {
             const text = String(v || '');
-            if(!text) return;
+            if(!text) return false;
+            let copied = false;
             if(navigator.clipboard && navigator.clipboard.writeText) {
-                navigator.clipboard.writeText(text).catch(() => {});
-            } else {
+                try {
+                    await navigator.clipboard.writeText(text);
+                    copied = true;
+                } catch(error) {}
+            }
+            if(!copied) {
                 const t = document.createElement('textarea');
                 t.value = text;
+                t.setAttribute('readonly', '');
+                t.style.position = 'fixed';
+                t.style.opacity = '0';
                 document.body.appendChild(t);
                 t.select();
-                document.execCommand('copy');
+                try { copied = document.execCommand('copy'); } catch(error) {}
                 document.body.removeChild(t);
             }
-            showToast('Copied');
+            showToast(copied ? successMessage : 'Could not copy text', !copied);
+            return copied;
+        }
+
+        async function copyConflictCenter(button) {
+            const rows = Array.from(document.querySelectorAll('.conflict-item'));
+            if(!rows.length) {
+                showToast('No conflicts to copy');
+                return;
+            }
+            const lines = ['Conflict center', ''];
+            rows.forEach(row => {
+                const kind = String(row.querySelector('em')?.textContent || 'conflict').trim().toUpperCase();
+                const title = String(row.querySelector('b')?.textContent || '').trim();
+                const detail = String(row.querySelector('small')?.textContent || '').trim();
+                lines.push(`- [${kind}] ${title}`);
+                if(detail) lines.push(`  ${detail}`);
+            });
+            if(button) button.disabled = true;
+            try {
+                await copyText(lines.join('\\n'), `Copied ${rows.length} conflict(s)`);
+            } finally {
+                if(button) button.disabled = false;
+            }
+        }
+
+        async function repairPasswordConflict(button, bssid) {
+            if(!button || button.disabled) return;
+            const row = button.closest('.conflict-item');
+            const detail = row && row.querySelector('small');
+            if(detail && !detail.dataset.originalDetail) {
+                detail.dataset.originalDetail = detail.textContent || '';
+            }
+            button.disabled = true;
+            button.classList.add('loading');
+            button.textContent = 'Checking...';
+            if(detail) detail.textContent = 'Starting local verification...';
+            showToast(
+                'Password verification started. It will continue in the background.',
+                false,
+                Math.max(notificationDurationMs, 5000)
+            );
+            try {
+                const started = await postAsync(
+                    'repair-password-conflict',
+                    {bssid:bssid || ''}
+                );
+                const jobBssid = started.bssid || bssid || '';
+                let result = started;
+                for(let attempt = 0; attempt < 720; attempt += 1) {
+                    if(result.status === 'done') break;
+                    if(result.status === 'error') {
+                        throw new Error(
+                            result.message || 'Password verification failed'
+                        );
+                    }
+                    if(detail) {
+                        const progress = result.total
+                            ? ` (${result.current || 0}/${result.total})`
+                            : '';
+                        detail.textContent = (
+                            result.message
+                            || 'Local verification is running...'
+                        ) + progress;
+                    }
+                    await new Promise(resolve => setTimeout(resolve, 1250));
+                    const response = await fetch(
+                        '/plugins/A_pwmenu/api/repair-password-conflict/'
+                        + encodeURIComponent(jobBssid),
+                        {
+                            credentials:'same-origin',
+                            headers:{'Accept':'application/json'}
+                        }
+                    );
+                    result = await response.json();
+                    if(!response.ok || !result.ok) {
+                        throw new Error(
+                            result.message
+                            || 'Could not read verification status'
+                        );
+                    }
+                }
+                if(result.status !== 'done') {
+                    throw new Error(
+                        'Local verification is still running. Reopen this '
+                        + 'network later to check the result.'
+                    );
+                }
+                if(row) row.remove();
+                const remaining = document.querySelectorAll(
+                    '.conflict-item'
+                ).length;
+                const total = document.getElementById('conflictTotal');
+                if(total) total.textContent = String(remaining);
+                const card = document.querySelector('.conflict-card');
+                if(card && remaining === 0) card.remove();
+                showToast(result.message || 'Password conflict repaired');
+            } catch(error) {
+                button.disabled = false;
+                button.classList.remove('loading');
+                button.textContent = 'Retry';
+                if(detail) detail.textContent = (
+                    error.message || detail.dataset.originalDetail
+                );
+                showToast(
+                    error.message || 'Password conflict was not changed',
+                    true
+                );
+            }
+        }
+
+        async function copyAllActivityHistory(button) {
+            if(button) button.disabled = true;
+            try {
+                const response = await fetch(
+                    '/plugins/A_pwmenu/api/history?limit=200',
+                    {
+                        credentials:'same-origin',
+                        headers:{'Accept':'application/json'}
+                    }
+                );
+                const payload = await response.json();
+                if(!response.ok || !payload.ok) {
+                    throw new Error(
+                        payload.message || 'Could not load activity history'
+                    );
+                }
+                const items = payload.items || [];
+                if(!items.length) {
+                    showToast('No activity to copy');
+                    return;
+                }
+                const lines = ['Activity history', ''];
+                items.forEach(item => {
+                    const meta = [item.time, item.source].filter(Boolean).join(' · ');
+                    lines.push(`- ${meta ? meta + ' — ' : ''}${String(item.title || 'Activity').trim()}`);
+                    const detail = String(item.detail || '').trim();
+                    if(detail) lines.push(`  ${detail}`);
+                });
+                await copyText(
+                    lines.join('\\n'),
+                    `Copied ${items.length} activity event(s)`
+                );
+            } catch(error) {
+                showToast(error.message || 'Could not copy activity history', true);
+            } finally {
+                if(button) button.disabled = false;
+            }
         }
 
         function showToast(text, isError, duration = notificationDurationMs) {
@@ -8008,12 +11503,371 @@ class A_pwmenu(plugins.Plugin):
             document.getElementById('mapCrackedBtn').classList.toggle('active', mapFilter === 'cracked');
         }
 
+        function tabView(t) {
+            return document.getElementById(t === 'other' ? 'v-other' : 'v-' + t);
+        }
+
+        function activeTabName() {
+            const active = document.querySelector('.tab.active');
+            return active ? active.id.replace('b-', '') : 'cracked';
+        }
+
+        function tabLoadingMarkup(tabName) {
+            if(tabName === 'map') {
+                return '<div class="pwmenu-map-loading" aria-busy="true"><div class="pwmenu-map-loading-core"><i></i></div><b>Loading map...</b><span>Preparing locations and map tiles</span></div>';
+            }
+            return '<div class="pwmenu-tab-skeleton" aria-busy="true"><i></i><i></i><i></i></div>';
+        }
+
+        function tabPageUrl(tabName, pageNumber, query, offset=null, limit=null) {
+            const params = new URLSearchParams();
+            params.set('page', String(pageNumber || 1));
+            if(query) params.set('q', query);
+            if(offset !== null) params.set('offset', String(Math.max(0, Number(offset) || 0)));
+            if(limit !== null) params.set('limit', String(Math.max(2, Number(limit) || backgroundBatchSize)));
+            if(currentSnapshotId) params.set('snapshot', currentSnapshotId);
+            return '/plugins/A_pwmenu/api/tab/' +
+                encodeURIComponent(tabName) + '?' + params.toString();
+        }
+
+        function detailCacheKey(kind, detailId) {
+            return String(kind || '') + ':' + String(detailId || '');
+        }
+
+        function applyCachedDetail(panel) {
+            if(!panel) return false;
+            const key = detailCacheKey(
+                panel.dataset.detailKind, panel.dataset.detailId
+            );
+            if(!detailHtmlCache.has(key)) return false;
+            panel.innerHTML = detailHtmlCache.get(key);
+            panel.dataset.loaded = '1';
+            return true;
+        }
+
+        function seedCardPlaceholders(tabName) {
+            const view = tabView(tabName);
+            const state = tabPageState.get(tabName);
+            if(!view || !state) return;
+            view.querySelectorAll('.pwmenu-card-placeholder').forEach(node => node.remove());
+            const missing = Math.max(0, state.total - state.loaded);
+            if(!missing) return;
+            const fragment = document.createDocumentFragment();
+            for(let index=0; index<missing; index+=1) {
+                const placeholder = document.createElement('div');
+                placeholder.className = 'si pwmenu-card-placeholder';
+                placeholder.setAttribute('aria-hidden', 'true');
+                placeholder.innerHTML = '<div class="pwmenu-card-placeholder-line wide"></div><div class="pwmenu-card-placeholder-line"></div>';
+                fragment.appendChild(placeholder);
+            }
+            view.appendChild(fragment);
+        }
+
+        function installPagePayload(tabName, payload) {
+            const view = tabView(tabName);
+            const state = tabPageState.get(tabName);
+            if(!view || !state) return 0;
+            const template = document.createElement('template');
+            template.innerHTML = payload.html || '';
+            const children = Array.from(template.content.children);
+            const cards = children.filter(node => node.classList.contains('si'));
+            const extras = children.filter(node => !node.classList.contains('si'));
+            cards.forEach(card => {
+                const placeholder = view.querySelector('.pwmenu-card-placeholder');
+                card.classList.add('pwmenu-card-arrival');
+                if(placeholder) placeholder.replaceWith(card);
+                else view.appendChild(card);
+                window.setTimeout(() => card.classList.remove('pwmenu-card-arrival'), 500);
+            });
+            extras.forEach(node => view.appendChild(node));
+            state.loaded = Math.max(
+                state.loaded,
+                Number(payload.nextOffset || (state.loaded + cards.length))
+            );
+            state.nextOffset = Number(payload.nextOffset || state.loaded);
+            state.hasMore = !!payload.hasMore;
+            state.total = Number(payload.total || state.total);
+            const pending = new Set(state.pendingDetailIds || []);
+            (payload.detailIds || []).forEach(id => pending.add(String(id)));
+            state.pendingDetailIds = Array.from(pending);
+            view.querySelectorAll('.subs').forEach(applyCachedDetail);
+            return cards.length;
+        }
+
+        async function loadMoreTab(tabName, requestedLimit=backgroundBatchSize) {
+            const state = tabPageState.get(tabName);
+            const view = tabView(tabName);
+            if(!state || !view || !state.hasMore || state.loading) return false;
+            state.loading = true;
+            try {
+                const response = await fetch(
+                    tabPageUrl(
+                        tabName,
+                        state.page + 1,
+                        state.query,
+                        state.nextOffset,
+                        requestedLimit
+                    ),
+                    {credentials:'same-origin', headers:{'Accept':'application/json'}}
+                );
+                const payload = await response.json();
+                if(!response.ok || !payload.ok) {
+                    throw new Error(payload.message || 'Could not load more networks');
+                }
+                if(String(payload.snapshotId || '') !== currentSnapshotId) {
+                    state.loading = false;
+                    state.hasMore = false;
+                    view.querySelectorAll('.pwmenu-card-placeholder').forEach(
+                        node => node.classList.add('stale')
+                    );
+                    showToast(
+                        'New captures arrived. Reopen this tab to refresh them',
+                        false
+                    );
+                    return false;
+                }
+                state.page = Number(payload.page || state.nextPage);
+                state.nextPage = payload.nextPage;
+                const installed = installPagePayload(tabName, payload);
+                state.loading = false;
+                if(!state.hasMore) hydratePendingTabDetails(tabName);
+                return installed > 0 || !state.hasMore;
+            } catch(error) {
+                state.loading = false;
+                showToast(error.message || 'Could not load more networks', true);
+                return false;
+            }
+        }
+
+        async function scheduleTabBackfill(tabName) {
+            if(!['cracked', 'handshakes'].includes(tabName)) return false;
+            const existing = tabBackfillTasks.get(tabName);
+            if(existing) return existing;
+            const generation = tabRequestGeneration.get(tabName);
+            const task = (async () => {
+                try {
+                    while(true) {
+                        const state = tabPageState.get(tabName);
+                        if(
+                            !state
+                            || !state.hasMore
+                            || tabRequestGeneration.get(tabName) !== generation
+                        ) break;
+                        const foreground = activeTabName() === tabName;
+                        await waitForBrowserIdle(foreground ? 160 : 700);
+                        if(tabRequestGeneration.get(tabName) !== generation) break;
+                        const loaded = await loadMoreTab(
+                            tabName,
+                            foreground ? foregroundBatchSize : backgroundBatchSize
+                        );
+                        if(!loaded) break;
+                        await new Promise(resolve => window.setTimeout(
+                            resolve,
+                            foreground
+                                ? foregroundBatchDelayMs
+                                : backgroundBatchDelayMs
+                        ));
+                    }
+                    return true;
+                } finally {
+                    if(tabBackfillTasks.get(tabName) === task) {
+                        tabBackfillTasks.delete(tabName);
+                    }
+                }
+            })();
+            tabBackfillTasks.set(tabName, task);
+            return task;
+        }
+
+        async function loadTab(tabName, foreground=false, force=false, requestedQuery=null) {
+            if(!['cracked', 'handshakes', 'map', 'other'].includes(tabName)) return false;
+            const currentState = tabPageState.get(tabName);
+            const query = requestedQuery === null
+                ? String((currentState && currentState.query) || '')
+                : String(requestedQuery || '').trim();
+            if(!force && loadedTabs.has(tabName) && (!currentState || currentState.query === query)) return true;
+            if(!force && loadingTabs.has(tabName)) return loadingTabs.get(tabName);
+            const view = tabView(tabName);
+            if(!view) return false;
+            const generation = Number(tabRequestGeneration.get(tabName) || 0) + 1;
+            tabRequestGeneration.set(tabName, generation);
+            view.innerHTML = tabLoadingMarkup(tabName);
+            const task = (async () => {
+                try {
+                    const response = await fetch(tabPageUrl(tabName, 1, query), {
+                        credentials: 'same-origin',
+                        headers: {'Accept': 'application/json'}
+                    });
+                    const payload = await response.json();
+                    if(!response.ok || !payload.ok) {
+                        throw new Error(payload.message || `Could not load ${tabName}`);
+                    }
+                    if(tabRequestGeneration.get(tabName) !== generation) return false;
+                    view.innerHTML = payload.html || '';
+                    const incomingSnapshot = String(payload.snapshotId || currentSnapshotId);
+                    if(currentSnapshotId && incomingSnapshot !== currentSnapshotId) {
+                        detailHtmlCache.clear();
+                    }
+                    currentSnapshotId = incomingSnapshot;
+                    tabPageState.set(tabName, {
+                        page: Number(payload.page || 1),
+                        nextPage: payload.nextPage,
+                        nextOffset: Number(
+                            payload.nextOffset
+                            || (payload.detailIds || []).length
+                        ),
+                        loaded: Number(
+                            payload.nextOffset
+                            || (payload.detailIds || []).length
+                        ),
+                        hasMore: !!payload.hasMore,
+                        total: Number(payload.total || 0),
+                        query: String(payload.query || query),
+                        loading: false,
+                        pendingDetailIds: [],
+                        detailHydrating: false
+                    });
+                    if(tabName === 'map') {
+                        mapPoints = Array.isArray(payload.mapPoints) ? payload.mapPoints : [];
+                        noGpsNetworks = Array.isArray(payload.noGpsNetworks) ? payload.noGpsNetworks : [];
+                        gpsStatus = payload.gpsStatus || {};
+                        updateGpsStatusDot();
+                        loadYandexMaps();
+                    }
+                    loadedTabs.add(tabName);
+                    if(tabName === 'cracked' || tabName === 'handshakes') {
+                        seedCardPlaceholders(tabName);
+                        view.querySelectorAll('.subs').forEach(applyCachedDetail);
+                        hydrateTabDetails(tabName, payload.detailIds || []);
+                        scheduleTabBackfill(tabName);
+                    }
+                    if(activeTabName() === tabName && tabName === 'map') {
+                        await initYandexMap();
+                        if(yandexMap) yandexMap.container.fitToViewport();
+                        renderMap();
+                    }
+                    return true;
+                } catch(error) {
+                    if(tabRequestGeneration.get(tabName) !== generation) return false;
+                    loadedTabs.delete(tabName);
+                    view.innerHTML = '<div class="pwmenu-load-error"><b>Could not load this section</b><button type="button">Retry</button></div>';
+                    const retry = view.querySelector('button');
+                    if(retry) retry.onclick = () => loadTab(tabName, true, true, query);
+                    if(foreground) showToast(error.message || 'Section loading failed', true);
+                    return false;
+                } finally {
+                    if(tabRequestGeneration.get(tabName) === generation) {
+                        loadingTabs.delete(tabName);
+                    }
+                }
+            })();
+            loadingTabs.set(tabName, task);
+            return task;
+        }
+
+        function waitForBrowserIdle(timeout=1200) {
+            return new Promise(resolve => {
+                if('requestIdleCallback' in window) {
+                    window.requestIdleCallback(() => resolve(), {timeout});
+                } else {
+                    setTimeout(resolve, Math.min(timeout, 700));
+                }
+            });
+        }
+
+        async function hydrateTabDetails(tabName, detailIds) {
+            if(!['cracked', 'handshakes'].includes(tabName)) return false;
+            const kind = tabName === 'cracked' ? 'cracked' : 'handshake';
+            const ids = Array.from(new Set(
+                (detailIds || []).map(String).filter(id => /^\\d{1,6}$/.test(id))
+            ));
+            ids.forEach(detailId => {
+                const panel = document.querySelector(
+                    `[data-detail-kind="${kind}"][data-detail-id="${detailId}"]`
+                );
+                applyCachedDetail(panel);
+            });
+            const missing = ids.filter(
+                detailId => !detailHtmlCache.has(detailCacheKey(kind, detailId))
+            );
+            if(!missing.length) return true;
+            const batchKey = currentSnapshotId + ':' + kind + ':' + missing.join(',');
+            if(loadingDetailBatches.has(batchKey)) return loadingDetailBatches.get(batchKey);
+            const task = (async () => {
+                try {
+                    const response = await fetch(
+                        '/plugins/A_pwmenu/api/details/' +
+                        encodeURIComponent(tabName) + '?snapshot=' +
+                        encodeURIComponent(currentSnapshotId) + '&ids=' +
+                        encodeURIComponent(missing.join(',')),
+                        {
+                            credentials: 'same-origin',
+                            headers: {'Accept': 'application/json'}
+                        }
+                    );
+                    const payload = await response.json();
+                    if(response.status === 409 && payload.reload) return false;
+                    if(!response.ok || !payload.ok) {
+                        throw new Error(payload.message || 'Could not preload card details');
+                    }
+                    currentSnapshotId = String(payload.snapshotId || currentSnapshotId);
+                    Object.entries(payload.details || {}).forEach(([detailId, fragment]) => {
+                        detailHtmlCache.set(
+                            detailCacheKey(kind, detailId), fragment
+                        );
+                        const panel = document.querySelector(
+                            `[data-detail-kind="${kind}"][data-detail-id="${detailId}"]`
+                        );
+                        applyCachedDetail(panel);
+                    });
+                    return true;
+                } catch(error) {
+                    return false;
+                } finally {
+                    loadingDetailBatches.delete(batchKey);
+                }
+            })();
+            loadingDetailBatches.set(batchKey, task);
+            return task;
+        }
+
+        async function hydratePendingTabDetails(tabName) {
+            const state = tabPageState.get(tabName);
+            if(!state || state.detailHydrating) return false;
+            state.detailHydrating = true;
+            try {
+                while((state.pendingDetailIds || []).length) {
+                    await waitForBrowserIdle(
+                        activeTabName() === tabName ? 260 : 850
+                    );
+                    const ids = state.pendingDetailIds.splice(0, 50);
+                    await hydrateTabDetails(tabName, ids);
+                }
+                return true;
+            } finally {
+                state.detailHydrating = false;
+            }
+        }
+
+        async function scheduleBackgroundPreload() {
+            if(bootstrap.backgroundPreload === false) return;
+            await loadTab(t0, true);
+            scheduleTabBackfill(t0);
+            loadYandexMaps();
+            const queue = ['handshakes', 'map', 'cracked', 'other'].filter(name => name !== t0);
+            for(const name of queue) {
+                await waitForBrowserIdle(name === 'map' ? 500 : 850);
+                await loadTab(name, false);
+            }
+        }
+
         function tab(t) {
             closeMobileSearch();
             document.body.classList.remove('view-cracked', 'view-handshakes', 'view-map', 'view-other');
             document.body.classList.add('view-' + t);
             document.querySelectorAll('.list, #v-other, #v-map').forEach(e=>e.classList.add('hidden'));
-            const view = document.getElementById(t==='other'?'v-other':'v-'+t);
+            const view = tabView(t);
+            if(!view) return;
             view.classList.remove('hidden');
             if(t!=='other' && t!=='map') view.classList.add('list');
             document.querySelectorAll('.tab').forEach(e=>{
@@ -8021,22 +11875,31 @@ class A_pwmenu(plugins.Plugin):
                 e.setAttribute('aria-selected', 'false');
             });
             const activeButton = document.getElementById('b-'+t);
-            activeButton.classList.add('active');
-            activeButton.setAttribute('aria-selected', 'true');
-            if(t==='map') {
-                startPhoneGps(false);
-                initYandexMap();
-                setTimeout(() => {
-                    const sheet = document.getElementById('mapSheet');
-                    if(yandexMap) yandexMap.container.fitToViewport();
-                    renderMap();
-                }, 80);
+            if(activeButton) {
+                activeButton.classList.add('active');
+                activeButton.setAttribute('aria-selected', 'true');
             }
-            flt();
+            const searchValue = (
+                t === 'cracked' || t === 'handshakes'
+            ) ? String(document.getElementById('s').value || '').trim() : null;
+            loadTab(t, true, false, searchValue).then(() => {
+                if(t !== activeTabName()) return;
+                if(t === 'cracked' || t === 'handshakes') {
+                    scheduleTabBackfill(t);
+                }
+                if(t === 'map') {
+                    startPhoneGps(false);
+                    initYandexMap();
+                    setTimeout(() => {
+                        if(yandexMap) yandexMap.container.fitToViewport();
+                        renderMap();
+                    }, 80);
+                }
+            });
         }
 
-        function tog(id) {
-            const target = document.getElementById('s-'+id);
+        async function tog(id) {
+            let target = document.getElementById('s-'+id);
             if(!target) return;
             const opening = target.style.display !== 'block';
             document.querySelectorAll('#v-cracked .subs, #v-handshakes .subs').forEach(panel => {
@@ -8049,13 +11912,60 @@ class A_pwmenu(plugins.Plugin):
                 const card = target.closest('.si');
                 if(card) card.classList.add('open');
                 requestAnimationFrame(() => card && card.scrollIntoView({block:'center', behavior:'smooth'}));
+                applyCachedDetail(target);
+                if(target.dataset.loaded !== '1') {
+                    target.innerHTML = '<div class="pwmenu-detail-loading">Loading...</div>';
+                    if(target.dataset.loading === '1') return;
+                    target.dataset.loading = '1';
+                    try {
+                        const detailKind = target.dataset.detailKind;
+                        const detailId = target.dataset.detailId;
+                        const url = '/plugins/A_pwmenu/api/detail/' +
+                            encodeURIComponent(detailKind) + '/' +
+                            encodeURIComponent(detailId) + '?snapshot=' +
+                            encodeURIComponent(currentSnapshotId);
+                        const response = await fetch(url, {
+                            credentials: 'same-origin',
+                            headers: {'Accept': 'application/json'}
+                        });
+                        const payload = await response.json();
+                        if(response.status === 409 && payload.reload) {
+                            currentSnapshotId = String(payload.snapshotId || '');
+                            const sourceTab = detailKind === 'cracked' ? 'cracked' : 'handshakes';
+                            loadedTabs.delete(sourceTab);
+                            detailHtmlCache.clear();
+                            const state = tabPageState.get(sourceTab);
+                            await loadTab(
+                                sourceTab, true, true,
+                                state ? state.query : ''
+                            );
+                            return tog(id);
+                        }
+                        if(!response.ok || !payload.ok) {
+                            throw new Error(payload.message || 'Could not load details');
+                        }
+                        currentSnapshotId = String(payload.snapshotId || currentSnapshotId);
+                        detailHtmlCache.set(
+                            detailCacheKey(detailKind, detailId),
+                            payload.html || ''
+                        );
+                        target.innerHTML = payload.html || '';
+                        target.dataset.loaded = '1';
+                    } catch(error) {
+                        target.innerHTML = '<div class="pwmenu-detail-loading">Could not load details. Tap again to retry.</div>';
+                        showToast(error.message || 'Could not load details', true);
+                        return;
+                    } finally {
+                        target = document.getElementById('s-'+id) || target;
+                        delete target.dataset.loading;
+                    }
+                }
             }
         }
 
         function flt() {
             const raw = document.getElementById('s').value;
-            let v = raw.toUpperCase();
-            let active = document.querySelector('.tab.active').id.replace('b-','');
+            let active = activeTabName();
             if(active === 'other') return;
             if(active === 'map') {
                 const mapSearch = document.getElementById('mapSearch');
@@ -8063,10 +11973,13 @@ class A_pwmenu(plugins.Plugin):
                 renderMap();
                 return;
             }
-            let act = 'v-' + active;
-            document.getElementById(act).querySelectorAll('.si').forEach(el=>{
-                el.style.display = el.getAttribute('data-t').toUpperCase().includes(v) ? '' : 'none';
-            });
+            clearTimeout(tabSearchTimer);
+            tabSearchTimer = setTimeout(() => {
+                const state = tabPageState.get(active);
+                const query = String(raw || '').trim();
+                if(state && state.query === query) return;
+                loadTab(active, true, true, query);
+            }, 240);
         }
     </script>
 </body>
