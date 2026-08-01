@@ -492,6 +492,95 @@ class CaptureQualityTests(unittest.TestCase):
             "Quick_Network:quick-pass",
         )
 
+    def test_password_display_prefers_and_rotates_visible_recovered_aps(self):
+        cracked = {
+            ("bssid", "aabbccddeeff", "near-pass"): {
+                "essid": "Near-Network",
+                "bssid": "aabbccddeeff",
+                "password": "near-pass",
+                "source": "Manual",
+                "sources": ["Manual"],
+            },
+            ("bssid", "112233445566", "far-pass"): {
+                "essid": "Far-Network",
+                "bssid": "112233445566",
+                "password": "far-pass",
+                "source": "OHC",
+                "sources": ["OHC"],
+            },
+        }
+        self.plugin.options.update({
+            "display_password_max_length": 80,
+            "display_password_visible_ttl": 90,
+            "display_password_visible_cycle_seconds": 8,
+        })
+        access_points = [
+            {"hostname": "Far-Network", "mac": "11:22:33:44:55:66", "rssi": -71},
+            {"hostname": "Near-Network", "mac": "AA:BB:CC:DD:EE:FF", "rssi": -31},
+        ]
+
+        with mock.patch.object(
+            self.plugin, "_get_cracked_data", return_value=cracked
+        ), mock.patch("A_pwmenu.time.monotonic", return_value=100.0):
+            self.plugin.on_unfiltered_ap_list(None, access_points)
+
+        with mock.patch("A_pwmenu.time.monotonic", return_value=100.0), \
+             mock.patch.object(self.plugin, "_latest_display_credential") as latest:
+            self.assertEqual(
+                self.plugin._display_password_text(),
+                "Near-Network:near-pass",
+            )
+            latest.assert_not_called()
+
+        with mock.patch("A_pwmenu.time.monotonic", return_value=109.0):
+            self.assertEqual(
+                self.plugin._display_password_text(),
+                "Far-Network:far-pass",
+            )
+
+        with mock.patch("A_pwmenu.time.monotonic", return_value=191.0), \
+             mock.patch.object(
+                 self.plugin,
+                 "_latest_display_credential",
+                 return_value=(1, "Fallback", "fallback-pass"),
+             ):
+            self.assertEqual(
+                self.plugin._display_password_text(),
+                "Fallback:fallback-pass",
+            )
+
+    def test_visible_password_display_rejects_ambiguous_bssid(self):
+        cracked = {
+            ("bssid", "aabbccddeeff", "first"): {
+                "essid": "Home-WiFi",
+                "bssid": "aabbccddeeff",
+                "password": "first",
+                "sources": ["Manual"],
+            },
+            ("bssid", "aabbccddeeff", "second"): {
+                "essid": "Home-WiFi",
+                "bssid": "aabbccddeeff",
+                "password": "second",
+                "sources": ["OHC"],
+            },
+            ("essid", "homewifi", "name-only"): {
+                "essid": "Home-WiFi",
+                "bssid": "",
+                "password": "name-only",
+                "sources": ["Handshake Lab"],
+            },
+        }
+        with mock.patch.object(
+            self.plugin, "_get_cracked_data", return_value=cracked
+        ):
+            candidates = self.plugin._visible_cracked_candidates([{
+                "hostname": "Home-WiFi",
+                "mac": "AA:BB:CC:DD:EE:FF",
+                "rssi": -40,
+            }])
+
+        self.assertEqual(candidates, [])
+
     def test_integrated_quickdic_skips_scan_when_known_key_verifies(self):
         capture_path = os.path.join(
             self.tempdir.name, "Known_aabbccddeeff.pcap"

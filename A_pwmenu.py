@@ -50,8 +50,8 @@ logging.info("[A_pwmenu] Module init.")
 
 class A_pwmenu(plugins.Plugin):
     __author__ = 'NewFPV'
-    __version__ = '1.4.0'
-    __ui_revision__ = '20260801-15'
+    __version__ = '1.4.1'
+    __ui_revision__ = '20260802-16'
     __license__ = 'GPL3'
     __description__ = 'Ultimate Password Manager'
 
@@ -120,6 +120,9 @@ class A_pwmenu(plugins.Plugin):
         self.config_path = '/etc/pwnagotchi/config.toml'
         self.whitelist_lock = threading.RLock()
         self.display_password_element = 'pwmenu_password'
+        self.visible_credentials_lock = threading.RLock()
+        self.visible_credentials = []
+        self.visible_credentials_updated_at = 0.0
         self.quickdic_lock = threading.Lock()
         self.quickdic_pending = []
         self.quickdic_wakeup = threading.Event()
@@ -596,6 +599,15 @@ class A_pwmenu(plugins.Plugin):
         self.options.setdefault('web_background_batch_delay_ms', 120)
         self.options.setdefault('web_foreground_batch_size', 24)
         self.options.setdefault('web_foreground_batch_delay_ms', 50)
+        self.options.setdefault('other_card_order_cleanup', 1)
+        self.options.setdefault('other_card_order_identity', 2)
+        self.options.setdefault('other_card_order_transfer', 3)
+        self.options.setdefault('other_card_order_ohc', 4)
+        self.options.setdefault('other_card_order_wpa_sec', 5)
+        self.options.setdefault('other_card_order_whitelist', 6)
+        self.options.setdefault('other_card_order_activity', 7)
+        self.options.setdefault('other_card_order_conflicts', 8)
+        self.options.setdefault('other_card_order_credit', 9)
         self.options.setdefault('activity_history_max', 200)
         self.options.setdefault('activity_history_hours', 24)
         self.options.setdefault('backup_max_bytes', 2147483648)
@@ -632,6 +644,9 @@ class A_pwmenu(plugins.Plugin):
         self.options.setdefault('display_password_handshake_lab', True)
         self.options.setdefault('display_password_manual', True)
         self.options.setdefault('display_password_quickdic', True)
+        self.options.setdefault('display_password_visible_enabled', True)
+        self.options.setdefault('display_password_visible_ttl', 90)
+        self.options.setdefault('display_password_visible_cycle_seconds', 8)
         self.options.setdefault('display_password_horizontal_x', -1)
         self.options.setdefault('display_password_horizontal_y', -1)
         self.options.setdefault('display_password_vertical_x', -1)
@@ -683,6 +698,25 @@ class A_pwmenu(plugins.Plugin):
             dedupe_key='pwnagotchi-ready',
             dedupe_window=30,
         )
+
+    def on_unfiltered_ap_list(self, agent, access_points):
+        """Remember recovered credentials for APs visible in the latest scan."""
+        if (
+            not self._module_enabled('display_password')
+            or not self._option_bool('display_password_visible_enabled', True)
+        ):
+            self._set_visible_credentials([])
+            return
+        try:
+            self._set_visible_credentials(
+                self._visible_cracked_candidates(access_points or [])
+            )
+        except Exception as error:
+            # Keep the previous scan until its TTL expires. A malformed
+            # Bettercap row must not blank the screen or interrupt recon.
+            logging.debug(
+                f"[A_pwmenu] Visible credential refresh failed: {error}"
+            )
 
     def on_ui_update(self, ui):
         if not self.ready:
@@ -743,6 +777,7 @@ class A_pwmenu(plugins.Plugin):
         self.ohc_scheduler_running = False
         self.quality_scan_running = False
         self.quickdic_running = False
+        self._set_visible_credentials([])
         self.ohc_scheduler_wakeup.set()
         self.quickdic_wakeup.set()
         self._stop_ohc_proxy()
@@ -909,6 +944,139 @@ class A_pwmenu(plugins.Plugin):
         y = self._option_int(f'display_password_{prefix}_y', -1)
         return (default[0] if x < 0 else x, default[1] if y < 0 else y)
 
+    def _display_source_enabled(self, record):
+        option_by_source = {
+            'WPA-Sec': 'display_password_wpa_sec',
+            'OHC': 'display_password_ohc',
+            'Handshake Lab': 'display_password_handshake_lab',
+            'Manual': 'display_password_manual',
+            'QuickDic': 'display_password_quickdic',
+        }
+        sources = record.get('sources') or [record.get('source')]
+        return any(
+            source and self._option_bool(
+                option_by_source.get(str(source), ''), True
+            )
+            for source in sources
+        )
+
+    def _set_visible_credentials(self, credentials):
+        with self.visible_credentials_lock:
+            self.visible_credentials = list(credentials or [])
+            self.visible_credentials_updated_at = time.monotonic()
+
+    def _visible_cracked_candidates(self, access_points):
+        records = [
+            record for record in self._get_cracked_data().values()
+            if record.get('password') and self._display_source_enabled(record)
+        ]
+        by_bssid = {}
+        name_only_exact = {}
+        name_only_normalized = {}
+        for record in records:
+            bssid = self._compact_bssid(record.get('bssid'))
+            essid = str(record.get('essid') or '')
+            if bssid and bssid != '000000000000':
+                by_bssid.setdefault(bssid, []).append(record)
+                continue
+            if essid:
+                name_only_exact.setdefault(essid, []).append(record)
+                normalized = self._normalized_essid_key(essid)
+                if normalized:
+                    name_only_normalized.setdefault(normalized, []).append(
+                        record
+                    )
+
+        def unambiguous(candidates):
+            passwords = {
+                str(candidate.get('password') or '')
+                for candidate in candidates or []
+                if candidate.get('password')
+            }
+            if len(passwords) != 1:
+                return None
+            return next(iter(candidates), None)
+
+        visible = {}
+        for access_point in access_points:
+            if not isinstance(access_point, dict):
+                continue
+            essid = str(
+                access_point.get('hostname')
+                or access_point.get('essid')
+                or access_point.get('ssid')
+                or ''
+            )
+            bssid = self._compact_bssid(
+                access_point.get('mac')
+                or access_point.get('bssid')
+                or access_point.get('BSSID')
+            )
+            bssid_records = by_bssid.get(bssid) if bssid else None
+            record = unambiguous(bssid_records)
+            if bssid_records and record is None:
+                # Conflicting passwords for the exact AP are not safe to show.
+                continue
+            if record is None and essid:
+                record = unambiguous(name_only_exact.get(essid))
+            if record is None and essid:
+                record = unambiguous(
+                    name_only_normalized.get(
+                        self._normalized_essid_key(essid)
+                    )
+                )
+            if record is None:
+                continue
+            try:
+                rssi = float(
+                    access_point.get('rssi')
+                    or access_point.get('signal')
+                    or access_point.get('signal_strength')
+                    or -999
+                )
+            except (TypeError, ValueError):
+                rssi = -999.0
+            identity = bssid or self._normalized_essid_key(essid)
+            candidate = {
+                'essid': essid or str(record.get('essid') or ''),
+                'bssid': bssid,
+                'password': str(record.get('password') or ''),
+                'rssi': rssi,
+            }
+            previous = visible.get(identity)
+            if previous is None or candidate['rssi'] > previous['rssi']:
+                visible[identity] = candidate
+        return sorted(
+            visible.values(),
+            key=lambda item: (
+                -item['rssi'],
+                item['essid'].casefold(),
+                item['bssid'],
+            ),
+        )
+
+    def _visible_display_credential(self):
+        if not self._option_bool('display_password_visible_enabled', True):
+            return None
+        now = time.monotonic()
+        ttl = max(5, self._option_int('display_password_visible_ttl', 90))
+        cycle = max(
+            1,
+            self._option_int('display_password_visible_cycle_seconds', 8),
+        )
+        with self.visible_credentials_lock:
+            credentials = list(self.visible_credentials)
+            updated_at = self.visible_credentials_updated_at
+        if not credentials or now - updated_at > ttl:
+            return None
+        index = int(max(0.0, now - updated_at) / cycle) % len(credentials)
+        current = credentials[index]
+        return (
+            updated_at,
+            current.get('essid') or current.get('bssid') or 'Wi-Fi',
+            current.get('password') or '',
+        )
+
     def _latest_display_credential(self):
         sources = []
         potfiles = []
@@ -961,7 +1129,10 @@ class A_pwmenu(plugins.Plugin):
         return max(sources, default=None, key=lambda item: item[0])
 
     def _display_password_text(self):
-        latest = self._latest_display_credential()
+        latest = (
+            self._visible_display_credential()
+            or self._latest_display_credential()
+        )
         if not latest:
             return str(
                 self.options.get('display_password_empty_text')
@@ -1900,6 +2071,7 @@ class A_pwmenu(plugins.Plugin):
                 conflicts=model['conflicts'],
                 activity_history=model['activity_history'],
                 whitelist=whitelist,
+                other_card_order=self._other_card_orders(),
                 notification_duration_ms=notification_duration_ms,
                 snapshot_id=snapshot_id,
                 web_background_preload=self._option_bool(
@@ -3418,7 +3590,7 @@ class A_pwmenu(plugins.Plugin):
             response = requests.get(
                 api_url,
                 cookies={'key': str(key)},
-                headers={'User-Agent': 'PWMenu/1.4.0'},
+                headers={'User-Agent': f'PWMenu/{self.__version__}'},
                 timeout=(10, 30),
             )
             response.raise_for_status()
@@ -4745,7 +4917,7 @@ class A_pwmenu(plugins.Plugin):
                     headers={
                         'User-Agent': (
                             'Mozilla/5.0 (X11; Linux aarch64) '
-                            'PWMenu/1.4.0'
+                            f'PWMenu/{self.__version__}'
                         )
                     },
                     timeout=(10, 30)
@@ -5123,6 +5295,29 @@ class A_pwmenu(plugins.Plugin):
             return int(getattr(self, 'options', {}).get(key, default))
         except (TypeError, ValueError):
             return default
+
+    def _other_card_orders(self):
+        defaults = {
+            'cleanup': 1,
+            'identity': 2,
+            'transfer': 3,
+            'ohc': 4,
+            'wpa_sec': 5,
+            'whitelist': 6,
+            'activity': 7,
+            'conflicts': 8,
+            'credit': 9,
+        }
+        return {
+            name: max(
+                -999,
+                min(
+                    self._option_int(f'other_card_order_{name}', default),
+                    999,
+                ),
+            )
+            for name, default in defaults.items()
+        }
 
     def _gps_float(self, value):
         try:
@@ -8567,6 +8762,7 @@ class A_pwmenu(plugins.Plugin):
     def _get_html(self):
         return """
 {% set wpa_status = wpa_status|default({}) %}
+{% set other_card_order = other_card_order|default({'cleanup': 1, 'identity': 2, 'transfer': 3, 'ohc': 4, 'wpa_sec': 5, 'whitelist': 6, 'activity': 7, 'conflicts': 8, 'credit': 9}) %}
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -9044,15 +9240,15 @@ class A_pwmenu(plugins.Plugin):
         #v-cracked>.newfpv-credit, #v-handshakes>.newfpv-credit { grid-column:1/-1; }
         #v-other { grid-template-columns:repeat(2,minmax(0,1fr));align-items:start;gap:14px; }
         #v-other:not(.hidden) { display:grid; }
-        #v-other>.cleanup-card{order:1}
-        #v-other>.identity-card{order:2}
-        #v-other>.operations-card{order:3}
-        #v-other>.ohc-card{order:4}
-        #v-other>.wpa-card{order:5}
-        #v-other>.whitelist-card{order:6}
-        #v-other>.activity-card{grid-column:1/-1;order:7}
-        #v-other>.conflict-card{grid-column:1/-1;order:8}
-        #v-other>.newfpv-credit{order:9}
+        #v-other>.cleanup-card{order:var(--pw-order-cleanup,1)}
+        #v-other>.identity-card{order:var(--pw-order-identity,2)}
+        #v-other>.operations-card{order:var(--pw-order-transfer,3)}
+        #v-other>.ohc-card{order:var(--pw-order-ohc,4)}
+        #v-other>.wpa-card{order:var(--pw-order-wpa-sec,5)}
+        #v-other>.whitelist-card{order:var(--pw-order-whitelist,6)}
+        #v-other>.activity-card{grid-column:1/-1;order:var(--pw-order-activity,7)}
+        #v-other>.conflict-card{grid-column:1/-1;order:var(--pw-order-conflicts,8)}
+        #v-other>.newfpv-credit{order:var(--pw-order-credit,9)}
         .mobile-profile-card { display:none; }
         .card { height:100%;margin:0;padding:22px;border:1px solid var(--line);border-radius:23px;background:linear-gradient(145deg,rgba(20,23,26,.94),rgba(11,13,15,.94));box-shadow:none; }
         .card h3 { letter-spacing:-.025em; }
@@ -9668,7 +9864,7 @@ class A_pwmenu(plugins.Plugin):
         </div>
         <footer class="map-desktop-footer">{{ newfpv_credit(false) }}</footer>
 
-        <div id="v-other" class="hidden">
+        <div id="v-other" class="hidden" style="--pw-order-cleanup:{{ other_card_order.cleanup }};--pw-order-identity:{{ other_card_order.identity }};--pw-order-transfer:{{ other_card_order.transfer }};--pw-order-ohc:{{ other_card_order.ohc }};--pw-order-wpa-sec:{{ other_card_order.wpa_sec }};--pw-order-whitelist:{{ other_card_order.whitelist }};--pw-order-activity:{{ other_card_order.activity }};--pw-order-conflicts:{{ other_card_order.conflicts }};--pw-order-credit:{{ other_card_order.credit }};">
             <!-- PWMENU_TAB_OTHER_START -->
             {% set conflicts = conflicts|default([]) %}
             {% set activity_history = activity_history|default({'items': [], 'total': 0, 'nextOffset': 0, 'hasMore': false}) %}
