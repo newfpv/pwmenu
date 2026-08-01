@@ -135,12 +135,16 @@ class WebLazyLoadingTests(unittest.TestCase):
         self.assertNotIn("OHC Password Storage", resources["page"])
         self.assertNotIn(">Copy all<", resources["page"])
         self.assertIn(
-            "#v-other>.activity-card{grid-column:1/-1;order:7}",
+            "#v-other>.activity-card{grid-column:1/-1;order:var(--pw-order-activity,7)}",
             resources["app.css"],
         )
         self.assertIn(
-            "#v-other>.conflict-card{grid-column:1/-1;order:8}",
+            "#v-other>.conflict-card{grid-column:1/-1;order:var(--pw-order-conflicts,8)}",
             resources["app.css"],
+        )
+        self.assertIn(
+            "--pw-order-cleanup:{{ other_card_order.cleanup }}",
+            resources["page"],
         )
 
         with self.app.test_request_context(
@@ -162,6 +166,34 @@ class WebLazyLoadingTests(unittest.TestCase):
         ):
             response = self.plugin._serve_web_asset("app.js", request)
             self.assertEqual(response.status_code, 304)
+
+    def test_other_card_order_defaults_and_numeric_overrides(self):
+        self.assertEqual(
+            self.plugin._other_card_orders(),
+            {
+                "cleanup": 1,
+                "identity": 2,
+                "transfer": 3,
+                "ohc": 4,
+                "wpa_sec": 5,
+                "whitelist": 6,
+                "activity": 7,
+                "conflicts": 8,
+                "credit": 9,
+            },
+        )
+
+        self.plugin.options.update({
+            "other_card_order_cleanup": "8",
+            "other_card_order_identity": -2000,
+            "other_card_order_activity": 2,
+            "other_card_order_credit": 5000,
+        })
+        order = self.plugin._other_card_orders()
+        self.assertEqual(order["cleanup"], 8)
+        self.assertEqual(order["identity"], -999)
+        self.assertEqual(order["activity"], 2)
+        self.assertEqual(order["credit"], 999)
 
     def test_snapshot_is_split_into_shell_tabs_and_on_demand_details(self):
         rendered = """

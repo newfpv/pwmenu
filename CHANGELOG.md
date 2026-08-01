@@ -2,6 +2,79 @@
 
 All notable changes to A_pwmenu are documented here.
 
+## 1.4.1 — 2026-08-02
+
+PWMenu 1.4.1 is a focused reliability and field-display release. It keeps the
+1.4.0 storage format and Bluetooth-first Web UI, so no state migration is
+required. Existing PCAPs, map sidecars, credentials, history, cloud queues,
+whitelist settings, and backups remain compatible.
+
+### Visible recovered networks on the Pwnagotchi display
+
+- The integrated password display now consumes Pwnagotchi's unfiltered AP
+  scan. When a recovered network is currently visible, its live SSID and
+  password replace the generic most-recent credential on the device screen.
+- The unfiltered callback intentionally runs before Pwnagotchi applies its
+  whitelist. A recovered owner network can therefore appear on the display
+  even when it is excluded from capture and attack selection.
+- Visible matches use the exact BSSID first. Legacy name-only credentials are
+  accepted only when their exact or punctuation-normalized name resolves to a
+  single password; conflicting passwords for one BSSID are never guessed.
+- Multiple recovered APs rotate strongest-signal first. The scan TTL, rotation
+  interval, and the complete feature can be configured independently. After
+  the scan expires, the display falls back to the latest enabled password
+  source as before.
+- Visible state is bounded to the latest scan and kept only in memory. It is
+  cleared on plugin unload and does not add passwords, scan results, or signal
+  values to the persistent PWMenu state or normal logs.
+- Added `display_password_visible_enabled`, `display_password_visible_ttl`,
+  and `display_password_visible_cycle_seconds`. All existing source switches,
+  length limits, orientation settings, and display coordinates continue to
+  apply.
+
+### Configurable Other layout
+
+- Added a numeric `other_card_order_*` option for every Other card: cleanup,
+  identity, transfer, OHC, WPA-sec, whitelist, activity, conflicts, and the
+  author credit. Lower numbers appear first and the defaults preserve the
+  existing interface order.
+- Order values are parsed as integers and safely clamped. Equal values retain
+  document order, conditional cards still disappear when they have nothing to
+  report, and the same configured order is used by phone and desktop layouts.
+- Card ordering is applied with per-page CSS custom properties, so the large
+  cacheable stylesheet remains shared while each installation can choose its
+  own compact Other layout.
+
+### Capture Cleanup confirmation hotfix
+
+- Fixed cleanup confirmations being rejected when the Web UI grouped
+  candidates in a different order from the deletion request or when a
+  human-readable quality summary refreshed between the two requests.
+- Cleanup tokens now use a canonical path/signature/category set. The
+  protection remains strict: every PCAP is still signature-checked and
+  reanalyzed immediately before deletion, and a file that is no longer empty,
+  uncrackable, or unusable is preserved.
+- Display-only reason text and list ordering no longer change the confirmation
+  identity. Real changes to the resolved file path, file signature, or cleanup
+  category still invalidate the old confirmation and require a fresh review.
+- Added regression coverage for reversed group ordering, refreshed quality
+  summaries, successful deletion after a valid confirmation, and the existing
+  stale-token rejection. Together with the visible-AP and configurable-layout
+  coverage, the complete suite now contains 93 passing tests.
+- Made WPA-sec request User-Agent versioning derive from the plugin version so
+  future patch releases cannot advertise a stale PWMenu version.
+
+### Release and cache metadata
+
+- Bumped the plugin version to `1.4.1` and the UI revision to
+  `20260802-16`. Browsers receive one revision-triggered refresh while
+  content-hashed CSS and JavaScript keep their normal immutable caching.
+- Updated the tagged-install command and the complete configuration example
+  for the new display and Other-layout controls.
+- Verified the release with Python compilation and all 93 unit tests covering
+  storage, backup/restore, password verification, capture quality, OHC,
+  WPA-sec, conflicts, whitelist safety, and Bluetooth Web UI transport.
+
 ## 1.4.0 — 2026-07-30
 
 ### Pwnagotchi-native storage discovery
@@ -121,11 +194,6 @@ All notable changes to A_pwmenu are documented here.
 - Added a one-time UI revision cookie and cache-clear response in addition to
   content-hashed assets, forcing browsers that retained an early 1.4.0 shell to
   replace it while preserving normal long-lived asset caching afterwards.
-- Fixed Capture Cleanup confirmations being rejected when the Web UI grouped
-  candidates in a different order from the deletion request or when a
-  human-readable quality summary refreshed between the two requests. Cleanup
-  tokens now use a canonical path/signature/category set, while every file is
-  still reanalyzed and signature-checked immediately before deletion.
 - Added lazy-transport, stable snapshot, placeholder backfill, best-capture,
   conflict, activity history, full-capture backup/restore, health-state, and
   configured-storage migration regression coverage. The suite now contains

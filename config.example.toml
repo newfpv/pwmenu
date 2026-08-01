@@ -69,6 +69,12 @@ main.plugins.A_pwmenu.display_password_ohc = true
 main.plugins.A_pwmenu.display_password_handshake_lab = true
 main.plugins.A_pwmenu.display_password_manual = true
 main.plugins.A_pwmenu.display_password_quickdic = true
+# Prefer recovered credentials for APs present in the latest unfiltered scan.
+# Exact BSSID matches win. Multiple visible recovered APs rotate strongest-first.
+# After the scan data expires, the most recently recovered credential is shown.
+main.plugins.A_pwmenu.display_password_visible_enabled = true
+main.plugins.A_pwmenu.display_password_visible_ttl = 90
+main.plugins.A_pwmenu.display_password_visible_cycle_seconds = 8
 # -1 keeps the display-specific automatic coordinate.
 main.plugins.A_pwmenu.display_password_horizontal_x = -1
 main.plugins.A_pwmenu.display_password_horizontal_y = -1
@@ -131,6 +137,18 @@ main.plugins.A_pwmenu.web_background_batch_delay_ms = 120
 main.plugins.A_pwmenu.web_foreground_batch_size = 24
 main.plugins.A_pwmenu.web_foreground_batch_delay_ms = 50
 main.plugins.A_pwmenu.web_notification_duration_ms = 2600
+
+# Card order in Other. Lower numbers appear first; equal numbers retain their
+# built-in order. These defaults reproduce the standard PWMenu layout.
+main.plugins.A_pwmenu.other_card_order_cleanup = 1
+main.plugins.A_pwmenu.other_card_order_identity = 2
+main.plugins.A_pwmenu.other_card_order_transfer = 3
+main.plugins.A_pwmenu.other_card_order_ohc = 4
+main.plugins.A_pwmenu.other_card_order_wpa_sec = 5
+main.plugins.A_pwmenu.other_card_order_whitelist = 6
+main.plugins.A_pwmenu.other_card_order_activity = 7
+main.plugins.A_pwmenu.other_card_order_conflicts = 8
+main.plugins.A_pwmenu.other_card_order_credit = 9
 
 # Backup/restore. The portable archive is intentionally not encrypted and may
 # contain API keys, recovered passwords, network identifiers, and coordinates.
