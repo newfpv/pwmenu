@@ -51,7 +51,7 @@ logging.info("[A_pwmenu] Module init.")
 class A_pwmenu(plugins.Plugin):
     __author__ = 'NewFPV'
     __version__ = '1.4.0'
-    __ui_revision__ = '20260730-14'
+    __ui_revision__ = '20260801-15'
     __license__ = 'GPL3'
     __description__ = 'Ultimate Password Manager'
 
@@ -7262,8 +7262,20 @@ class A_pwmenu(plugins.Plugin):
                     f"[A_pwmenu] Could not inspect cleanup candidate "
                     f"{path}: {error}"
                 )
+        entries.sort(
+            key=lambda entry: os.path.normcase(
+                os.path.realpath(entry['path'])
+            )
+        )
         fingerprint = json.dumps(
-            [(entry['path'], entry['signature'], entry['reason']) for entry in entries],
+            [
+                (
+                    os.path.normcase(os.path.realpath(entry['path'])),
+                    entry['signature'],
+                    entry['category'],
+                )
+                for entry in entries
+            ],
             separators=(',', ':'),
             ensure_ascii=True,
         ).encode('utf-8')

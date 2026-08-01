@@ -121,6 +121,11 @@ All notable changes to A_pwmenu are documented here.
 - Added a one-time UI revision cookie and cache-clear response in addition to
   content-hashed assets, forcing browsers that retained an early 1.4.0 shell to
   replace it while preserving normal long-lived asset caching afterwards.
+- Fixed Capture Cleanup confirmations being rejected when the Web UI grouped
+  candidates in a different order from the deletion request or when a
+  human-readable quality summary refreshed between the two requests. Cleanup
+  tokens now use a canonical path/signature/category set, while every file is
+  still reanalyzed and signature-checked immediately before deletion.
 - Added lazy-transport, stable snapshot, placeholder backfill, best-capture,
   conflict, activity history, full-capture backup/restore, health-state, and
   configured-storage migration regression coverage. The suite now contains

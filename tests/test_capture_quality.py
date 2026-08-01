@@ -111,6 +111,57 @@ class CaptureQualityTests(unittest.TestCase):
         self.assertEqual((deleted, total), (1, 1))
         self.assertFalse(os.path.exists(empty_path))
 
+    def test_cleanup_token_is_stable_across_group_order_and_reason_refresh(self):
+        paths = [
+            os.path.join(self.tempdir.name, "Zulu_aabbccddeeff.pcap"),
+            os.path.join(self.tempdir.name, "Alpha_112233445566.pcap"),
+        ]
+        for path in paths:
+            with open(path, "wb") as handle:
+                handle.write(b"partial capture frames")
+
+        groups = [{
+            "files": [
+                {
+                    "_path": path,
+                    "_signature": self.plugin._ohc_file_signature(path),
+                    "quality": {
+                        "grade": "Partial",
+                        "hashes": 0,
+                        "summary": "Cached display reason",
+                    },
+                }
+                for path in paths
+            ]
+        }]
+        displayed = self.plugin._capture_cleanup_report(groups)
+
+        refreshed_quality = {
+            "grade": "Partial",
+            "hashes": 0,
+            "summary": "Fresh analysis reason",
+        }
+        with mock.patch.object(
+            self.plugin,
+            "_quality_file_record",
+            return_value=refreshed_quality,
+        ):
+            current = self.plugin._capture_cleanup_report()
+            deleted, total, message = self.plugin._clean_capture_candidates(
+                displayed["token"]
+            )
+
+        self.assertEqual(displayed["token"], current["token"])
+        self.assertEqual(
+            [entry["name"] for entry in displayed["entries"]],
+            [
+                os.path.basename(path)
+                for path in sorted(paths, key=os.path.normcase)
+            ],
+        )
+        self.assertEqual((deleted, total), (2, 2), message)
+        self.assertFalse(any(os.path.exists(path) for path in paths))
+
     def test_partial_capture_without_hash_is_cleanup_candidate(self):
         path = os.path.join(
             self.tempdir.name, "Partial_aabbccddeeff.pcap"
