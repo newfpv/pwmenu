@@ -50,8 +50,8 @@ logging.info("[A_pwmenu] Module init.")
 
 class A_pwmenu(plugins.Plugin):
     __author__ = 'NewFPV'
-    __version__ = '1.4.1'
-    __ui_revision__ = '20260802-16'
+    __version__ = '1.4.2'
+    __ui_revision__ = '20260803-1'
     __license__ = 'GPL3'
     __description__ = 'Ultimate Password Manager'
 
@@ -107,6 +107,9 @@ class A_pwmenu(plugins.Plugin):
         self.ohc_proxy_lock = threading.RLock()
         self.ohc_proxy_process = None
         self.ohc_proxy_config_file = '/run/a_pwmenu_ohc_xray.json'
+        self.ohc_proxy_verified_at = 0.0
+        self.ohc_route_active = 'direct'
+        self.ohc_route_last_error = ''
         self.capture_analysis_lock = threading.Lock()
         self.password_verify_lock = threading.Lock()
         self.conflict_repair_lock = threading.RLock()
@@ -527,7 +530,10 @@ class A_pwmenu(plugins.Plugin):
                     and self._option_bool('ohc_enabled', True)
                     and self._option_bool('ohc_auto_upload', True)
                 ):
-                    self._ensure_ohc_proxy()
+                    if self._ohc_route_mode() == 'vless':
+                        self._ensure_ohc_proxy(verify=True)
+                    else:
+                        self._stop_ohc_proxy()
                     reconcile = self._option_bool(
                         'ohc_reconcile_on_start',
                         False,
@@ -581,10 +587,16 @@ class A_pwmenu(plugins.Plugin):
         self.options.setdefault('ohc_api_key', '')
         self.options.setdefault('ohc_auto_upload', True)
         self.options.setdefault('ohc_sync_interval', 3600)
+        self.options.setdefault('ohc_route_mode', 'auto')
         self.options.setdefault('ohc_vless_url', '')
         self.options.setdefault('ohc_vless_flow', 'auto')
         self.options.setdefault('ohc_xray_binary', '/usr/local/bin/xray')
         self.options.setdefault('ohc_proxy_port', 10809)
+        self.options.setdefault('ohc_vless_startup_timeout', 8)
+        self.options.setdefault('ohc_vless_ready_delay', 2)
+        self.options.setdefault('ohc_vless_probe_timeout', 12)
+        self.options.setdefault('ohc_vless_probe_attempts', 3)
+        self.options.setdefault('ohc_vless_probe_interval', 300)
         self.options.setdefault('import_max_bytes', 2097152)
         self.options.setdefault('archive_memory_limit', 2097152)
         self.options.setdefault('web_gzip_level', 1)
@@ -3688,6 +3700,21 @@ class A_pwmenu(plugins.Plugin):
             logging.debug(f"[A_pwmenu] OHC key lookup failed: {e}")
         return ''
 
+    def _ohc_route_mode(self):
+        """Return the effective OHC route without exposing proxy secrets."""
+        if not str(self.options.get('ohc_vless_url') or '').strip():
+            return 'direct'
+        mode = str(
+            self.options.get('ohc_route_mode', 'auto') or 'auto'
+        ).strip().lower()
+        return mode if mode in ('auto', 'direct', 'vless') else 'auto'
+
+    def _set_ohc_route_state(self, active, error=''):
+        self.ohc_route_active = (
+            active if active in ('direct', 'vless') else 'direct'
+        )
+        self.ohc_route_last_error = str(error or '')[:240]
+
     def _ohc_vless_config(self):
         """Build an Xray client config without persisting the VLESS URL."""
         value = str(self.options.get('ohc_vless_url') or '').strip()
@@ -3775,6 +3802,7 @@ class A_pwmenu(plugins.Plugin):
         with self.ohc_proxy_lock:
             process = self.ohc_proxy_process
             self.ohc_proxy_process = None
+            self.ohc_proxy_verified_at = 0.0
             if process and process.poll() is None:
                 try:
                     process.terminate()
@@ -3791,7 +3819,54 @@ class A_pwmenu(plugins.Plugin):
             except OSError as error:
                 logging.debug(f'[A_pwmenu] Could not remove OHC proxy config: {error}')
 
-    def _ensure_ohc_proxy(self):
+    def _ohc_proxy_mapping(self):
+        proxy = (
+            f"http://127.0.0.1:"
+            f"{self._option_int('ohc_proxy_port', 10809)}"
+        )
+        return {'http': proxy, 'https': proxy}
+
+    def _probe_ohc_proxy(self):
+        """Verify that the local Xray listener can reach the real OHC TLS endpoint."""
+        timeout = max(
+            3,
+            min(self._option_int('ohc_vless_probe_timeout', 12), 60),
+        )
+        session = requests.Session()
+        session.trust_env = False
+        try:
+            response = session.get(
+                'https://api.onlinehashcrack.com/v2',
+                allow_redirects=False,
+                timeout=timeout,
+                proxies=self._ohc_proxy_mapping(),
+            )
+            if response.status_code >= 500 or response.status_code == 407:
+                raise requests.ConnectionError(
+                    f'OHC probe returned HTTP {response.status_code}'
+                )
+            self.ohc_proxy_verified_at = time.time()
+            return True, ''
+        except requests.RequestException as error:
+            return False, str(error)
+        finally:
+            session.close()
+
+    def _probe_ohc_proxy_with_retries(self):
+        attempts = max(
+            1,
+            min(self._option_int('ohc_vless_probe_attempts', 3), 5),
+        )
+        last_error = ''
+        for attempt in range(attempts):
+            ok, last_error = self._probe_ohc_proxy()
+            if ok:
+                return True, ''
+            if attempt + 1 < attempts:
+                time.sleep(1)
+        return False, last_error
+
+    def _ensure_ohc_proxy(self, verify=True, restart=False):
         config = self._ohc_vless_config()
         if config is None:
             self._stop_ohc_proxy()
@@ -3802,8 +3877,52 @@ class A_pwmenu(plugins.Plugin):
 
         with self.ohc_proxy_lock:
             process = self.ohc_proxy_process
+            if restart and process and process.poll() is None:
+                try:
+                    process.terminate()
+                    process.wait(timeout=3)
+                except (OSError, subprocess.SubprocessError):
+                    try:
+                        process.kill()
+                    except OSError:
+                        pass
+                process = None
+                self.ohc_proxy_process = None
+                self.ohc_proxy_verified_at = 0.0
             if process and process.poll() is None:
-                return True
+                probe_interval = max(
+                    30,
+                    min(
+                        self._option_int(
+                            'ohc_vless_probe_interval', 300
+                        ),
+                        3600,
+                    ),
+                )
+                probe_is_fresh = (
+                    self.ohc_proxy_verified_at
+                    and time.time() - self.ohc_proxy_verified_at
+                    < probe_interval
+                )
+                if not verify or probe_is_fresh:
+                    return True
+                ok, probe_error = self._probe_ohc_proxy_with_retries()
+                if ok:
+                    return True
+                logging.warning(
+                    '[A_pwmenu] OHC VLESS health check failed; '
+                    f'restarting Xray: {probe_error}'
+                )
+                try:
+                    process.terminate()
+                    process.wait(timeout=3)
+                except (OSError, subprocess.SubprocessError):
+                    try:
+                        process.kill()
+                    except OSError:
+                        pass
+                self.ohc_proxy_process = None
+                self.ohc_proxy_verified_at = 0.0
             self.ohc_proxy_process = None
             binary = str(self.options.get('ohc_xray_binary') or '/usr/local/bin/xray')
             if not os.path.isfile(binary) or not os.access(binary, os.X_OK):
@@ -3834,7 +3953,18 @@ class A_pwmenu(plugins.Plugin):
                     stderr=subprocess.DEVNULL,
                     close_fds=True,
                 )
-                for _ in range(20):
+                startup_timeout = max(
+                    2,
+                    min(
+                        self._option_int(
+                            'ohc_vless_startup_timeout', 8
+                        ),
+                        30,
+                    ),
+                )
+                deadline = time.time() + startup_timeout
+                port_ready = False
+                while time.time() < deadline:
                     if self.ohc_proxy_process.poll() is not None:
                         raise RuntimeError('Xray exited during startup')
                     try:
@@ -3842,11 +3972,38 @@ class A_pwmenu(plugins.Plugin):
                             ('127.0.0.1', self._option_int('ohc_proxy_port', 10809)),
                             timeout=0.1,
                         ):
-                            logging.info('[A_pwmenu] OHC-only VLESS proxy is ready')
-                            return True
+                            port_ready = True
+                            break
                     except OSError:
                         time.sleep(0.1)
-                raise RuntimeError('Xray proxy port did not open')
+                if not port_ready:
+                    raise RuntimeError(
+                        'Xray proxy port did not open within '
+                        f'{startup_timeout}s'
+                    )
+                if verify:
+                    ready_delay = max(
+                        0,
+                        min(
+                            self._option_int(
+                                'ohc_vless_ready_delay', 2
+                            ),
+                            5,
+                        ),
+                    )
+                    if ready_delay:
+                        time.sleep(ready_delay)
+                    ok, probe_error = (
+                        self._probe_ohc_proxy_with_retries()
+                    )
+                    if not ok:
+                        raise RuntimeError(
+                            f'Xray tunnel health check failed: {probe_error}'
+                        )
+                logging.info(
+                    '[A_pwmenu] OHC-only VLESS proxy is ready and verified'
+                )
+                return True
             except (OSError, RuntimeError, subprocess.SubprocessError) as error:
                 logging.error(f'[A_pwmenu] OHC VLESS proxy failed: {error}')
                 process = self.ohc_proxy_process
@@ -3856,15 +4013,117 @@ class A_pwmenu(plugins.Plugin):
                         process.terminate()
                     except OSError:
                         pass
+                self.ohc_proxy_verified_at = 0.0
                 return False
 
-    def _ohc_request_proxies(self):
+    def _ohc_request_proxies(self, restart=False):
         if not str(self.options.get('ohc_vless_url') or '').strip():
-            return None
-        if not self._ensure_ohc_proxy():
+            raise requests.ConnectionError('OHC VLESS URL is not configured')
+        if not self._ensure_ohc_proxy(verify=True, restart=restart):
             raise requests.ConnectionError('OHC VLESS proxy unavailable')
-        proxy = f"http://127.0.0.1:{self._option_int('ohc_proxy_port', 10809)}"
-        return {'http': proxy, 'https': proxy}
+        return self._ohc_proxy_mapping()
+
+    def _ohc_direct_response_is_blocked(self, response):
+        if response.status_code in (403, 451):
+            return True
+        try:
+            body = str(response.text or '')[:2048].casefold()
+        except Exception:
+            return False
+        markers = (
+            'not available in your country',
+            'country is not allowed',
+            'region is not allowed',
+            'access from your country',
+            'sanction',
+            'geo-block',
+        )
+        return any(marker in body for marker in markers)
+
+    def _ohc_post_once(self, payload, route, restart_proxy=False):
+        session = requests.Session()
+        session.trust_env = False
+        try:
+            proxies = (
+                self._ohc_request_proxies(restart=restart_proxy)
+                if route == 'vless'
+                else None
+            )
+            return session.post(
+                'https://api.onlinehashcrack.com/v2',
+                json=payload,
+                timeout=30,
+                proxies=proxies,
+            )
+        finally:
+            session.close()
+
+    def _ohc_post(self, payload):
+        """POST to OHC using direct, forced VLESS, or automatic fallback."""
+        mode = self._ohc_route_mode()
+        direct_error = None
+        direct_response = None
+
+        if mode in ('auto', 'direct'):
+            try:
+                direct_response = self._ohc_post_once(
+                    payload, 'direct'
+                )
+                if (
+                    mode == 'direct'
+                    or not self._ohc_direct_response_is_blocked(
+                        direct_response
+                    )
+                ):
+                    self._set_ohc_route_state('direct')
+                    return direct_response
+                direct_error = (
+                    'direct OHC route returned HTTP '
+                    f'{direct_response.status_code}'
+                )
+                logging.warning(
+                    '[A_pwmenu] OHC direct route appears blocked; '
+                    'trying VLESS'
+                )
+            except requests.RequestException as error:
+                direct_error = str(error)
+                if mode == 'direct':
+                    self._set_ohc_route_state('direct', direct_error)
+                    raise
+                logging.warning(
+                    '[A_pwmenu] OHC direct route failed; trying VLESS: '
+                    f'{error}'
+                )
+
+        vless_error = None
+        for restart_proxy in (False, True):
+            try:
+                response = self._ohc_post_once(
+                    payload,
+                    'vless',
+                    restart_proxy=restart_proxy,
+                )
+                self._set_ohc_route_state('vless')
+                if restart_proxy:
+                    logging.info(
+                        '[A_pwmenu] OHC VLESS recovered after Xray restart'
+                    )
+                return response
+            except requests.RequestException as error:
+                vless_error = str(error)
+                if not restart_proxy:
+                    logging.warning(
+                        '[A_pwmenu] OHC VLESS request failed; '
+                        f'restarting Xray once: {error}'
+                    )
+
+        error = 'OHC VLESS route failed after Xray restart'
+        if mode == 'auto' and direct_error:
+            error += f'; direct route: {direct_error}'
+        if vless_error:
+            error += f'; VLESS route: {vless_error}'
+        self._set_ohc_route_state('vless', error)
+        raise requests.ConnectionError(error)
 
     def _ohc_display_face_values(self):
         if self.ohc_display_faces:
@@ -4805,12 +5064,7 @@ class A_pwmenu(plugins.Plugin):
             'hashes': [h.strip() for h in hashes if h.strip()]
         }
         try:
-            res = requests.post(
-                'https://api.onlinehashcrack.com/v2',
-                json=payload,
-                timeout=30,
-                proxies=self._ohc_request_proxies(),
-            )
+            res = self._ohc_post(payload)
             try:
                 data = res.json()
             except ValueError:
@@ -4835,12 +5089,7 @@ class A_pwmenu(plugins.Plugin):
             'action': 'list_tasks'
         }
         try:
-            res = requests.post(
-                'https://api.onlinehashcrack.com/v2',
-                json=payload,
-                timeout=30,
-                proxies=self._ohc_request_proxies(),
-            )
+            res = self._ohc_post(payload)
             try:
                 data = res.json()
             except ValueError:
@@ -5620,7 +5869,10 @@ class A_pwmenu(plugins.Plugin):
             'last': self.ohc_last_result,
             'pending': pending,
             'uncrackable': uncrackable,
-            'retry_in': retry_in
+            'retry_in': retry_in,
+            'route_mode': self._ohc_route_mode(),
+            'route_active': self.ohc_route_active,
+            'route_error': self.ohc_route_last_error,
         }
 
     def _health_issues(self, gps_status, ohc_status, wpa_status):
@@ -9904,7 +10156,11 @@ class A_pwmenu(plugins.Plugin):
                 <div class="sub" style="margin-top:10px;">
                     Persistent queue: {{ ohc_status.pending }} file(s)
                     {% if ohc_status.retry_in > 0 %} • retry in {{ ohc_status.retry_in }}s{% endif %}
+                    • route: {{ ohc_status.route_active|upper }}{% if ohc_status.route_mode == 'auto' %} (AUTO){% endif %}
                 </div>
+                {% if ohc_status.route_error and ohc_status.retry_in > 0 %}
+                <div class="service-alert"><b>OHC route needs attention</b><span>{{ ohc_status.route_error }}</span></div>
+                {% endif %}
                 {% if ohc_status.uncrackable %}
                 <div class="service-alert"><b>{{ ohc_status.uncrackable }} capture(s) have no extractable WPA/PMKID hash.</b><span>They are excluded before upload and listed in Capture cleanup.</span></div>
                 {% endif %}

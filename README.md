@@ -158,7 +158,7 @@ Install the current tested release:
 
 ```bash
 sudo wget -O /usr/local/share/pwnagotchi/custom-plugins/A_pwmenu.py \
-  https://raw.githubusercontent.com/newfpv/pwmenu/v1.4.1/A_pwmenu.py
+  https://raw.githubusercontent.com/newfpv/pwmenu/v1.4.2/A_pwmenu.py
 ```
 
 Enable it in `/etc/pwnagotchi/config.toml`:
