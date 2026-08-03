@@ -6,6 +6,8 @@ import types
 import unittest
 from unittest import mock
 
+import requests
+
 
 def install_pwnagotchi_stubs():
     pwnagotchi = types.ModuleType("pwnagotchi")
@@ -222,6 +224,114 @@ class OhcExportDedupTests(unittest.TestCase):
         config = self.plugin._ohc_vless_config()
 
         self.assertEqual(config["outbounds"][0]["settings"]["flow"], "")
+
+    def test_route_mode_is_direct_without_a_vless_url(self):
+        self.plugin.options = {
+            "ohc_route_mode": "vless",
+            "ohc_vless_url": "",
+        }
+
+        self.assertEqual(self.plugin._ohc_route_mode(), "direct")
+
+    def test_auto_route_keeps_successful_direct_response(self):
+        self.plugin.options = {
+            "ohc_route_mode": "auto",
+            "ohc_vless_url": "vless://configured",
+        }
+        response = mock.Mock(status_code=200, text='{"success":true}')
+
+        with mock.patch.object(
+            self.plugin,
+            "_ohc_post_once",
+            return_value=response,
+        ) as post_once:
+            result = self.plugin._ohc_post({"action": "list_tasks"})
+
+        self.assertIs(result, response)
+        post_once.assert_called_once_with(
+            {"action": "list_tasks"},
+            "direct",
+        )
+        self.assertEqual(self.plugin.ohc_route_active, "direct")
+
+    def test_auto_route_falls_back_to_vless_on_transport_failure(self):
+        self.plugin.options = {
+            "ohc_route_mode": "auto",
+            "ohc_vless_url": "vless://configured",
+        }
+        response = mock.Mock(status_code=200, text='{"success":true}')
+
+        with mock.patch.object(
+            self.plugin,
+            "_ohc_post_once",
+            side_effect=[requests.ConnectionError("direct blocked"), response],
+        ) as post_once:
+            result = self.plugin._ohc_post({"action": "list_tasks"})
+
+        self.assertIs(result, response)
+        self.assertEqual(post_once.call_args_list[1].args[1], "vless")
+        self.assertFalse(post_once.call_args_list[1].kwargs["restart_proxy"])
+        self.assertEqual(self.plugin.ohc_route_active, "vless")
+
+    def test_auto_route_falls_back_to_vless_on_country_block(self):
+        self.plugin.options = {
+            "ohc_route_mode": "auto",
+            "ohc_vless_url": "vless://configured",
+        }
+        blocked = mock.Mock(status_code=451, text="Unavailable for legal reasons")
+        proxied = mock.Mock(status_code=200, text='{"success":true}')
+
+        with mock.patch.object(
+            self.plugin,
+            "_ohc_post_once",
+            side_effect=[blocked, proxied],
+        ) as post_once:
+            result = self.plugin._ohc_post({"action": "list_tasks"})
+
+        self.assertIs(result, proxied)
+        self.assertEqual(post_once.call_args_list[0].args[1], "direct")
+        self.assertEqual(post_once.call_args_list[1].args[1], "vless")
+
+    def test_forced_vless_restarts_xray_once_after_transport_failure(self):
+        self.plugin.options = {
+            "ohc_route_mode": "vless",
+            "ohc_vless_url": "vless://configured",
+        }
+        response = mock.Mock(status_code=200, text='{"success":true}')
+
+        with mock.patch.object(
+            self.plugin,
+            "_ohc_post_once",
+            side_effect=[requests.ConnectionError("stale tunnel"), response],
+        ) as post_once:
+            result = self.plugin._ohc_post({"action": "list_tasks"})
+
+        self.assertIs(result, response)
+        self.assertFalse(post_once.call_args_list[0].kwargs["restart_proxy"])
+        self.assertTrue(post_once.call_args_list[1].kwargs["restart_proxy"])
+        self.assertEqual(self.plugin.ohc_route_active, "vless")
+
+    def test_vless_health_probe_retries_before_restarting_xray(self):
+        self.plugin.options = {"ohc_vless_probe_attempts": 3}
+
+        with (
+            mock.patch.object(
+                self.plugin,
+                "_probe_ohc_proxy",
+                side_effect=[
+                    (False, "not ready"),
+                    (False, "still starting"),
+                    (True, ""),
+                ],
+            ) as probe,
+            mock.patch("A_pwmenu.time.sleep") as sleep,
+        ):
+            ok, error = self.plugin._probe_ohc_proxy_with_retries()
+
+        self.assertTrue(ok)
+        self.assertEqual(error, "")
+        self.assertEqual(probe.call_count, 3)
+        self.assertEqual(sleep.call_count, 2)
 
 
 if __name__ == "__main__":

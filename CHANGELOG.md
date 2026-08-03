@@ -2,6 +2,74 @@
 
 All notable changes to A_pwmenu are documented here.
 
+## 1.4.2 — 2026-08-03
+
+PWMenu 1.4.2 is a reliability update for OnlineHashCrack routing through
+direct Internet access and optional Xray/VLESS. It keeps the 1.4.1 storage and
+configuration formats: existing captures, passwords, maps, queues, cloud
+history, backups, and UI preferences require no migration.
+
+### Predictable OHC route modes
+
+- Added `ohc_route_mode` with three explicit policies. `auto` tries the direct
+  OHC API first and falls back to VLESS only for transport failures, HTTP 403
+  or 451 responses, and recognized country-block responses. `direct` never
+  starts Xray. `vless` requires the configured Xray route and never leaks a
+  request through a direct fallback.
+- An empty `ohc_vless_url` always behaves as direct mode. Supplying a VLESS URL
+  no longer forces every OHC request through Xray when `auto` is selected.
+- Both OHC upload and task-history synchronization now use the same route
+  selector, retry behavior, timeout policy, and local deduplication path.
+- Proxy requests ignore ambient `HTTP_PROXY`, `HTTPS_PROXY`, and system proxy
+  environment variables, so the selected route is not silently replaced by a
+  host-wide proxy configuration.
+
+### Xray startup and health verification
+
+- Replaced the old "local port is open" readiness check with a two-stage
+  check: PWMenu first verifies the loopback proxy listener and then performs a
+  real TLS request to OnlineHashCrack through that proxy. A process is marked
+  usable only after the end-to-end route succeeds.
+- Added configurable startup timeout, stabilization delay, probe timeout,
+  probe attempts, and periodic probe interval. The defaults are deliberately
+  tolerant of Raspberry Pi startup and Reality handshake latency.
+- A stale or half-open Xray process is stopped and started once after a VLESS
+  transport failure, followed by a fresh health probe and one controlled
+  request retry. Persistent failures return to the existing durable queue and
+  backoff instead of spinning or dropping a capture.
+- In `auto` mode Xray is started lazily only when direct access is blocked. In
+  `direct` mode it is kept stopped; in forced `vless` mode it is prepared when
+  the plugin starts.
+- The configuration example now documents the lifecycle controls and explains
+  that `ohc_vless_flow` overrides the flow embedded in the VLESS URL. Leaving
+  that override empty can break servers that require XTLS Vision; use
+  `xtls-rprx-vision` when that is what the server provides.
+
+### Status, diagnostics, and field behavior
+
+- The OHC card reports the effective route (`DIRECT` or `VLESS`) together with
+  the configured policy (`AUTO`, `DIRECT`, or `VLESS`). When a queued request
+  is backing off, the most recent route error is shown instead of leaving an
+  unexplained retry timer.
+- Added bounded route-health state for the last verified proxy time, active
+  route, and latest error. It is diagnostic state only and does not alter
+  credentials, capture identities, or deduplication history.
+- Verified an authenticated OHC task-list synchronization through the local
+  Xray/VLESS path. Testing also confirmed that a server may accept TCP while
+  its Reality/TLS route is temporarily unavailable; the new end-to-end probe
+  and durable retry path are designed for exactly that failure mode.
+
+### Release validation
+
+- Added regression tests for direct mode without a VLESS URL, successful
+  direct routing in automatic mode, automatic fallback after transport
+  failures and HTTP 451, forced-VLESS process recovery, and health-probe retry
+  behavior.
+- Bumped the plugin version to `1.4.2` and UI revision to `20260803-1`, forcing
+  one browser cache refresh while preserving content-hashed static caching.
+- Verified the release with Python compilation, whitespace checks, and all 99
+  unit tests.
+
 ## 1.4.1 — 2026-08-02
 
 PWMenu 1.4.1 is a focused reliability and field-display release. It keeps the

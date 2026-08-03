@@ -34,12 +34,21 @@ main.plugins.A_pwmenu.ohc_retry_poll_interval = 60
 main.plugins.A_pwmenu.ohc_reconcile_on_start = false
 # Optional OHC-only VLESS route. Leave empty to connect directly.
 # The link is read from config.toml and is never written to PWMenu state.
+# Route modes: "auto" tries direct first and falls back to VLESS only when
+# the direct API is blocked/unreachable; "direct" never starts Xray;
+# "vless" forces every OHC request through Xray without a direct fallback.
+main.plugins.A_pwmenu.ohc_route_mode = "auto"
 main.plugins.A_pwmenu.ohc_vless_url = ""
 # "auto" uses the flow from the link. Set "" only when the server account
 # is configured without flow even though the shared link contains one.
 main.plugins.A_pwmenu.ohc_vless_flow = "auto"
 main.plugins.A_pwmenu.ohc_xray_binary = "/usr/local/bin/xray"
 main.plugins.A_pwmenu.ohc_proxy_port = 10809
+main.plugins.A_pwmenu.ohc_vless_startup_timeout = 8
+main.plugins.A_pwmenu.ohc_vless_ready_delay = 2
+main.plugins.A_pwmenu.ohc_vless_probe_timeout = 12
+main.plugins.A_pwmenu.ohc_vless_probe_attempts = 3
+main.plugins.A_pwmenu.ohc_vless_probe_interval = 300
 
 # PwnDroid GPS over the phone's Bluetooth PAN connection.
 main.plugins.A_pwmenu.pwndroid_ws_enabled = true
